@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mediate"
+version = "0.1.0"
+description = "Recursively standardize a media library: photos to lossless WebP, videos and animated GIFs to compatible MP4, with strict validation before deleting originals."
+requires-python = ">=3.9"
+authors = [{ name = "Eddy Sant" }]
+license = { text = "MIT" }
+
+[project.scripts]
+mediate = "mediate.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["mediate*"]
