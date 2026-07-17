@@ -2,7 +2,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from mediate.renamer import apply_renames, clean_base, parse_stem, plan_renames
+from mediate.renamer import (
+    apply_renames,
+    clean_base,
+    looks_random,
+    parse_stem,
+    plan_folder_renames,
+    plan_renames,
+    record_batch,
+    undo_last_batch,
+)
 
 
 class ParseStemTests(unittest.TestCase):
@@ -27,6 +36,42 @@ class ParseStemTests(unittest.TestCase):
     def test_plain(self):
         p = parse_stem("Terminator 2")
         self.assertEqual((p.base, p.number, p.is_dup), ("Terminator 2", None, False))
+
+    def test_dash_number(self):
+        p = parse_stem("Bonnie Wright - 2")
+        self.assertEqual((p.base, p.number), ("Bonnie Wright", 2))
+        p = parse_stem("Cora-Keegan-001")
+        self.assertEqual((p.base, p.number), ("Cora-Keegan", 1))
+
+    def test_date_stem_is_not_dash_numbered(self):
+        p = parse_stem("2023-01-05")
+        self.assertEqual((p.base, p.number), ("2023-01-05", None))
+
+    def test_site_extraction(self):
+        p = parse_stem("Bella-Hadid-TheSpot.com-4")
+        self.assertEqual((p.base, p.number, p.site), ("Bella-Hadid-", 4, "TheSpot.com"))
+
+    def test_existing_tag_roundtrip(self):
+        p = parse_stem("Bella Hadid [TheSpot.com 04]")
+        self.assertEqual((p.base, p.number, p.site), ("Bella Hadid", 4, "TheSpot.com"))
+        p = parse_stem("Eddy Sant [01]")
+        self.assertEqual((p.base, p.number, p.site), ("Eddy Sant", 1, None))
+
+    def test_unknown_bracket_tag_is_opaque(self):
+        self.assertTrue(parse_stem("Bella [ue73up]").opaque)
+        self.assertTrue(
+            parse_stem("Vacation [550e8400-e29b-41d4-a716-446655440000]").opaque
+        )
+
+
+class LooksRandomTests(unittest.TestCase):
+    def test_random_tokens(self):
+        self.assertTrue(looks_random("ue73up"))
+        self.assertTrue(looks_random("x9k2mq31"))
+
+    def test_meaningful_names_are_not_random(self):
+        for stem in ("photo2023", "party2023", "4kvideo", "IMG1234", "eddy sant", "holiday"):
+            self.assertFalse(looks_random(stem), stem)
 
 
 class CleanBaseTests(unittest.TestCase):
@@ -133,6 +178,72 @@ class PlanRenamesTests(unittest.TestCase):
         self.assertEqual(plan["trip (1).jpg"], "Trip [1].jpg")
         self.assertEqual(plan["trip (3).png"], "Trip [1].png")
 
+    def test_dashed_name_with_dash_numbering(self):
+        self.touch("Cora-Keegan-001.jpg")
+        self.touch("Cora-Keegan-003.jpg")
+        plan = self.plan()
+        self.assertEqual(plan["Cora-Keegan-001.jpg"], "Cora Keegan [1].jpg")
+        self.assertEqual(plan["Cora-Keegan-003.jpg"], "Cora Keegan [2].jpg")
+
+    def test_dash_number_starts_at_one(self):
+        self.touch("Bonnie Wright - 2.jpg")
+        self.assertEqual(self.plan(), {"Bonnie Wright - 2.jpg": "Bonnie Wright [1].jpg"})
+
+    def test_website_moves_into_tag(self):
+        self.touch("Bella-Hadid-TheSpot.com-4.jpg")
+        self.assertEqual(
+            self.plan(),
+            {"Bella-Hadid-TheSpot.com-4.jpg": "Bella Hadid [TheSpot.com 1].jpg"},
+        )
+
+    def test_site_series_are_separate(self):
+        self.touch("Bella-Hadid-TheSpot.com-4.jpg")
+        self.touch("Bella-Hadid-TheSpot.com-7.jpg")
+        self.touch("Bella-Hadid-2.jpg")
+        plan = self.plan()
+        self.assertEqual(plan["Bella-Hadid-TheSpot.com-4.jpg"], "Bella Hadid [TheSpot.com 1].jpg")
+        self.assertEqual(plan["Bella-Hadid-TheSpot.com-7.jpg"], "Bella Hadid [TheSpot.com 2].jpg")
+        self.assertEqual(plan["Bella-Hadid-2.jpg"], "Bella Hadid [1].jpg")
+
+    def test_random_token_takes_folder_name(self):
+        self.touch("Bella/ue73up.jpg")
+        self.assertEqual(self.plan(), {"ue73up.jpg": "Bella [ue73up].jpg"})
+
+    def test_standardized_names_are_idempotent(self):
+        self.touch("Eddy Sant [1].jpg")
+        self.touch("Eddy Sant [2].jpg")
+        self.touch("Bella [ue73up].jpg")
+        self.touch("Vacation [550e8400-e29b-41d4-a716-446655440000].jpg")
+        self.touch("Bella Hadid [TheSpot.com 1].jpg")
+        self.assertEqual(self.plan(), {})
+
+    def test_date_stems_survive_cleanup(self):
+        self.touch("2023-01-05 party.jpg")
+        self.assertEqual(self.plan(), {"2023-01-05 party.jpg": "2023-01-05 Party.jpg"})
+
+    def test_date_prefix_uses_mtime_fallback(self):
+        import os
+
+        p = self.touch("eddy sant.jpg")
+        os.utime(p, (1577975400, 1577975400))  # 2020-01-02 local time
+        plans = {r.src.name: r.dst.name for r in plan_renames(self.root, date_prefix=True)}
+        self.assertEqual(plans, {"eddy sant.jpg": "2020-01-02 Eddy Sant.jpg"})
+
+
+class FolderRenameTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_folders_cleaned_deepest_first(self):
+        (self.root / "summer_trip/beach_day").mkdir(parents=True)
+        plans = plan_folder_renames(self.root)
+        self.assertEqual(
+            [(p.src.name, p.dst.name) for p in plans],
+            [("beach_day", "Beach Day"), ("summer_trip", "Summer Trip")],
+        )
+
 
 class ApplyRenamesTests(unittest.TestCase):
     def setUp(self):
@@ -150,7 +261,7 @@ class ApplyRenamesTests(unittest.TestCase):
         self.touch("eddy_sant.jpg", b"underscore")
         self.touch("eddy.sant.jpg", b"dots")
         plans = plan_renames(self.root)
-        renamed, skipped = apply_renames(plans, self.root, dry_run=False)
+        renamed, skipped, _ = apply_renames(plans, self.root, dry_run=False)
         self.assertEqual((renamed, skipped), (1, 1))
         names = sorted(p.name for p in self.root.iterdir())
         self.assertIn("Eddy Sant.jpg", names)
@@ -162,7 +273,7 @@ class ApplyRenamesTests(unittest.TestCase):
         self.touch("trip [2].jpg")
         self.touch("trip [3].jpg")
         plans = plan_renames(self.root)
-        renamed, skipped = apply_renames(plans, self.root, dry_run=False)
+        renamed, skipped, _ = apply_renames(plans, self.root, dry_run=False)
         self.assertEqual((renamed, skipped), (2, 0))
         self.assertEqual(
             sorted(p.name for p in self.root.iterdir()),
@@ -176,6 +287,23 @@ class ApplyRenamesTests(unittest.TestCase):
         self.assertEqual(
             [p.name for p in self.root.iterdir()], ["eddy sant (1).jpg"]
         )
+
+    def test_undo_restores_last_batch(self):
+        self.touch("eddy sant (1).jpg")
+        self.touch("Cora-Keegan-001.jpg")
+        plans = plan_renames(self.root)
+        renamed, _, applied = apply_renames(plans, self.root, dry_run=False)
+        record_batch(self.root, applied)
+        self.assertEqual(renamed, 2)
+        self.assertIn(".mediate-renames.json", [p.name for p in self.root.iterdir()])
+        restored = undo_last_batch(self.root, dry_run=False)
+        self.assertEqual(restored, 2)
+        self.assertEqual(
+            sorted(p.name for p in self.root.iterdir() if not p.name.startswith(".")),
+            ["Cora-Keegan-001.jpg", "eddy sant (1).jpg"],
+        )
+        # A second undo has nothing left to reverse.
+        self.assertEqual(undo_last_batch(self.root, dry_run=False), 0)
 
 
 if __name__ == "__main__":

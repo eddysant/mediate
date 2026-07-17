@@ -15,7 +15,7 @@ from .disposal import Disposer
 from .macmeta import get_birthtime, set_birthtime
 from .probe import MP4_HEVC, MP4_STANDARD, gif_is_animated, mp4_status
 from .scanner import MediaJob
-from .validators import validate_output
+from .validators import validate_output, verify_photo_metadata, verify_video_duration
 
 log = logging.getLogger("mediate")
 
@@ -112,6 +112,17 @@ def _convert(kind: str, src: Path, tmp: Path) -> subprocess.CompletedProcess:
         png.unlink(missing_ok=True)
 
 
+def _sidecars_of(src: Path):
+    """Sidecar files belonging to src: photo.aae / photo.xmp / photo.jpg.xmp
+    (upper- or lowercase — Apple writes .AAE)."""
+    seen = set()
+    for ext in (".aae", ".AAE", ".xmp", ".XMP"):
+        for candidate in (src.with_suffix(ext), Path(str(src) + ext)):
+            if candidate.exists() and candidate not in seen:
+                seen.add(candidate)
+                yield candidate
+
+
 def process_job(job: MediaJob, opts: Options) -> Outcome:
     src = job.path
     kind = job.kind
@@ -155,12 +166,22 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
     # only after validation, so a crash never leaves a half-written file
     # wearing the final name.
     tmp = final.with_name(f".{final.stem}.{uuid.uuid4().hex[:8]}.part{final.suffix}")
+    src_size_pre = src.stat().st_size
+    # A big video at -preset slow can encode for many minutes: say so.
+    started = f"converting {src.name} ({_fmt_size(src_size_pre)}), this may take a while..."
+    log.info("       %s", started) if src_size_pre >= 100 * 1024 * 1024 else log.debug("%s", started)
     try:
         proc = _convert(kind, src, tmp)
     except FileNotFoundError as exc:
         return Outcome(FAILED, src, f"converter not found: {exc}")
 
     ok, reason = validate_output(proc.returncode, proc.stderr, tmp, is_video=(new_ext == ".mp4"))
+    if ok:
+        # 5. Metadata/duration verification, beyond structural integrity.
+        if new_ext == ".webp":
+            ok, reason = verify_photo_metadata(src, tmp)
+        else:
+            ok, reason = verify_video_duration(src, tmp)
     if not ok:
         log.debug("stderr for %s:\n%s", src, proc.stderr.strip())
         tmp.unlink(missing_ok=True)
@@ -184,6 +205,14 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
         except OSError as exc:
             tmp.unlink(missing_ok=True)
             return Outcome(FAILED, src, f"could not dispose of original ({exc}); conversion discarded")
+        # Sidecars (.aae Apple edits, .xmp) describe the original file; once
+        # it is gone they are orphans, so they travel with it.
+        for sidecar in _sidecars_of(src):
+            try:
+                opts.dispose(sidecar)
+                disposed += f" with {sidecar.name}"
+            except OSError as exc:
+                log.warning("could not dispose of sidecar %s: %s", sidecar, exc)
     os.replace(tmp, final)
     # Preserve the original's timestamps so date-based sorting still works —
     # mtime for everything, plus Finder's creation date on macOS.

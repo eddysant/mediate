@@ -94,6 +94,24 @@ def parse_args(argv=None) -> argparse.Namespace:
         action="store_true",
         help="only standardize file names; no conversions",
     )
+    parser.add_argument(
+        "--rename-folders",
+        action="store_true",
+        help="with --rename/--rename-only: also clean directory names",
+    )
+    parser.add_argument(
+        "--date-prefix",
+        action="store_true",
+        help="with --rename/--rename-only: prefix names with the capture date "
+        "(YYYY-MM-DD, from EXIF via exiftool if installed, video metadata, or "
+        "file modification time)",
+    )
+    parser.add_argument(
+        "--undo-renames",
+        action="store_true",
+        help="reverse the most recent rename batch recorded in the library's "
+        ".mediate-renames.json, then exit",
+    )
     disposal = parser.add_mutually_exclusive_group()
     disposal.add_argument(
         "--graveyard",
@@ -163,7 +181,20 @@ def main(argv=None) -> int:
     log_path = args.log_file or (root / "conversion.log")
     setup_logging(log_path, args.verbose)
 
+    if args.undo_renames:
+        from .renamer import undo_last_batch
+
+        restored = undo_last_batch(root, args.dry_run)
+        log.info("names: %d rename(s) %srestored", restored, "would be " if args.dry_run else "")
+        return 0
+
     mode = HARD if args.hard_delete else GRAVEYARD if args.graveyard else TRASH
+    if sys.platform == "win32" and mode == TRASH and not (args.keep_originals or args.dry_run or args.rename_only):
+        print(
+            "error: the Windows Recycle Bin is not supported; use --graveyard DIR or --hard-delete",
+            file=sys.stderr,
+        )
+        return 2
     dispose, dispose_label = make_disposer(mode, root, args.graveyard)
     opts = Options(
         dry_run=args.dry_run,
@@ -176,8 +207,11 @@ def main(argv=None) -> int:
     )
 
     if args.rename_only:
-        return run_rename_phase(root, args.dry_run)
+        return run_rename_phase(root, args)
 
+    from .probe import load_probe_cache, save_probe_cache
+
+    load_probe_cache()
     jobs = list(iter_media(root))
     run_mode = " (dry run)" if args.dry_run else ""
     log.info("scanning %s%s: %d candidate file(s), log: %s", root, run_mode, len(jobs), log_path)
@@ -190,7 +224,7 @@ def main(argv=None) -> int:
         )
     if not jobs:
         log.info("nothing to convert")
-        return run_rename_phase(root, args.dry_run) if args.rename else 0
+        return run_rename_phase(root, args) if args.rename else 0
 
     # Planning-time skips, resolved before the pool starts:
     # 1. Live Photo pairs — converting the .mov half breaks the pairing.
@@ -250,25 +284,36 @@ def main(argv=None) -> int:
             "done: %d converted, %d skipped, %d failed, %.1f MB saved",
             tally[CONVERTED], tally[SKIPPED], tally[FAILED], saved_mb,
         )
+    save_probe_cache()
     if args.rename:
         # Rename runs after conversion so freshly produced .webp/.mp4 files
         # get their names standardized in the same pass.
-        run_rename_phase(root, args.dry_run)
+        run_rename_phase(root, args)
     return 1 if tally[FAILED] else 0
 
 
-def run_rename_phase(root: Path, dry_run: bool) -> int:
-    from .renamer import apply_renames, plan_renames
+def run_rename_phase(root: Path, args: argparse.Namespace) -> int:
+    from .renamer import apply_renames, plan_folder_renames, plan_renames, record_batch
 
-    plans = plan_renames(root)
-    if not plans:
+    dry_run = args.dry_run
+    plans = plan_renames(root, date_prefix=args.date_prefix)
+    folder_plans = plan_folder_renames(root) if args.rename_folders else []
+    if not plans and not folder_plans:
         log.info("names: nothing to rename")
         return 0
-    renamed, skipped = apply_renames(plans, root, dry_run)
+    renamed, skipped, applied = apply_renames(plans, root, dry_run)
+    # Folders move only after every file rename has resolved, so file plan
+    # paths stay valid; the manifest keeps that order for a correct undo.
+    f_renamed, f_skipped, f_applied = apply_renames(folder_plans, root, dry_run)
+    if not dry_run:
+        record_batch(root, applied + f_applied)
     if dry_run:
-        log.info("names: %d file(s) would be renamed", renamed)
+        log.info("names: %d file(s) and %d folder(s) would be renamed", renamed, f_renamed)
     else:
-        log.info("names: %d renamed, %d skipped", renamed, skipped)
+        log.info(
+            "names: %d file(s) and %d folder(s) renamed, %d skipped (undo with --undo-renames)",
+            renamed, f_renamed, skipped + f_skipped,
+        )
     return 0
 
 

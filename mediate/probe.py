@@ -1,15 +1,76 @@
-"""ffprobe helpers for deciding whether a file needs conversion."""
+"""ffprobe helpers for deciding whether a file needs conversion.
+
+Probe results are cached (keyed by path + mtime + size) in the user cache
+directory, so re-running over a large already-standardized library doesn't
+re-spawn ffprobe for every file."""
 
 from __future__ import annotations
 
 import json
+import logging
+import os
 import subprocess
+import sys
+import threading
 from pathlib import Path
+
+log = logging.getLogger("mediate")
 
 # mp4_status() results
 MP4_STANDARD = "standard"          # h264/yuv420p video, aac audio
 MP4_HEVC = "hevc"                  # hevc video, aac audio — Apple-native
 MP4_NEEDS_CONVERSION = "convert"
+
+_cache: dict = {}
+_cache_lock = threading.Lock()
+_cache_dirty = False
+
+
+def _cache_file() -> Path:
+    if sys.platform == "darwin":
+        base = Path.home() / "Library" / "Caches"
+    else:
+        base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return base / "mediate" / "probe-cache.json"
+
+
+def load_probe_cache() -> None:
+    global _cache
+    try:
+        _cache = json.loads(_cache_file().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        _cache = {}
+
+
+def save_probe_cache() -> None:
+    if not _cache_dirty:
+        return
+    path = _cache_file()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Unbounded growth guard: a fresh start is cheaper than an LRU.
+        data = _cache if len(_cache) <= 200_000 else {}
+        path.write_text(json.dumps(data), encoding="utf-8")
+    except OSError as exc:
+        log.debug("could not write probe cache: %s", exc)
+
+
+def _cached(kind: str, path: Path, compute):
+    try:
+        st = path.stat()
+    except OSError:
+        return compute()
+    key = f"{kind}:{path}"
+    with _cache_lock:
+        entry = _cache.get(key)
+        if entry and entry.get("m") == st.st_mtime and entry.get("s") == st.st_size:
+            return entry["v"]
+    value = compute()
+    global _cache_dirty
+    with _cache_lock:
+        _cache[key] = {"m": st.st_mtime, "s": st.st_size, "v": value}
+        _cache_dirty = True
+    return value
 
 
 def _ffprobe_json(args: list) -> dict | None:
@@ -32,6 +93,10 @@ def mp4_status(path: Path) -> str:
     only makes it bigger), or needing conversion. An unreadable file reports
     needs-conversion; the attempt that follows is protected by the
     validation protocol."""
+    return _cached("mp4", path, lambda: _mp4_status_uncached(path))
+
+
+def _mp4_status_uncached(path: Path) -> str:
     data = _ffprobe_json(
         ["-show_entries", "stream=codec_type,codec_name,pix_fmt", str(path)]
     )
@@ -54,6 +119,10 @@ def mp4_status(path: Path) -> str:
 def gif_is_animated(path: Path) -> bool:
     """True if the GIF has more than one frame. Probe failures count as
     animated so the file still goes through the (validated) conversion."""
+    return _cached("gif", path, lambda: _gif_is_animated_uncached(path))
+
+
+def _gif_is_animated_uncached(path: Path) -> bool:
     data = _ffprobe_json(
         [
             "-select_streams", "v:0",

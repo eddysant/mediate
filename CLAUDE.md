@@ -17,7 +17,7 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 | `validators.py` | the 4-step checklist (exit code, exists, size > 0, full-decode integrity for videos) |
 | `disposal.py` | Trash (macOS per-volume `.Trashes`, freedesktop elsewhere) / `--graveyard DIR` / `--hard-delete` |
 | `macmeta.py` | ctypes `setattrlist(2)` to copy the original's birthtime (Finder "date created") onto outputs; no-op off macOS |
-| `renamer.py` | `--rename`/`--rename-only` phase: stem parsing (numbers/copy markers), cleanup + title case, per-(dir, base, ext) series renumbering with gap-closing and zero-padding, GUID→folder-name, never-overwrite apply loop |
+| `renamer.py` | `--rename`/`--rename-only` phase: stem parsing (paren/bracket/dash numbers, copy markers, `[site N]` tags, websites), cleanup + title case, per-(dir, base, site, ext) series renumbering compacted to 1 with gap-closing and zero-padding, GUID/random-token→folder-name, `--date-prefix`, `--rename-folders`, manifest + `--undo-renames`, never-overwrite apply loop |
 
 ## The safety pipeline (order matters)
 
@@ -28,10 +28,16 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
    directory — never the final name, so a crash can't leave a half-written file
    looking finished.
 3. Validate (`validators.py`). Failure → delete temp, keep original, log stderr.
-4. `--only-if-smaller` check (after validation, before disposal).
-5. Dispose of the original (**before** `os.replace`, because a re-encoded
+4. Metadata verification: photos must keep their EXIF `DateTimeOriginal`
+   (exiftool when installed, else structural EXIF-block presence check);
+   videos must keep their duration within 1s/2% (catches truncated encodes
+   that decode cleanly). This is what stops cwebp's silent TIFF metadata drop.
+5. `--only-if-smaller` check (after validation, before disposal).
+6. Dispose of the original (**before** `os.replace`, because a re-encoded
    `foo.mp4` targets its own name). Disposal failure → discard temp, FAILED.
-6. `os.replace(tmp, final)`, then `os.utime` (mtime) + `set_birthtime` (macOS).
+   Sidecars (`.aae`/`.AAE`/`.xmp`) travel with the disposed original —
+   they describe a file that no longer exists.
+7. `os.replace(tmp, final)`, then `os.utime` (mtime) + `set_birthtime` (macOS).
 
 ## Gotchas / hard-won details
 
@@ -83,7 +89,30 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   (Screenshot/WhatsApp) are in `NO_CLEAN_RE` — their dots are times.
 - **Live Photo `.mov`s mirror their still's rename** rather than renumbering
   in their own series; otherwise diverging gap-closes would break the
-  dir+stem pairing the converter's Live Photo guard relies on.
+  dir+stem pairing the converter's Live Photo guard relies on. With
+  `--date-prefix` the mirror/sidecar map must store the *prefixed* stem
+  (`finalize()` returns what it actually emitted) or the pair diverges.
+  When exiftool is installed, stem-pairs whose `ContentIdentifier`s both
+  exist but differ are provably not Live Photos and get unprotected.
+- **Renamer parse-order matters**: recognized tags (`[N]`, `[site N]`,
+  `[site]`) parse first; any *other* trailing `[…]` marks the name opaque
+  (already standardized, e.g. a GUID tag) and only the extension case is
+  touched — that's what makes re-runs idempotent. Dash-numbers require a
+  non-digit before the dash (`Cora-Keegan-001` numbers, `2023-01-05` does
+  not); a bare space-number (`Terminator 2`) is never numbering. `SITE_RE`
+  domain labels deliberately exclude dashes — in filenames a dash is a
+  separator, not part of a hyphenated domain.
+- **Padding tracks the current series size** (width 2 iff ≥10 members), so a
+  series shrinking below 10 unpads on the next run. Numbering always
+  compacts to start at 1.
+- **Rename manifest**: every applied batch (files then folders, in execution
+  order) is appended to `.mediate-renames.json` at the root; undo replays it
+  reversed, so folder renames undo before the files inside them. Folder
+  plans are applied only after all file renames resolved — file plan paths
+  are computed against pre-rename folder names.
+- **Probe results are cached** (`probe.py`: path+mtime+size keyed JSON in the
+  user cache dir, loaded/saved by cli) — a 50k-file re-run would otherwise
+  spawn ffprobe per MP4/GIF. `load_probe_cache()` must run before the pool.
 
 ## Testing
 

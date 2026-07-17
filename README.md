@@ -56,27 +56,44 @@ Besides formats, mediate can settle *naming* disputes. `--rename` runs after
 conversion (so fresh `.webp`/`.mp4` outputs are covered too); `--rename-only`
 skips conversion entirely. Both respect `--dry-run`.
 
-- Cleanup: underscores/dots to spaces, whitespace collapsed, lowercase words
+- Cleanup: underscores/dots/dashes to spaces (digit-dash-digit survives, so
+  `2023-01-05` keeps its shape), whitespace collapsed, lowercase words
   title-cased (small words like "of" stay lower unless leading; existing
   capitalization such as `USA` or `McDonald` is respected), extensions
   lowercased, Unicode NFC-normalized.
-- Numbering: `photo (1)` becomes `Photo [1]`; `Copy of X` / `X - copy` /
-  `X copy 2` markers join the numbering; gaps are closed (`1,2,4` → `1,2,3`);
-  once a series reaches double digits, single digits are zero-padded
-  (`[01]`…`[10]`) so lexical order equals numeric order. Series are per
-  directory + base name + extension.
-- GUID names take their folder's name: `Vacation 2019/550e8400-….jpg` →
-  `Vacation 2019 [550e8400-…].jpg`.
+- Numbering: `photo (1)` → `Photo [1]`, `Bonnie Wright - 2` →
+  `Bonnie Wright [1]`, `Cora-Keegan-001` → `Cora Keegan [1]`; `Copy of X` /
+  `X - copy` / `X copy 2` markers join the numbering. Every series is
+  compacted to start at 1 with gaps closed (`1,2,4` → `1,2,3`); once a series
+  reaches double digits, single digits are zero-padded (`[01]`…`[10]`) so
+  lexical order equals numeric order. Series are per directory + base name +
+  site + extension — different file types count independently. A bare
+  space-number (`Terminator 2`) is *not* treated as numbering; only
+  `(N)`/`[N]`/dash-`N` forms are.
+- Websites in the name move into the tag:
+  `Bella-Hadid-TheSpot.com-4` → `Bella Hadid [TheSpot.com 1]` (each site is
+  its own numbering series).
+- GUID names — and random letter/digit tokens like `ue73up` — take their
+  folder's name: `Bella/ue73up.jpg` → `Bella [ue73up].jpg`,
+  `Vacation 2019/550e8400-….jpg` → `Vacation 2019 [550e8400-…].jpg`.
+- `--date-prefix` prepends the capture date: `2019-06-01 Eddy Sant [01].webp`
+  (EXIF via exiftool when installed, video creation_time, else file mtime).
+- `--rename-folders` cleans directory names with the same rules.
 - Protected: camera counters (`IMG_1234`, `DSC_0001`, `PXL_…`) and
   screenshot/WhatsApp names are left verbatim — nothing human to fix, and
-  their dots and digits are data.
+  their dots and digits are data. Names already carrying an unrecognized
+  `[…]` tag are left alone, so re-runs are idempotent.
 - Live Photo `.mov` halves mirror their still's rename, and `.aae`/`.xmp`
   sidecars follow their media file, so pairings survive.
 - A rename never overwrites: collisions (e.g. `eddy_sant.jpg` +
   `eddy.sant.jpg`) keep the loser's old name and log it.
+- **Every applied batch is recorded** in `.mediate-renames.json` at the
+  library root; `mediate DIR --undo-renames` reverses the most recent batch
+  (repeatable, batch by batch).
 
 ```sh
 mediate ~/Pictures/Library --rename-only --dry-run   # preview the renames
+mediate ~/Pictures/Library --undo-renames            # regret the last batch
 ```
 
 Options:
@@ -113,6 +130,11 @@ An original is disposed of **only** after all of these pass:
 3. The output file is larger than 0 bytes.
 4. (Videos) `ffmpeg -v error -i out.mp4 -f null -` exits `0` **and** prints
    nothing to stderr (full-decode integrity check).
+5. Metadata survived: a photo whose source has an EXIF capture date must
+   carry the same date in the WebP (exiftool when installed, structural
+   EXIF-block check otherwise) — this is what catches e.g. cwebp silently
+   dropping TIFF metadata. A video's duration must match the source within
+   1s/2%, catching truncated encodes that still decode cleanly.
 
 On any failure the partial output is removed, the original is untouched, and
 the reason is logged.
@@ -135,8 +157,19 @@ Additional safeguards beyond the checklist:
 
 ## Notes
 
+- `.aae`/`.xmp` sidecars describe their original file, so when an original is
+  disposed of after conversion, its sidecars travel with it.
+- ffprobe results are cached (`~/Library/Caches/mediate` / `$XDG_CACHE_HOME`),
+  keyed by path+mtime+size, so re-running over a large already-standardized
+  library is near-instant.
+- Files over 100 MB log a "converting … this may take a while" line — a big
+  video at `-preset slow` can encode for many minutes.
+- Windows: the Recycle Bin is not supported — mediate requires
+  `--graveyard DIR` or `--hard-delete` there.
 - MKVs with text subtitle tracks can fail to mux into MP4; those files fail
   validation and the originals are kept (visible in the log).
+- `.tif` inputs whose EXIF matters will fail the new metadata check (cwebp
+  cannot carry TIFF metadata) and stay untouched — by design.
 - Live Photo detection is by naming convention (same directory + stem,
   `.mov` beside a still); unrelated files that happen to share a name are
   skipped too — the log says why, and `--convert-live-photos` overrides.
