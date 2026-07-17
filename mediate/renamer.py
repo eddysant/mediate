@@ -8,11 +8,11 @@ Rules, in order of application per file:
   the folder usually says everything.
 - "Copy of X" / "X - copy" / "X copy 2" markers are folded into numbering.
 - Trailing numbering is parsed from "(N)", "[N]", "[site N]" or a
-  dash-separated "-N" ("Bonnie Wright - 2", "Cora-Keegan-001"). A bare
+  dash-separated "-N" ("Wren Tally - 2", "Tilly-Marsh-001"). A bare
   space-number ("Terminator 2") is NOT numbering. Dash-numbers require a
   non-digit before the dash so dates ("2023-01-05") survive.
-- A website token in the stem ("Bella-Hadid-TheSpot.com-4") moves into the
-  bracket tag: "Bella Hadid [TheSpot.com 1]".
+- A website token in the stem ("Nova-Quinn-Example.com-4") moves into the
+  bracket tag: "Nova Quinn [Example.com 1]".
 - Survivors are renumbered per (directory, base, site, extension) series:
   always compacted to start at 1, gaps closed, zero-padded to two digits
   once the series reaches double digits, re-emitted as " [N]"/" [site N]".
@@ -70,7 +70,7 @@ COPY_OF_RE = re.compile(r"^copy of[ _]+(?P<base>.+)$", re.IGNORECASE)
 COPY_PAREN_RE = re.compile(r"^(?P<base>.*?)[ _-]*\(\s*copy\s*(?P<n>\d+)?\s*\)$", re.IGNORECASE)
 COPY_TAIL_RE = re.compile(r"^(?P<base>.*?)[ _-]+copy(?:[ _-]*(?P<n>\d+))?$", re.IGNORECASE)
 # Domain labels here exclude dashes on purpose: in filenames a dash is far
-# more likely a separator ("Bella-Hadid-TheSpot.com") than part of a domain.
+# more likely a separator ("Nova-Quinn-Example.com") than part of a domain.
 SITE_RE = re.compile(
     r"(?:(?<=^)|(?<=[-_.\s]))"
     r"(?P<site>(?:[A-Za-z0-9]+\.)+"

@@ -23,17 +23,17 @@ class PlanFileTests(unittest.TestCase):
         return path
 
     def test_roundtrip_and_apply(self):
-        self.touch("eddy sant (1).jpg")
+        self.touch("misty vale (1).jpg")
         plan_path = self.root / "plan.json"
         write_plan(self.root, plan_renames(self.root), plan_path)
         loaded = load_plan(self.root, plan_path)
         self.assertEqual(
             [(p.src.name, p.dst.name) for p in loaded],
-            [("eddy sant (1).jpg", "Eddy Sant [1].jpg")],
+            [("misty vale (1).jpg", "Misty Vale [1].jpg")],
         )
         renamed, skipped, _ = apply_renames(loaded, self.root, dry_run=False)
         self.assertEqual((renamed, skipped), (1, 0))
-        self.assertTrue((self.root / "Eddy Sant [1].jpg").exists())
+        self.assertTrue((self.root / "Misty Vale [1].jpg").exists())
 
     def test_edited_plan_is_honored(self):
         self.touch("a.jpg")

@@ -61,8 +61,8 @@ skips conversion entirely. Both respect `--dry-run`.
   title-cased (small words like "of" stay lower unless leading; existing
   capitalization such as `USA` or `McDonald` is respected), extensions
   lowercased, Unicode NFC-normalized.
-- Numbering: `photo (1)` → `Photo [1]`, `Bonnie Wright - 2` →
-  `Bonnie Wright [1]`, `Cora-Keegan-001` → `Cora Keegan [1]`; `Copy of X` /
+- Numbering: `photo (1)` → `Photo [1]`, `Wren Tally - 2` →
+  `Wren Tally [1]`, `Tilly-Marsh-001` → `Tilly Marsh [1]`; `Copy of X` /
   `X - copy` / `X copy 2` markers join the numbering. Every series is
   compacted to start at 1 with gaps closed (`1,2,4` → `1,2,3`); once a series
   reaches double digits, single digits are zero-padded (`[01]`…`[10]`) so
@@ -71,12 +71,12 @@ skips conversion entirely. Both respect `--dry-run`.
   space-number (`Terminator 2`) is *not* treated as numbering; only
   `(N)`/`[N]`/dash-`N` forms are.
 - Websites in the name move into the tag:
-  `Bella-Hadid-TheSpot.com-4` → `Bella Hadid [TheSpot.com 1]` (each site is
+  `Nova-Quinn-Example.com-4` → `Nova Quinn [Example.com 1]` (each site is
   its own numbering series).
 - GUID names — and random letter/digit tokens like `ue73up` — take their
-  folder's name: `Bella/ue73up.jpg` → `Bella [ue73up].jpg`,
+  folder's name: `Nova/ue73up.jpg` → `Nova [ue73up].jpg`,
   `Vacation 2019/550e8400-….jpg` → `Vacation 2019 [550e8400-…].jpg`.
-- `--date-prefix` prepends the capture date: `2019-06-01 Eddy Sant [01].webp`
+- `--date-prefix` prepends the capture date: `2019-06-01 Misty Vale [01].webp`
   (EXIF via exiftool when installed, video creation_time, else file mtime).
 - `--rename-folders` cleans directory names with the same rules.
 - Protected: camera counters (`IMG_1234`, `DSC_0001`, `PXL_…`) and
@@ -85,8 +85,8 @@ skips conversion entirely. Both respect `--dry-run`.
   `[…]` tag are left alone, so re-runs are idempotent.
 - Live Photo `.mov` halves mirror their still's rename, and `.aae`/`.xmp`
   sidecars follow their media file, so pairings survive.
-- A rename never overwrites: collisions (e.g. `eddy_sant.jpg` +
-  `eddy.sant.jpg`) keep the loser's old name and log it.
+- A rename never overwrites: collisions (e.g. `misty_vale.jpg` +
+  `misty.vale.jpg`) keep the loser's old name and log it.
 - **Every applied batch is recorded** in `.mediate-renames.json` at the
   library root; `mediate DIR --undo-renames` reverses the most recent batch
   (repeatable, batch by batch).

@@ -1,6 +1,6 @@
 # mediate — Architecture Notes
 
-Stdlib-only Python (≥3.9) CLI by Eddy Sant, built with AI assistance. Recursively
+Stdlib-only Python (≥3.9) CLI by Misty Vale, built with AI assistance. Recursively
 standardizes a media library: photos → lossless WebP (`cwebp`), videos/animated
 GIFs → h264/yuv420p/AAC MP4 (`ffmpeg`). Originals are disposed of (Trash by
 default) **only** after a strict validation checklist. No Python dependencies —
@@ -99,7 +99,7 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   `[site]`) parse first; any *other* trailing `[…]` marks the name opaque
   (already standardized, e.g. a GUID tag) and only the extension case is
   touched — that's what makes re-runs idempotent. Dash-numbers require a
-  non-digit before the dash (`Cora-Keegan-001` numbers, `2023-01-05` does
+  non-digit before the dash (`Tilly-Marsh-001` numbers, `2023-01-05` does
   not); a bare space-number (`Terminator 2`) is never numbering. `SITE_RE`
   domain labels deliberately exclude dashes — in filenames a dash is a
   separator, not part of a hyphenated domain.
