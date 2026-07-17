@@ -130,6 +130,12 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   push/PR; a `v*` tag additionally builds `mediate.pyz` (stdlib zipapp) and
   creates the GitHub Release with `--generate-notes`. Releasing = bump
   version in `__init__.py`/`pyproject.toml`, tag, push the tag.
+- **Homebrew tap** (`eddysant/homebrew-tap`, sibling checkout at
+  `~/Code/homebrew-tap`): `Formula/mediate.rb` wraps the release source
+  tarball (libexec + PYTHONPATH bin shim on brewed python; ffmpeg/webp as
+  deps, exiftool in caveats). After each release, bump the formula's `url`
+  tag and `sha256` (`curl -sL <tarball> | shasum -a 256`) and push the tap —
+  this is a manual step; CI can't push cross-repo without a PAT.
 
 ## Testing
 

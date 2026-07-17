@@ -32,16 +32,22 @@ Skipped automatically:
 - `cwebp`, `ffmpeg`, `ffprobe` on PATH: `brew install webp ffmpeg`
 - HEIC conversion additionally needs macOS (`sips` is built in)
 
+## Install
+
+```sh
+brew install eddysant/tap/mediate     # installs ffmpeg + webp too
+```
+
+or grab the single-file `mediate.pyz` from the
+[latest release](https://github.com/eddysant/mediate/releases/latest), or run
+from a checkout with no install at all.
+
 ## Usage
 
 ```sh
-# from the project root, no install needed
-python3 -m mediate ~/Pictures/Library --dry-run   # preview only
-python3 -m mediate ~/Pictures/Library             # convert; originals -> Trash
-
-# or install the `mediate` command
-pip install .
-mediate ~/Pictures/Library --dry-run
+python3 -m mediate ~/Pictures/Library --dry-run   # from the project root
+mediate ~/Pictures/Library --dry-run              # brew / pip install .
+mediate ~/Pictures/Library                        # convert; originals -> Trash
 ```
 
 A sensible full-strength invocation for a real library:
