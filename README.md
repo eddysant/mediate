@@ -50,6 +50,35 @@ A sensible full-strength invocation for a real library:
 mediate ~/Pictures/Library --only-if-smaller --convert-heic
 ```
 
+## Name standardization (`--rename` / `--rename-only`)
+
+Besides formats, mediate can settle *naming* disputes. `--rename` runs after
+conversion (so fresh `.webp`/`.mp4` outputs are covered too); `--rename-only`
+skips conversion entirely. Both respect `--dry-run`.
+
+- Cleanup: underscores/dots to spaces, whitespace collapsed, lowercase words
+  title-cased (small words like "of" stay lower unless leading; existing
+  capitalization such as `USA` or `McDonald` is respected), extensions
+  lowercased, Unicode NFC-normalized.
+- Numbering: `photo (1)` becomes `Photo [1]`; `Copy of X` / `X - copy` /
+  `X copy 2` markers join the numbering; gaps are closed (`1,2,4` → `1,2,3`);
+  once a series reaches double digits, single digits are zero-padded
+  (`[01]`…`[10]`) so lexical order equals numeric order. Series are per
+  directory + base name + extension.
+- GUID names take their folder's name: `Vacation 2019/550e8400-….jpg` →
+  `Vacation 2019 [550e8400-…].jpg`.
+- Protected: camera counters (`IMG_1234`, `DSC_0001`, `PXL_…`) and
+  screenshot/WhatsApp names are left verbatim — nothing human to fix, and
+  their dots and digits are data.
+- Live Photo `.mov` halves mirror their still's rename, and `.aae`/`.xmp`
+  sidecars follow their media file, so pairings survive.
+- A rename never overwrites: collisions (e.g. `eddy_sant.jpg` +
+  `eddy.sant.jpg`) keep the loser's old name and log it.
+
+```sh
+mediate ~/Pictures/Library --rename-only --dry-run   # preview the renames
+```
+
 Options:
 
 - `--dry-run` — traverse and print what would happen; nothing is written or deleted.

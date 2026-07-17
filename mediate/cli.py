@@ -82,6 +82,18 @@ def parse_args(argv=None) -> argparse.Namespace:
         "them (default: skip such pairs, since converting the video half breaks "
         "Live Photo pairing in Apple Photos)",
     )
+    parser.add_argument(
+        "--rename",
+        action="store_true",
+        help="after converting, standardize file names: cleanup + title case, "
+        "'(N)' -> '[N]' with gaps closed and zero-padding, GUID names replaced "
+        "by the folder name + [guid]",
+    )
+    parser.add_argument(
+        "--rename-only",
+        action="store_true",
+        help="only standardize file names; no conversions",
+    )
     disposal = parser.add_mutually_exclusive_group()
     disposal.add_argument(
         "--graveyard",
@@ -140,7 +152,7 @@ def main(argv=None) -> int:
         return 2
 
     missing = [tool for tool in REQUIRED_TOOLS if shutil.which(tool) is None]
-    if missing and not args.dry_run:
+    if missing and not args.dry_run and not args.rename_only:
         print(
             f"error: required tool(s) not found on PATH: {', '.join(missing)}\n"
             "install them first, e.g.: brew install webp ffmpeg",
@@ -163,6 +175,9 @@ def main(argv=None) -> int:
         dispose_label=dispose_label,
     )
 
+    if args.rename_only:
+        return run_rename_phase(root, args.dry_run)
+
     jobs = list(iter_media(root))
     run_mode = " (dry run)" if args.dry_run else ""
     log.info("scanning %s%s: %d candidate file(s), log: %s", root, run_mode, len(jobs), log_path)
@@ -174,8 +189,8 @@ def main(argv=None) -> int:
             ", ".join(missing),
         )
     if not jobs:
-        log.info("nothing to do")
-        return 0
+        log.info("nothing to convert")
+        return run_rename_phase(root, args.dry_run) if args.rename else 0
 
     # Planning-time skips, resolved before the pool starts:
     # 1. Live Photo pairs — converting the .mov half breaks the pairing.
@@ -235,7 +250,26 @@ def main(argv=None) -> int:
             "done: %d converted, %d skipped, %d failed, %.1f MB saved",
             tally[CONVERTED], tally[SKIPPED], tally[FAILED], saved_mb,
         )
+    if args.rename:
+        # Rename runs after conversion so freshly produced .webp/.mp4 files
+        # get their names standardized in the same pass.
+        run_rename_phase(root, args.dry_run)
     return 1 if tally[FAILED] else 0
+
+
+def run_rename_phase(root: Path, dry_run: bool) -> int:
+    from .renamer import apply_renames, plan_renames
+
+    plans = plan_renames(root)
+    if not plans:
+        log.info("names: nothing to rename")
+        return 0
+    renamed, skipped = apply_renames(plans, root, dry_run)
+    if dry_run:
+        log.info("names: %d file(s) would be renamed", renamed)
+    else:
+        log.info("names: %d renamed, %d skipped", renamed, skipped)
+    return 0
 
 
 if __name__ == "__main__":

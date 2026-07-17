@@ -17,6 +17,7 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 | `validators.py` | the 4-step checklist (exit code, exists, size > 0, full-decode integrity for videos) |
 | `disposal.py` | Trash (macOS per-volume `.Trashes`, freedesktop elsewhere) / `--graveyard DIR` / `--hard-delete` |
 | `macmeta.py` | ctypes `setattrlist(2)` to copy the original's birthtime (Finder "date created") onto outputs; no-op off macOS |
+| `renamer.py` | `--rename`/`--rename-only` phase: stem parsing (numbers/copy markers), cleanup + title case, per-(dir, base, ext) series renumbering with gap-closing and zero-padding, GUID→folder-name, never-overwrite apply loop |
 
 ## The safety pipeline (order matters)
 
@@ -69,6 +70,20 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 - `setattrlist` is the only stable macOS API for setting `ATTR_CMN_CRTIME`;
   also, setting mtime older than birthtime implicitly lowers birthtime, so the
   utime→set_birthtime order matters less than it looks — but keep it anyway.
+- **Renamer gap-closing needs the deferred-apply loop** (`apply_renames`):
+  `[2]→[1], [3]→[2]` — the second rename's target is occupied until the first
+  happens. Renames whose target is another pending rename's source wait a
+  round; anything still blocked when a full round makes no progress is skipped
+  (never overwritten). `samefile()` distinguishes a real collision from a
+  case-only rename on case-insensitive APFS (`exists()` lies there).
+- **Renamer protected patterns run on the number-stripped base**: `IMG_1234
+  (1).JPG` still gets `(1)→[1]` and `.jpg`, but the `IMG_1234` stem is
+  verbatim. `PROTECTED_RE` must allow multi-group counters
+  (`PXL_20230101_123456`). Word cleanup replaces dots, so timestamped names
+  (Screenshot/WhatsApp) are in `NO_CLEAN_RE` — their dots are times.
+- **Live Photo `.mov`s mirror their still's rename** rather than renumbering
+  in their own series; otherwise diverging gap-closes would break the
+  dir+stem pairing the converter's Live Photo guard relies on.
 
 ## Testing
 
