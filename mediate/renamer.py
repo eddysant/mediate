@@ -46,6 +46,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
 
+from .exiftool import run_exiftool
 from .scanner import BUNDLE_EXTS, GIF_EXTS, HEIC_EXTS, MP4_EXTS, PHOTO_EXTS, VIDEO_EXTS
 
 log = logging.getLogger("mediate")
@@ -189,12 +190,9 @@ def clean_base(base: str) -> str:
 def media_date(path: Path) -> str:
     """Capture date as YYYY-MM-DD: EXIF via exiftool when installed, video
     creation_time via ffprobe, else the file's mtime."""
-    if shutil.which("exiftool"):
-        proc = subprocess.run(
-            ["exiftool", "-s3", "-d", "%Y-%m-%d", "-DateTimeOriginal", "-CreateDate", str(path)],
-            capture_output=True, text=True,
-        )
-        for line in proc.stdout.splitlines():
+    out = run_exiftool(["-s3", "-d", "%Y-%m-%d", "-DateTimeOriginal", "-CreateDate", str(path)])
+    if out:
+        for line in out.splitlines():
             if re.fullmatch(r"\d{4}-\d{2}-\d{2}", line.strip()):
                 return line.strip()
     if path.suffix.lower() in (VIDEO_EXTS | MP4_EXTS) and shutil.which("ffprobe"):
@@ -411,6 +409,38 @@ def apply_renames(plans: List[Rename], root: Path, dry_run: bool) -> Tuple[int, 
             break
         pending = deferred
     return renamed, skipped, applied
+
+
+def write_plan(root: Path, plans: List[Rename], path: Path) -> None:
+    """Serialize a rename plan for review/editing before applying."""
+    path.write_text(
+        json.dumps(
+            {
+                "root": str(root),
+                "renames": [
+                    {"from": str(p.src.relative_to(root)), "to": str(p.dst.relative_to(root))}
+                    for p in plans
+                ],
+            },
+            indent=1,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def load_plan(root: Path, path: Path) -> List[Rename]:
+    """Load an (possibly hand-edited) plan. Every path must be relative and
+    stay inside root — a plan file is user input, not trusted state."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    plans: List[Rename] = []
+    for entry in data.get("renames", []):
+        src_rel, dst_rel = Path(entry["from"]), Path(entry["to"])
+        for rel in (src_rel, dst_rel):
+            if rel.is_absolute() or ".." in rel.parts:
+                raise ValueError(f"plan entry escapes the library root: {rel}")
+        plans.append(Rename(root / src_rel, root / dst_rel))
+    return plans
 
 
 def _manifest_path(root: Path) -> Path:

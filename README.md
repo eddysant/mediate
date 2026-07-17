@@ -94,6 +94,10 @@ skips conversion entirely. Both respect `--dry-run`.
 ```sh
 mediate ~/Pictures/Library --rename-only --dry-run   # preview the renames
 mediate ~/Pictures/Library --undo-renames            # regret the last batch
+
+# review-then-commit: write the plan, edit the JSON, apply it
+mediate ~/Pictures/Library --rename-only --plan-file plan.json
+mediate ~/Pictures/Library --apply-plan plan.json
 ```
 
 Options:
@@ -112,6 +116,9 @@ Options:
 - `--graveyard DIR` — move originals to DIR (mirroring the folder structure)
   instead of the Trash.
 - `--hard-delete` — permanently delete originals (the pre-Trash behavior).
+- `--plan-file PATH` / `--apply-plan PATH` — write the proposed renames as
+  editable JSON instead of applying, then apply the (possibly hand-edited)
+  plan later. Applied plans are recorded for `--undo-renames` like any batch.
 - `--workers N` — concurrent conversions (default 2; ffmpeg is already
   multithreaded, so higher values mainly help photo-heavy libraries).
 - `--log-file PATH` — detailed log location (default: `conversion.log` inside
@@ -120,6 +127,21 @@ Options:
 
 Exit code is `0` when nothing failed, `1` if any file failed validation,
 `2` for usage errors (bad directory, missing tools).
+
+## Config file
+
+Default flags live in `~/.config/mediate/config` (or `$MEDIATE_CONFIG`) —
+one flag per line, `#` comments:
+
+```
+# my defaults
+--only-if-smaller
+--convert-heic
+--workers 4
+```
+
+They are prepended to every invocation; `--no-config` ignores the file for
+one run.
 
 ## Safety protocol
 
@@ -162,8 +184,12 @@ Additional safeguards beyond the checklist:
 - ffprobe results are cached (`~/Library/Caches/mediate` / `$XDG_CACHE_HOME`),
   keyed by path+mtime+size, so re-running over a large already-standardized
   library is near-instant.
-- Files over 100 MB log a "converting … this may take a while" line — a big
-  video at `-preset slow` can encode for many minutes.
+- Videos longer than a minute report live encode progress (25/50/75% marks
+  via ffmpeg's `-progress` pipe); files over 100 MB additionally announce
+  themselves up front.
+- exiftool queries (metadata validation, `--date-prefix`, Live Photo
+  verification) go through a persistent `-stay_open` daemon — one process
+  for the whole run instead of one per file.
 - Windows: the Recycle Bin is not supported — mediate requires
   `--graveyard DIR` or `--hard-delete` there.
 - MKVs with text subtitle tracks can fail to mux into MP4; those files fail

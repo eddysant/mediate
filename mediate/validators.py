@@ -3,11 +3,12 @@ original file may be deleted."""
 
 from __future__ import annotations
 
-import shutil
 import subprocess
-from functools import lru_cache
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Tuple
+
+from .exiftool import exiftool_available, run_exiftool
+from .probe import media_duration
 
 
 def _tail(stderr: str, lines: int = 3) -> str:
@@ -48,17 +49,9 @@ def validate_output(
     return True, "ok"
 
 
-@lru_cache(maxsize=1)
-def _has_exiftool() -> bool:
-    return shutil.which("exiftool") is not None
-
-
 def _exif_date(path: Path) -> str:
-    proc = subprocess.run(
-        ["exiftool", "-s3", "-DateTimeOriginal", str(path)],
-        capture_output=True, text=True,
-    )
-    return proc.stdout.strip() if proc.returncode == 0 else ""
+    out = run_exiftool(["-s3", "-DateTimeOriginal", str(path)])
+    return out.strip() if out else ""
 
 
 def verify_photo_metadata(src: Path, output: Path) -> Tuple[bool, str]:
@@ -66,7 +59,7 @@ def verify_photo_metadata(src: Path, output: Path) -> Tuple[bool, str]:
     carries a capture date, the WebP must carry the same one. Uses exiftool
     when installed; otherwise falls back to a structural check (source had an
     EXIF block, output WebP must contain an EXIF RIFF chunk)."""
-    if _has_exiftool():
+    if exiftool_available():
         src_date = _exif_date(src)
         if src_date and _exif_date(output) != src_date:
             return False, "EXIF DateTimeOriginal not preserved in output"
@@ -84,23 +77,11 @@ def verify_photo_metadata(src: Path, output: Path) -> Tuple[bool, str]:
     return True, "ok"
 
 
-def _duration(path: Path) -> Optional[float]:
-    proc = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "csv=p=0", str(path)],
-        capture_output=True, text=True,
-    )
-    try:
-        return float(proc.stdout.strip())
-    except ValueError:
-        return None
-
-
 def verify_video_duration(src: Path, output: Path) -> Tuple[bool, str]:
     """A structurally valid MP4 can still be truncated. If both durations are
     readable they must agree within 1s (or 2% for long videos)."""
-    src_dur = _duration(src)
-    out_dur = _duration(output)
+    src_dur = media_duration(src)
+    out_dur = media_duration(output)
     if src_dur is not None and out_dur is not None:
         if abs(src_dur - out_dur) > max(1.0, src_dur * 0.02):
             return False, f"duration mismatch: source {src_dur:.1f}s vs output {out_dur:.1f}s"

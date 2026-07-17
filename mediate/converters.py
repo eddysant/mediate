@@ -6,6 +6,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,7 +14,7 @@ from typing import List, Optional
 
 from .disposal import Disposer
 from .macmeta import get_birthtime, set_birthtime
-from .probe import MP4_HEVC, MP4_STANDARD, gif_is_animated, mp4_status
+from .probe import MP4_HEVC, MP4_STANDARD, gif_is_animated, media_duration, mp4_status
 from .scanner import MediaJob
 from .validators import validate_output, verify_photo_metadata, verify_video_duration
 
@@ -92,6 +93,37 @@ def _run(cmd: List[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
+# Encodes shorter than this don't get progress reporting.
+PROGRESS_MIN_SECONDS = 60.0
+
+
+def _run_ffmpeg_progress(cmd: List[str], src: Path, total: float) -> subprocess.CompletedProcess:
+    """Run ffmpeg with `-progress pipe:1` and log 25/50/75% marks. stderr is
+    drained on a thread (validation needs it; blocking would deadlock)."""
+    cmd = [cmd[0], "-progress", "pipe:1", "-nostats", *cmd[1:]]
+    log.debug("running: %s", " ".join(cmd))
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    stderr_chunks: List[str] = []
+    drain = threading.Thread(target=lambda: stderr_chunks.append(proc.stderr.read()))
+    drain.start()
+    reported = 0
+    for line in proc.stdout:
+        if line.startswith("out_time_ms="):  # microseconds, despite the name
+            try:
+                pct = int(int(line.split("=", 1)[1]) / 1_000_000 / total * 100)
+            except (ValueError, ZeroDivisionError):
+                continue
+            if pct >= reported + 25 and pct < 100:
+                reported = pct - pct % 25
+                log.info("       %s: %d%%", src.name, reported)
+    proc.wait()
+    drain.join()
+    return subprocess.CompletedProcess(cmd, proc.returncode, "", stderr_chunks[0] if stderr_chunks else "")
+
+
 def _convert(kind: str, src: Path, tmp: Path) -> subprocess.CompletedProcess:
     """Run the conversion subprocess(es) for a job. HEIC goes through a
     two-step pipeline: sips (built into macOS, decodes HEVC-compressed
@@ -99,6 +131,12 @@ def _convert(kind: str, src: Path, tmp: Path) -> subprocess.CompletedProcess:
     lossless cwebp encode. PNG specifically: sips copies the EXIF block
     into it and cwebp extracts EXIF from PNG — with a TIFF intermediate
     cwebp drops the metadata ("EXIF extraction from TIFF is unsupported")."""
+    if kind in ("video", "gif"):
+        cmd = _build_command(kind, src, tmp)
+        total = media_duration(src)
+        if total and total >= PROGRESS_MIN_SECONDS:
+            return _run_ffmpeg_progress(cmd, src, total)
+        return _run(cmd)
     if kind != "heic":
         return _run(_build_command(kind, src, tmp))
 

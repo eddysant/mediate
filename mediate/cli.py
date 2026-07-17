@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import shutil
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -35,7 +36,39 @@ STATUS_MARKS = {
 }
 
 
+def config_file_path() -> Path:
+    override = os.environ.get("MEDIATE_CONFIG")
+    if override:
+        return Path(override)
+    base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return base / "mediate" / "config"
+
+
+def load_config_args() -> list:
+    """Default flags from the config file: one flag per line, # comments.
+    They are prepended to the command line, so explicit arguments win where
+    argparse takes the last value (note: a store_true flag from the config
+    cannot be switched off per-run except with --no-config)."""
+    path = config_file_path()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    args = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            args.extend(line.split(None, 1) if line.startswith("--") and " " in line else [line])
+    return args
+
+
 def parse_args(argv=None) -> argparse.Namespace:
+    if argv is None:
+        argv = sys.argv[1:]
+    if "--no-config" not in argv:
+        config_args = load_config_args()
+        if config_args:
+            argv = config_args + list(argv)
     parser = argparse.ArgumentParser(
         prog="mediate",
         description=(
@@ -112,6 +145,26 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="reverse the most recent rename batch recorded in the library's "
         ".mediate-renames.json, then exit",
     )
+    parser.add_argument(
+        "--plan-file",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="with --rename/--rename-only: write the proposed renames to PATH "
+        "as editable JSON instead of applying them",
+    )
+    parser.add_argument(
+        "--apply-plan",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="apply a (possibly hand-edited) plan written by --plan-file, then exit",
+    )
+    parser.add_argument(
+        "--no-config",
+        action="store_true",
+        help="ignore the config file (~/.config/mediate/config)",
+    )
     disposal = parser.add_mutually_exclusive_group()
     disposal.add_argument(
         "--graveyard",
@@ -186,6 +239,23 @@ def main(argv=None) -> int:
 
         restored = undo_last_batch(root, args.dry_run)
         log.info("names: %d rename(s) %srestored", restored, "would be " if args.dry_run else "")
+        return 0
+
+    if args.apply_plan:
+        from .renamer import apply_renames, load_plan, record_batch
+
+        try:
+            plans = load_plan(root, args.apply_plan)
+        except (OSError, ValueError, KeyError) as exc:
+            print(f"error: cannot load plan {args.apply_plan}: {exc}", file=sys.stderr)
+            return 2
+        renamed, skipped, applied = apply_renames(plans, root, args.dry_run)
+        if not args.dry_run:
+            record_batch(root, applied)
+        log.info(
+            "plan applied: %d renamed, %d skipped%s",
+            renamed, skipped, " (dry run)" if args.dry_run else " (undo with --undo-renames)",
+        )
         return 0
 
     mode = HARD if args.hard_delete else GRAVEYARD if args.graveyard else TRASH
@@ -293,11 +363,21 @@ def main(argv=None) -> int:
 
 
 def run_rename_phase(root: Path, args: argparse.Namespace) -> int:
-    from .renamer import apply_renames, plan_folder_renames, plan_renames, record_batch
+    from .renamer import apply_renames, plan_folder_renames, plan_renames, record_batch, write_plan
 
     dry_run = args.dry_run
     plans = plan_renames(root, date_prefix=args.date_prefix)
     folder_plans = plan_folder_renames(root) if args.rename_folders else []
+    if args.plan_file:
+        # Files before folders: the same order apply uses, so an edited plan
+        # replayed via --apply-plan keeps paths valid.
+        write_plan(root, plans + folder_plans, args.plan_file)
+        log.info(
+            "names: plan with %d rename(s) written to %s — review/edit, then run "
+            "mediate %s --apply-plan %s",
+            len(plans) + len(folder_plans), args.plan_file, root, args.plan_file,
+        )
+        return 0
     if not plans and not folder_plans:
         log.info("names: nothing to rename")
         return 0

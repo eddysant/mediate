@@ -17,6 +17,7 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 | `validators.py` | the 4-step checklist (exit code, exists, size > 0, full-decode integrity for videos) |
 | `disposal.py` | Trash (macOS per-volume `.Trashes`, freedesktop elsewhere) / `--graveyard DIR` / `--hard-delete` |
 | `macmeta.py` | ctypes `setattrlist(2)` to copy the original's birthtime (Finder "date created") onto outputs; no-op off macOS |
+| `exiftool.py` | persistent `exiftool -stay_open` daemon behind `run_exiftool(args)` (thread-safe, atexit-stopped, one-shot fallback); all exiftool queries go through it |
 | `renamer.py` | `--rename`/`--rename-only` phase: stem parsing (paren/bracket/dash numbers, copy markers, `[site N]` tags, websites), cleanup + title case, per-(dir, base, site, ext) series renumbering compacted to 1 with gap-closing and zero-padding, GUID/random-token→folder-name, `--date-prefix`, `--rename-folders`, manifest + `--undo-renames`, never-overwrite apply loop |
 
 ## The safety pipeline (order matters)
@@ -113,6 +114,22 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 - **Probe results are cached** (`probe.py`: path+mtime+size keyed JSON in the
   user cache dir, loaded/saved by cli) — a 50k-file re-run would otherwise
   spawn ffprobe per MP4/GIF. `load_probe_cache()` must run before the pool.
+  `media_duration()` lives here too (shared by validation and progress).
+- **ffmpeg progress** (`_run_ffmpeg_progress` in converters): `-progress
+  pipe:1 -nostats`, parse `out_time_ms=` (microseconds despite the name),
+  log 25/50/75% marks; stderr MUST be drained on a thread or the pipe fills
+  and ffmpeg deadlocks. Only for encodes with known duration ≥ 60s.
+- **Plan files** (`write_plan`/`load_plan`): editable JSON, `--plan-file` to
+  write, `--apply-plan` to execute. `load_plan` rejects absolute paths and
+  `..` segments — a plan file is user input. Applied plans are recorded in
+  the undo manifest like any batch.
+- **Config file** (`~/.config/mediate/config` or `$MEDIATE_CONFIG`): flags
+  one per line, prepended to argv in `parse_args` unless `--no-config`.
+  Tests must set `MEDIATE_CONFIG=/nonexistent` to stay hermetic.
+- **CI** (`.github/workflows/ci.yml`): unit tests on ubuntu+macos for every
+  push/PR; a `v*` tag additionally builds `mediate.pyz` (stdlib zipapp) and
+  creates the GitHub Release with `--generate-notes`. Releasing = bump
+  version in `__init__.py`/`pyproject.toml`, tag, push the tag.
 
 ## Testing
 

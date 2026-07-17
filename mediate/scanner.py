@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterator, List, Tuple
+
+from .exiftool import exiftool_available, run_exiftool
 
 log = logging.getLogger("mediate")
 
@@ -93,18 +93,15 @@ def find_live_photo_companions(jobs: List[MediaJob]) -> Dict[Path, Path]:
 
 
 def _content_identifier(path: Path) -> str:
-    proc = subprocess.run(
-        ["exiftool", "-s3", "-ContentIdentifier", str(path)],
-        capture_output=True, text=True,
-    )
-    return proc.stdout.strip() if proc.returncode == 0 else ""
+    out = run_exiftool(["-s3", "-ContentIdentifier", str(path)])
+    return out.strip() if out else ""
 
 
 def _verify_live_pairs(companions: Dict[Path, Path]) -> Dict[Path, Path]:
     """When exiftool is available, drop stem-pairs whose ContentIdentifiers
     both exist but differ — same name, provably not a Live Photo. Pairs stay
     protected when in doubt (missing exiftool or missing identifiers)."""
-    if not companions or shutil.which("exiftool") is None:
+    if not companions or not exiftool_available():
         return companions
     verified: Dict[Path, Path] = {}
     for mov, still in companions.items():

@@ -116,6 +116,23 @@ def _mp4_status_uncached(path: Path) -> str:
     return MP4_NEEDS_CONVERSION
 
 
+def media_duration(path: Path) -> "float | None":
+    """Container duration in seconds, or None if unreadable. Cached."""
+    return _cached("dur", path, lambda: _media_duration_uncached(path))
+
+
+def _media_duration_uncached(path: Path) -> "float | None":
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True,
+    )
+    try:
+        return float(proc.stdout.strip())
+    except ValueError:
+        return None
+
+
 def gif_is_animated(path: Path) -> bool:
     """True if the GIF has more than one frame. Probe failures count as
     animated so the file still goes through the (validated) conversion."""

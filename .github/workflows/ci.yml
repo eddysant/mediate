@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run unit tests
+        run: python -m unittest discover tests -v
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build zipapp
+        run: |
+          mkdir -p build/zipapp dist
+          cp -R mediate build/zipapp/mediate
+          printf 'import sys\n\nfrom mediate.cli import main\n\nsys.exit(main())\n' > build/zipapp/__main__.py
+          python -m zipapp build/zipapp -o dist/mediate.pyz -p "/usr/bin/env python3" -c
+          chmod +x dist/mediate.pyz
+          ./dist/mediate.pyz --version
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/mediate.pyz \
+            --title "mediate ${GITHUB_REF_NAME#v}" \
+            --generate-notes
