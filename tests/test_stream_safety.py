@@ -9,6 +9,7 @@ from mediate.converters import (
     _build_command,
     _build_remux_command,
     _build_rotation_command,
+    _explain_source_truncation,
     process_job,
 )
 from mediate.probe import (
@@ -451,7 +452,7 @@ class StreamValidationTests(unittest.TestCase):
         wrong_video["pix_fmt"] = "yuv420p10le"
         ok, reason = self._verify(source, _inventory(wrong_video, self.japanese))
         self.assertFalse(ok)
-        self.assertIn("not h264/yuv420p", reason)
+        self.assertIn("not h264/8-bit 4:2:0", reason)
 
     def test_accepts_implicit_h264_limited_range(self):
         source_video = dict(self.video)
@@ -461,6 +462,27 @@ class StreamValidationTests(unittest.TestCase):
         source = _inventory(source_video, self.japanese)
         output = _inventory(output_video, self.japanese)
         self.assertEqual(self._verify(source, output), (True, "ok"))
+
+    def test_accepts_full_range_h264_pixel_format_alias(self):
+        full_range = dict(self.video)
+        full_range["pix_fmt"] = "yuvj420p"
+        full_range["color"] = {"color_range": "pc"}
+        inventory = _inventory(full_range, self.japanese)
+        self.assertEqual(self._verify(inventory, inventory), (True, "ok"))
+
+    def test_truncated_source_duration_failure_explains_missing_media(self):
+        reason = _explain_source_truncation(
+            "duration mismatch: source 34.7s vs output 21.5s",
+            "[matroska,webm] File ended prematurely",
+        )
+        self.assertIn("source file is truncated", reason)
+        self.assertIn("cannot be reconstructed", reason)
+        self.assertEqual(
+            _explain_source_truncation(
+                "duration mismatch: source 10.0s vs output 5.0s", ""
+            ),
+            "duration mismatch: source 10.0s vs output 5.0s",
+        )
 
     def test_allows_explicit_removal_of_an_extra_video_track(self):
         source = _inventory(

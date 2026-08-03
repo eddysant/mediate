@@ -124,6 +124,17 @@ class VideoStreamStatusTests(unittest.TestCase):
         ]}
         self.assertEqual(self._mock_status(data), STREAM_STANDARD)
 
+    def test_full_range_h264_alias_is_standard(self):
+        from unittest.mock import patch
+        from mediate.probe import MP4_STANDARD, STREAM_STANDARD, _mp4_status_uncached
+        data = {"streams": [
+            {"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuvj420p"},
+            {"codec_type": "audio", "codec_name": "aac"},
+        ]}
+        self.assertEqual(self._mock_status(data), STREAM_STANDARD)
+        with patch("mediate.probe._ffprobe_json", return_value=data):
+            self.assertEqual(_mp4_status_uncached(Path("full-range.mp4")), MP4_STANDARD)
+
     def test_hevc_aac_is_hevc(self):
         from mediate.probe import STREAM_HEVC
         data = {"streams": [

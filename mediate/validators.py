@@ -10,6 +10,7 @@ from typing import Tuple
 from .exiftool import exiftool_available, run_exiftool
 from .probe import (
     COLOR_FIELDS,
+    STANDARD_H264_PIXEL_FORMATS,
     audio_stream_label,
     check_video_integrity,
     inventory_streams,
@@ -358,9 +359,12 @@ def verify_video_streams(
 
     before_video = source_video[0]
     after_video = target_video[0]
-    if after_video.get("codec_name") != "h264" or after_video.get("pix_fmt") != "yuv420p":
+    if (
+        after_video.get("codec_name") != "h264"
+        or after_video.get("pix_fmt") not in STANDARD_H264_PIXEL_FORMATS
+    ):
         return False, (
-            "primary output is not h264/yuv420p: "
+            "primary output is not h264/8-bit 4:2:0: "
             f"{after_video.get('codec_name')}/{after_video.get('pix_fmt')}"
         )
     if _normalised_rotation(before_video.get("rotation")) != _normalised_rotation(

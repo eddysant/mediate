@@ -144,7 +144,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         prog="mediate",
         description=(
             "Recursively standardize a media library: photos (JPEG/PNG/TIFF) to "
-            "lossless WebP via cwebp, videos and animated GIFs to h264/yuv420p/AAC "
+            "lossless WebP via cwebp, videos and animated GIFs to h264/8-bit 4:2:0/AAC "
             "MP4 via ffmpeg. Originals are moved to the Trash only after the "
             "converted file passes a strict validation checklist."
         ),

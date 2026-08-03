@@ -34,7 +34,7 @@ VIDEO_EXTS = {
     ".m1v", ".m2v", ".m2p", ".mpv", ".divx", ".xvid",
 }
 
-# MP4s are probed first: correctly encoded ones (h264/yuv420p/aac) are skipped.
+# MP4s are probed first: compatible h264/8-bit 4:2:0/aac files are skipped.
 MP4_EXTS = {".mp4"}
 
 # macOS package directories that look like folders but are application data.

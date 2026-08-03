@@ -21,8 +21,11 @@ from .progress import run_ffmpeg_progress
 
 log = logging.getLogger("mediate")
 
-# mp4_status() results
-MP4_STANDARD = "standard"          # h264/yuv420p video, aac audio
+# mp4_status() results. yuvj420p is FFmpeg's deprecated name for full-range
+# 8-bit yuv420p; both have the same widely supported 4:2:0 sample layout.
+STANDARD_H264_PIXEL_FORMATS = frozenset({"yuv420p", "yuvj420p"})
+
+MP4_STANDARD = "standard"          # h264 8-bit 4:2:0 video, aac audio
 MP4_HEVC = "hevc"                  # hevc video, aac audio — Apple-native
 MP4_NEEDS_CONVERSION = "convert"
 
@@ -127,12 +130,14 @@ def _ffprobe_json(args: list) -> dict | None:
 
 
 def mp4_status(path: Path) -> str:
-    """Classify an .mp4: already standard (h264/yuv420p + AAC), HEVC (more
+    """Classify an .mp4: already standard (h264 8-bit 4:2:0 + AAC), HEVC (more
     space-efficient than h264 and Apple-native, so re-encoding it to h264
     only makes it bigger), or needing conversion. An unreadable file reports
     needs-conversion; the attempt that follows is protected by the
     validation protocol."""
-    return _cached("mp4", path, lambda: _mp4_status_uncached(path))
+    # Versioned key invalidates classifications made before full-range
+    # yuvj420p was recognised as 8-bit 4:2:0 compatible.
+    return _cached("mp4v2", path, lambda: _mp4_status_uncached(path))
 
 
 def _mp4_status_uncached(path: Path) -> str:
@@ -156,7 +161,11 @@ def _mp4_status_uncached(path: Path) -> str:
         return MP4_NEEDS_CONVERSION
     if any(s.get("codec_name") != "aac" for s in audio):
         return MP4_NEEDS_CONVERSION
-    if all(s.get("codec_name") == "h264" and s.get("pix_fmt") == "yuv420p" for s in video):
+    if all(
+        s.get("codec_name") == "h264"
+        and s.get("pix_fmt") in STANDARD_H264_PIXEL_FORMATS
+        for s in video
+    ):
         return MP4_STANDARD
     if all(s.get("codec_name") == "hevc" for s in video):
         return MP4_HEVC
@@ -164,17 +173,17 @@ def _mp4_status_uncached(path: Path) -> str:
 
 
 # video_stream_status() results — usable for any container, not just .mp4
-STREAM_STANDARD = "standard"       # h264/yuv420p video, aac (or no) audio
+STREAM_STANDARD = "standard"       # h264 8-bit 4:2:0, aac (or no) audio
 STREAM_HEVC = "hevc"               # hevc video, aac (or no) audio
 STREAM_NEEDS_CONVERSION = "convert"
 
 
 def video_stream_status(path: Path) -> str:
     """Classify *any* video file's streams (not just .mp4). Returns
-    STREAM_STANDARD when the streams are already h264/yuv420p + AAC and can
+    STREAM_STANDARD when streams are already h264 8-bit 4:2:0 + AAC and can
     be remuxed into MP4 with ``-c copy``, STREAM_HEVC for HEVC + AAC, or
     STREAM_NEEDS_CONVERSION when re-encoding is required."""
-    return _cached("vstream", path, lambda: _video_stream_status_uncached(path))
+    return _cached("vstreamv2", path, lambda: _video_stream_status_uncached(path))
 
 
 def _video_stream_status_uncached(path: Path) -> str:
@@ -199,7 +208,11 @@ def _video_stream_status_uncached(path: Path) -> str:
     # Audio must be AAC (or absent — some screen recordings have no audio)
     if any(s.get("codec_name") != "aac" for s in audio):
         return STREAM_NEEDS_CONVERSION
-    if all(s.get("codec_name") == "h264" and s.get("pix_fmt") == "yuv420p" for s in video):
+    if all(
+        s.get("codec_name") == "h264"
+        and s.get("pix_fmt") in STANDARD_H264_PIXEL_FORMATS
+        for s in video
+    ):
         return STREAM_STANDARD
     if all(s.get("codec_name") == "hevc" for s in video):
         return STREAM_HEVC

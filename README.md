@@ -15,7 +15,8 @@ validation checklist (and even then, it goes to the Trash, not oblivion).
 Skipped automatically:
 
 - `.webp`, hidden files/directories (`.DS_Store` etc.), static GIFs.
-- MP4s already h264/yuv420p/AAC (checked with `ffprobe`).
+- MP4s already h264/8-bit 4:2:0/AAC (including FFmpeg's full-range
+  `yuvj420p` alias, checked with `ffprobe`).
 - **HEVC MP4s** — smaller than h264 and Apple-native; re-encoding them to
   h264 only grows the file (`--reencode-hevc` to force).
 - **HEIC/HEIF** — already space-efficient (`--convert-heic` to convert).
@@ -206,6 +207,12 @@ compressed image coefficients and metadata without another lossy encode, then
 retries the normal conversion and validation. The repair is performed on a
 temporary file; the source remains untouched until the validated replacement
 transaction commits.
+
+Video containers that end prematurely are different: mediate can preserve the
+decodable prefix, but it cannot reconstruct packets that are absent from the
+file. If the encoded duration is shorter than the declared source duration,
+the run reports the source as truncated and keeps it rather than presenting a
+partial video as a complete repair.
 
 By default, already-standardized MP4s are classified by stream format and
 skipped without a full decode. `--validate-existing` enables the library-health

@@ -378,6 +378,23 @@ def _convert_photo(src: Path, tmp: Path) -> subprocess.CompletedProcess:
         repaired.unlink(missing_ok=True)
 
 
+def _explain_source_truncation(reason: str, stderr: str) -> str:
+    """Replace an output symptom with the irrecoverable source diagnosis."""
+    truncation_markers = (
+        "File ended prematurely",
+        "Input file is truncated",
+        "input file is truncated",
+    )
+    if "duration mismatch" in reason and any(
+        marker in stderr for marker in truncation_markers
+    ):
+        return (
+            "source file is truncated; missing media cannot be reconstructed "
+            f"({reason})"
+        )
+    return reason
+
+
 def _convert(
     kind: str,
     src: Path,
@@ -460,7 +477,9 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
             health = video_health(src)
             if health.get("ok"):
                 return Outcome(
-                    SKIPPED, src, "already standardized and healthy MP4 (h264/yuv420p/aac)"
+                    SKIPPED,
+                    src,
+                    "already standardized and healthy MP4 (h264/8-bit 4:2:0/aac)",
                 )
             repair = True
         if status == MP4_HEVC and not opts.reencode_hevc:
@@ -599,13 +618,16 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
             return verify_photo_metadata(src, tmp)
         if kind == "gif":
             return verify_video_duration(src, tmp)
-        return verify_video_streams(
+        result = verify_video_streams(
             src,
             tmp,
             inventory,
             allow_stream_removal=opts.allow_stream_removal,
             allow_video_downgrade=opts.allow_video_downgrade,
         )
+        if not result[0]:
+            return False, _explain_source_truncation(result[1], proc.stderr)
+        return result
 
     first_stage = (
         "repair-remux" if repair and lossless_repair_possible
