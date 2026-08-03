@@ -353,6 +353,26 @@ class StreamValidationTests(unittest.TestCase):
                 self.assertFalse(ok)
                 self.assertIn(message, reason)
 
+    def test_audio_sync_tolerance_is_frame_aware_but_still_rejects_drift(self):
+        source_video = dict(self.video)
+        source_video.update({"start_time": "0.080", "avg_frame_rate": "12/1"})
+        source_audio = dict(self.japanese)
+        source_audio["start_time"] = "0.000"
+        output_video = dict(self.video)
+        output_video.update({"start_time": "0.000", "avg_frame_rate": "12/1"})
+        rounded_audio = dict(self.japanese)
+        rounded_audio["start_time"] = "0.000"
+
+        source = _inventory(source_video, source_audio)
+        rounded = _inventory(output_video, rounded_audio)
+        self.assertEqual(self._verify(source, rounded), (True, "ok"))
+
+        drifted_audio = dict(rounded_audio)
+        drifted_audio["start_time"] = "0.200"
+        ok, reason = self._verify(source, _inventory(output_video, drifted_audio))
+        self.assertFalse(ok)
+        self.assertIn("A/V start offset changed", reason)
+
     def test_detects_advanced_video_that_needs_explicit_downgrade_permission(self):
         advanced = _stream(
             "video",

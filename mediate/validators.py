@@ -164,6 +164,19 @@ def _normalised_layout(value):
     return str(value).lower().replace(" ", "")
 
 
+def _av_offset_tolerance(video: dict) -> float:
+    """Allow codec/container rounding up to roughly one low-rate frame.
+
+    Legacy containers such as ASF quantise stream starts differently across
+    FFmpeg versions. A frame-aware bound avoids false failures while still
+    rejecting sync shifts large enough to be perceptible.
+    """
+    frame_rate = _rate(video.get("avg_frame_rate"))
+    if not frame_rate or frame_rate <= 0:
+        return 0.05
+    return max(0.05, min(0.15, 1.5 / frame_rate))
+
+
 def _subtitle_identity(stream: dict) -> dict:
     tags = stream.get("tags", {})
     title = tags.get("title") or tags.get("name") or tags.get("handler_name")
@@ -276,8 +289,13 @@ def verify_video_streams(
         if None not in (source_video_start, before_start, target_video_start, after_start):
             before_offset = before_start - source_video_start
             after_offset = after_start - target_video_start
-            if abs(before_offset - after_offset) > 0.05:
-                return False, f"audio track {index} A/V start offset changed"
+            tolerance = _av_offset_tolerance(source_video[0])
+            if abs(before_offset - after_offset) > tolerance:
+                return False, (
+                    f"audio track {index} A/V start offset changed: source "
+                    f"{before_offset:+.3f}s vs output {after_offset:+.3f}s "
+                    f"(tolerance {tolerance:.3f}s)"
+                )
 
     source_subtitles = preservable_subtitle_streams(source)
     target_subtitles = inventory_streams(target, "subtitle")
