@@ -21,6 +21,7 @@ from mediate.converters import (
     process_job,
 )
 from mediate.probe import (
+    audio_stream_label,
     attached_artwork_streams,
     inventory_streams,
     primary_video_streams,
@@ -132,8 +133,8 @@ class FFmpegIntegrationTests(unittest.TestCase):
         audio = inventory_streams(output, "audio")
         self.assertEqual(len(audio), 2)
         self.assertEqual([track["tags"].get("language") for track in audio], ["jpn", "eng"])
-        self.assertEqual(audio[0]["tags"].get("name"), "Japanese")
-        self.assertIn("Commentary", audio[1]["tags"].get("name", ""))
+        self.assertEqual(audio_stream_label(audio[0]), "Japanese")
+        self.assertIn("Commentary", audio_stream_label(audio[1]) or "")
         self.assertEqual([chapter["title"] for chapter in output["chapters"]], ["Opening", "Ending"])
 
     def test_subtitles_and_artwork_require_explicit_removal(self):
