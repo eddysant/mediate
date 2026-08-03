@@ -39,6 +39,7 @@ from .probe import (
 from .progress import ConversionCancelled, run_ffmpeg_progress
 from .scanner import MediaJob
 from .safety import SafetyError, SourceSnapshot, ensure_output_capacity
+from .transaction import ReplacementTransaction, TransactionError
 from .validators import (
     validate_output,
     verify_photo_metadata,
@@ -68,6 +69,7 @@ class Options:
     allow_video_downgrade: bool = False
     dispose: Optional[Disposer] = None
     dispose_label: str = "delete original"
+    transaction_root: Optional[Path] = None
 
 
 @dataclass
@@ -577,24 +579,32 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
     disposed = ""
     if not opts.keep_originals and opts.dispose is not None:
         try:
-            disposed = f", {opts.dispose(src)}"
-        except OSError as exc:
+            transaction = ReplacementTransaction.prepare(
+                opts.transaction_root or src.parent,
+                src,
+                final,
+                tmp,
+                opts.dispose,
+                sidecars=list(_sidecars_of(src)),
+                birthtime=src_birthtime,
+                expected_source_identity={
+                    "device": source_snapshot.device,
+                    "inode": source_snapshot.inode,
+                    "size": source_snapshot.size,
+                    "mtime_ns": source_snapshot.mtime_ns,
+                },
+            )
+            disposed = f", {transaction.commit()}"
+        except (OSError, TransactionError) as exc:
             tmp.unlink(missing_ok=True)
-            return Outcome(FAILED, src, f"could not dispose of original ({exc}); conversion discarded")
-        # Sidecars (.aae Apple edits, .xmp) describe the original file; once
-        # it is gone they are orphans, so they travel with it.
-        for sidecar in _sidecars_of(src):
-            try:
-                opts.dispose(sidecar)
-                disposed += f" with {sidecar.name}"
-            except OSError as exc:
-                log.warning("could not dispose of sidecar %s: %s", sidecar, exc)
-    os.replace(tmp, final)
-    # Preserve the original's timestamps so date-based sorting still works —
-    # mtime for everything, plus Finder's creation date on macOS.
-    os.utime(final, (src_stat.st_atime, src_stat.st_mtime))
-    if src_birthtime is not None:
-        set_birthtime(final, src_birthtime)
+            return Outcome(FAILED, src, f"transaction failed; original recovered: {exc}")
+    else:
+        os.replace(tmp, final)
+        # Preserve the original's timestamps so date-based sorting still works —
+        # mtime for everything, plus Finder's creation date on macOS.
+        os.utime(final, (src_stat.st_atime, src_stat.st_mtime))
+        if src_birthtime is not None:
+            set_birthtime(final, src_birthtime)
     if new_ext == ".mp4":
         mark_video_healthy(final)
 

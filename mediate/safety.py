@@ -5,8 +5,10 @@ from __future__ import annotations
 import os
 import shutil
 import stat
+import threading
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Optional
 
 
 class SafetyError(RuntimeError):
@@ -77,3 +79,77 @@ def ensure_output_capacity(directory: Path, source_size: int) -> None:
             f"insufficient free space: need at least {required / (1024 * 1024):.0f} MB, "
             f"have {free / (1024 * 1024):.0f} MB"
         )
+
+
+class DiskSpaceReservation:
+    def __init__(self, manager: "DiskSpaceReservations", device: int, amount: int) -> None:
+        self.manager = manager
+        self.device = device
+        self.amount = amount
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self.manager._release(self.device, self.amount)
+
+    def __enter__(self) -> "DiskSpaceReservation":
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback) -> None:
+        self.release()
+
+
+class DiskSpaceReservations:
+    """Reserve output budgets per filesystem across concurrent workers."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._reserved: dict[int, int] = {}
+
+    def acquire(
+        self,
+        directory: Path,
+        source_size: int,
+        cancelled: Optional[Callable[[], bool]] = None,
+    ) -> DiskSpaceReservation:
+        if not os.access(directory, os.W_OK):
+            raise SafetyError(f"output directory is not writable: {directory}")
+        try:
+            device = directory.stat().st_dev
+        except OSError as exc:
+            raise SafetyError(f"cannot identify output filesystem: {exc}") from exc
+        required = required_temporary_space(source_size)
+        with self._condition:
+            while True:
+                try:
+                    free = shutil.disk_usage(directory).free
+                except OSError as exc:
+                    raise SafetyError(f"cannot determine output free space: {exc}") from exc
+                already_reserved = self._reserved.get(device, 0)
+                if free - already_reserved >= required:
+                    self._reserved[device] = already_reserved + required
+                    return DiskSpaceReservation(self, device, required)
+                if already_reserved == 0:
+                    raise SafetyError(
+                        f"insufficient aggregate free space: need at least "
+                        f"{required / (1024 * 1024):.0f} MB, "
+                        f"have {free / (1024 * 1024):.0f} MB"
+                    )
+                if cancelled is not None and cancelled():
+                    raise SafetyError("cancelled while waiting for temporary disk space")
+                self._condition.wait(timeout=0.25)
+
+    def _release(self, device: int, amount: int) -> None:
+        with self._condition:
+            remaining = self._reserved.get(device, 0) - amount
+            if remaining > 0:
+                self._reserved[device] = remaining
+            else:
+                self._reserved.pop(device, None)
+            self._condition.notify_all()
+
+    def reserved_bytes(self, device: int) -> int:
+        with self._condition:
+            return self._reserved.get(device, 0)

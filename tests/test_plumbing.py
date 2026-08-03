@@ -202,9 +202,27 @@ class ScanCompletionTests(unittest.TestCase):
             lambda _path: "standard",
             "standard",
             health_fn=lambda _path: {"ok": False, "reason": "decode error"},
+            validate_health=True,
         )
         self.assertEqual(candidates, [damaged])
         self.assertEqual(count, 0)
+
+    def test_existing_health_validation_is_opt_in(self):
+        from unittest.mock import Mock
+        from mediate.cli import _filter_standardized_mp4
+        from mediate.scanner import MediaJob
+
+        complete = MediaJob(Path("complete.mp4"), "mp4")
+        health = Mock(return_value={"ok": False, "reason": "decode error"})
+        candidates, count = _filter_standardized_mp4(
+            [complete],
+            lambda _path: "standard",
+            "standard",
+            health_fn=health,
+        )
+        self.assertEqual(candidates, [])
+        self.assertEqual(count, 1)
+        health.assert_not_called()
 
     def test_one_worker_exception_does_not_abort_result_collection(self):
         from mediate.cli import _resolve_future

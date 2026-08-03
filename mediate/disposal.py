@@ -10,16 +10,14 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Tuple
+from typing import Optional, Tuple
 
 TRASH = "trash"
 GRAVEYARD = "graveyard"
 HARD = "hard-delete"
-
-# Disposer(path) -> short description of what happened, for the log line.
-Disposer = Callable[[Path], str]
 
 
 def _unique_dest(directory: Path, name: str) -> Path:
@@ -62,44 +60,99 @@ def _trash_dir_for(path: Path) -> Path:
     return xdg_data / "Trash" / "files"
 
 
-def _send_to_trash(path: Path) -> str:
+def _send_to_trash(path: Path, original_path: Optional[Path] = None) -> str:
+    logical_path = original_path or path
     trash_dir = _trash_dir_for(path)
-    dest = _unique_dest(trash_dir, path.name)
+    dest = _unique_dest(trash_dir, logical_path.name)
     _move(path, dest)
     if sys.platform != "darwin":
         # Minimal freedesktop trashinfo so desktop Trash UIs can restore it.
         info_dir = trash_dir.parent / "info"
         info_dir.mkdir(parents=True, exist_ok=True)
-        (info_dir / f"{dest.name}.trashinfo").write_text(
-            "[Trash Info]\n"
-            f"Path={path}\n"
-            f"DeletionDate={datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}\n",
-            encoding="utf-8",
-        )
+        try:
+            (info_dir / f"{dest.name}.trashinfo").write_text(
+                "[Trash Info]\n"
+                f"Path={logical_path}\n"
+                f"DeletionDate={datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            # The file is already safely in Trash. Missing UI metadata must
+            # not make the replacement transaction attempt an impossible
+            # rollback from a source path that no longer exists.
+            pass
     return "original moved to Trash"
 
 
-def make_disposer(mode: str, root: Path, graveyard: Path | None) -> Tuple[Disposer, str]:
-    """Return (disposer, human label of what will happen to originals)."""
-    if mode == HARD:
-        def dispose(path: Path) -> str:
+@dataclass(frozen=True)
+class DisposalPolicy:
+    """Serializable disposal behavior used by crash-recovery transactions."""
+
+    mode: str
+    root: Path
+    graveyard: Optional[Path] = None
+
+    def __post_init__(self) -> None:
+        if self.mode not in {TRASH, GRAVEYARD, HARD}:
+            raise ValueError(f"unknown disposal mode: {self.mode}")
+        if self.mode == GRAVEYARD and self.graveyard is None:
+            raise ValueError("graveyard disposal requires a destination")
+
+    def __call__(self, path: Path, original_path: Optional[Path] = None) -> str:
+        logical_path = original_path or path
+        if self.mode == HARD:
             path.unlink()
             return "original deleted"
-        return dispose, "delete original"
-
-    if mode == GRAVEYARD:
-        assert graveyard is not None
-        base = graveyard.expanduser().resolve()
-
-        def dispose(path: Path) -> str:
+        if self.mode == GRAVEYARD:
+            assert self.graveyard is not None
             try:
-                rel = path.resolve().relative_to(root)
+                rel = logical_path.resolve().relative_to(self.root)
             except ValueError:
-                rel = Path(path.name)
-            dest = base / rel
+                rel = Path(logical_path.name)
+            dest = self.graveyard / rel
             dest = _unique_dest(dest.parent, dest.name)
             _move(path, dest)
-            return f"original moved to {base.name}/{rel.parent}" if str(rel.parent) != "." else f"original moved to {base.name}/"
-        return dispose, f"move original to graveyard {base}"
+            return (
+                f"original moved to {self.graveyard.name}/{rel.parent}"
+                if str(rel.parent) != "."
+                else f"original moved to {self.graveyard.name}/"
+            )
+        return _send_to_trash(path, logical_path)
 
-    return _send_to_trash, "move original to Trash"
+    def to_dict(self) -> dict:
+        return {
+            "mode": self.mode,
+            "root": str(self.root),
+            "graveyard": str(self.graveyard) if self.graveyard is not None else None,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict) -> "DisposalPolicy":
+        mode = value.get("mode")
+        if mode not in {TRASH, GRAVEYARD, HARD}:
+            raise ValueError(f"unknown disposal mode: {mode}")
+        graveyard = value.get("graveyard")
+        if mode == GRAVEYARD and not graveyard:
+            raise ValueError("recorded graveyard transaction has no destination")
+        return cls(
+            mode,
+            Path(value["root"]).resolve(),
+            Path(graveyard).resolve() if graveyard else None,
+        )
+
+
+# DisposalPolicy(path, original_path=None) -> short description for the log.
+Disposer = DisposalPolicy
+
+
+def make_disposer(mode: str, root: Path, graveyard: Path | None) -> Tuple[DisposalPolicy, str]:
+    """Return (serializable policy, human label for original disposal)."""
+    base = graveyard.expanduser().resolve() if graveyard is not None else None
+    policy = DisposalPolicy(mode, root.resolve(), base)
+    if mode == HARD:
+        return policy, "delete original"
+    if mode == GRAVEYARD:
+        assert base is not None
+        return policy, f"move original to graveyard {base}"
+
+    return policy, "move original to Trash"

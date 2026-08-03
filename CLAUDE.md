@@ -16,9 +16,11 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 | `converters.py` | command construction, stream-safety policy, temp-file protocol, `process_job()`; includes `-c copy` remuxing for compatible containers and a rotation display-matrix finalizer |
 | `validators.py` | exit/existence/size/full-decode checks plus photo metadata and video duration/stream/track/chapter/rotation/colour verification |
 | `progress.py` | concurrent FFmpeg progress plus cooperative cancellation and child termination |
-| `safety.py` | source snapshots, link/readability policy, output writability and free-space preflight |
+| `safety.py` | source snapshots, link/readability policy, output writability and aggregate per-filesystem free-space reservations |
 | `journal.py` | atomic `.mediate-run.json` state and interrupted-job prioritization |
-| `disposal.py` | Trash (macOS per-volume `.Trashes`, freedesktop elsewhere) / `--graveyard DIR` / `--hard-delete` |
+| `transaction.py` | durable two-phase validated-output replacement plus startup rollback/completion recovery |
+| `capabilities.py` | FFmpeg/cwebp version, encoder, progress, rotation, smoke-encode, and ffprobe JSON preflight |
+| `disposal.py` | serializable Trash (macOS per-volume `.Trashes`, freedesktop elsewhere) / graveyard / hard-delete policy |
 | `macmeta.py` | ctypes `setattrlist(2)` to copy the original's birthtime (Finder "date created") onto outputs; no-op off macOS |
 | `exiftool.py` | persistent `exiftool -stay_open` daemon behind `run_exiftool(args)` (thread-safe, atexit-stopped, one-shot fallback); all exiftool queries go through it |
 | `renamer.py` | `--rename`/`--rename-only` phase: stem parsing (paren/bracket/dash numbers, copy markers, `[site N]` tags, websites), cleanup + title case, per-(dir, base, site, ext) series renumbering compacted to 1 with gap-closing and zero-padding, GUID/random-token→folder-name, `--date-prefix`, `--rename-folders`, manifest + `--undo-renames`, never-overwrite apply loop |
@@ -50,11 +52,12 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
    picture metadata. This is what stops cwebp's silent TIFF metadata drop and FFmpeg's
    default “best stream” selection from quietly losing an alternate track.
 5. `--only-if-smaller` check (after validation, before disposal).
-6. Dispose of the original (**before** `os.replace`, because a re-encoded
-   `foo.mp4` targets its own name). Disposal failure → discard temp, FAILED.
-   Sidecars (`.aae`/`.AAE`/`.xmp`) travel with the disposed original —
-   they describe a file that no longer exists.
-7. `os.replace(tmp, final)`, then `os.utime` (mtime) + `set_birthtime` (macOS).
+6. Write a durable local transaction manifest, atomically stage the original,
+   atomically install the validated output, and restore timestamps. A crash
+   before installation rolls back on startup; a crash after a proven install
+   finishes the recorded disposal policy.
+7. Dispose of the staged original and its sidecars using the serializable
+   Trash/graveyard/hard-delete policy, then remove the manifest.
 
 ## Gotchas / hard-won details
 
@@ -150,10 +153,11 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   10% updates plus one-minute heartbeats. The console logging handler clears
   and redraws live lines around ordinary records. stderr MUST be drained on a
   thread or the pipe fills and FFmpeg deadlocks.
-- **Standard MP4 health is full-decode cached**. Healthy MP4s disappear from
-  candidate work; damaged files first get a lossless tolerant remux and only
-  then a `+genpts+discardcorrupt`/`ignore_err` re-encode. Every rung gets the
-  complete strict validator. HEVC repair still requires
+- **Standard MP4 health is opt-in via `--validate-existing` and full-decode
+  cached**. Normal runs trust standard stream classification. With the flag,
+  damaged files first get a lossless tolerant remux and only then a
+  `+genpts+discardcorrupt`/`ignore_err` re-encode. Every rung gets the complete
+  strict validator. HEVC repair still requires
   `--reencode-hevc`. `mark_video_healthy()` avoids decoding a just-validated
   output again on the next scan.
 - **Plan files** (`write_plan`/`load_plan`): editable JSON, `--plan-file` to
@@ -179,7 +183,8 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 - `python3 -m unittest discover tests` — pure-Python scanner/rename/probe tests
   plus generated-media FFmpeg integration coverage for ASF/VOB, surround and
   multi-audio, chapters, subtitle/artwork policy, corruption, advanced-video
-  blocking, and rotation. Media tests auto-skip when
+  blocking, rotation, failure-injected transactions, aggregate reservations,
+  and a real toolchain smoke check. Media tests auto-skip when
   ffmpeg/ffprobe/libx264 are unavailable.
 - End-to-end verification is manual but scriptable: generate fixtures with
   ffmpeg lavfi (`testsrc=size=321x239` exercises the odd-dimension GIF filter;

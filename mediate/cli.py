@@ -5,12 +5,12 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import shutil
 import sys
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from . import __version__
+from .capabilities import check_media_capabilities
 from .converters import (
     CONVERTED,
     FAILED,
@@ -26,11 +26,11 @@ from .converters import (
 from .disposal import GRAVEYARD, HARD, TRASH, make_disposer
 from .journal import RunJournal
 from .progress import CANCELLATION, LIVE_PROGRESS, ConversionCancelled
+from .safety import DiskSpaceReservations, SafetyError
 from .scanner import find_live_photo_companions, iter_media
+from .transaction import recover_transactions
 
 log = logging.getLogger("mediate")
-
-REQUIRED_TOOLS = ("cwebp", "ffmpeg", "ffprobe")
 
 STATUS_MARKS = {
     CONVERTED: "[ok]",
@@ -67,9 +67,9 @@ def _resolve_future(future: Future, job) -> Outcome:
 
 
 def _filter_standardized_mp4(
-    jobs, status_fn, standard_status, health_fn=None, workers=2
+    jobs, status_fn, standard_status, health_fn=None, workers=2, validate_health=False
 ):
-    """Separate completed, healthy MP4 outputs from remaining work."""
+    """Separate completed MP4 outputs, optionally full-decoding their health."""
     if health_fn is None:
         from .probe import video_health
 
@@ -79,8 +79,8 @@ def _filter_standardized_mp4(
         job for job in jobs
         if job.kind == "mp4" and status_fn(job.path) == standard_status
     ]
-    healthy = set()
-    if possible:
+    healthy = {job.path for job in possible} if not validate_health else set()
+    if possible and validate_health:
         log.info("validating integrity: %d standardized MP4 file(s)", len(possible))
         pool = ThreadPoolExecutor(max_workers=min(max(1, workers), len(possible)))
         futures = {pool.submit(health_fn, job.path): job for job in possible}
@@ -201,6 +201,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         "picture semantics may change)",
     )
     parser.add_argument(
+        "--validate-existing",
+        action="store_true",
+        help="fully decode already-standardized MP4 files and attempt repair when "
+        "damage is found (default: trust their stream format and skip them)",
+    )
+    parser.add_argument(
         "--rename",
         action="store_true",
         help="after converting, standardize file names: cleanup + title case, "
@@ -309,17 +315,27 @@ def main(argv=None) -> int:
         print(f"error: not a directory: {root}", file=sys.stderr)
         return 2
 
-    missing = [tool for tool in REQUIRED_TOOLS if shutil.which(tool) is None]
-    if missing and not args.dry_run and not args.rename_only:
-        print(
-            f"error: required tool(s) not found on PATH: {', '.join(missing)}\n"
-            "install them first, e.g.: brew install webp ffmpeg",
-            file=sys.stderr,
-        )
-        return 2
-
     log_path = args.log_file or (root / "conversion.log")
     setup_logging(log_path, args.verbose)
+
+    recovery = recover_transactions(root, dry_run=args.dry_run)
+    for message in recovery.messages:
+        level = logging.ERROR if message.startswith("unresolved") else logging.WARNING
+        log.log(level, "transaction recovery: %s", message)
+    if recovery.completed or recovery.rolled_back:
+        qualifier = "would handle" if args.dry_run else "handled"
+        log.warning(
+            "transaction recovery: %s %d installed and %d incomplete conversion(s)",
+            qualifier,
+            recovery.completed,
+            recovery.rolled_back,
+        )
+    if recovery.unresolved and not args.dry_run:
+        log.error(
+            "refusing new work while %d transaction(s) require manual recovery",
+            recovery.unresolved,
+        )
+        return 2
 
     if args.undo_renames:
         from .renamer import undo_last_batch
@@ -363,6 +379,7 @@ def main(argv=None) -> int:
         allow_video_downgrade=args.allow_video_downgrade,
         dispose=dispose,
         dispose_label=dispose_label,
+        transaction_root=root,
     )
 
     if args.rename_only:
@@ -372,12 +389,33 @@ def main(argv=None) -> int:
 
     load_probe_cache()
     recognized = list(iter_media(root))
+    capability_report = check_media_capabilities(
+        require_video=any(job.kind in {"video", "mp4", "gif"} for job in recognized),
+        require_photos=any(
+            job.kind == "photo" or (job.kind == "heic" and args.convert_heic)
+            for job in recognized
+        ),
+    )
+    for name, version in capability_report.versions.items():
+        log.debug("toolchain: %s: %s", name, version)
+    for warning in capability_report.warnings:
+        log.warning("toolchain warning: %s", warning)
+    if capability_report.errors:
+        for error in capability_report.errors:
+            log.error("toolchain error: %s", error)
+        if not args.dry_run:
+            return 2
+        log.warning("dry run continuing despite toolchain errors; probe results may be incomplete")
     # Already-standardized MP4 outputs are recognized media, not unfinished
     # work. Filtering them before the headline count stops repeat runs over a
     # completed library from looking as though files were missed previously.
     try:
         jobs, standardized_count = _filter_standardized_mp4(
-            recognized, mp4_status, MP4_STANDARD, workers=args.workers
+            recognized,
+            mp4_status,
+            MP4_STANDARD,
+            workers=args.workers,
+            validate_health=args.validate_existing,
         )
     except KeyboardInterrupt:
         log.error("interrupted during integrity validation; originals untouched")
@@ -392,11 +430,6 @@ def main(argv=None) -> int:
         log.info("already standardized: %d MP4 file(s)", standardized_count)
     if not args.keep_originals and not args.dry_run:
         log.info("originals: %s after validation", dispose_label)
-    if missing:
-        log.warning(
-            "dry run without %s installed: MP4/GIF probing treats those files as needing conversion",
-            ", ".join(missing),
-        )
     if not jobs:
         log.info("nothing to convert")
         save_probe_cache()
@@ -435,13 +468,23 @@ def main(argv=None) -> int:
     if resumed_count:
         log.info("resume journal: prioritizing %d interrupted/unfinished file(s)", resumed_count)
 
+    space_reservations = DiskSpaceReservations()
+
     def process_journaled(job):
         journal.mark(job, "running")
         try:
-            outcome = process_job(job, opts)
+            source_size = job.path.stat().st_size
+            with space_reservations.acquire(
+                job.path.parent,
+                source_size,
+                cancelled=CANCELLATION.requested,
+            ):
+                outcome = process_job(job, opts)
         except ConversionCancelled:
             journal.mark(job, "interrupted", "cancelled; original kept")
             raise
+        except (OSError, SafetyError) as exc:
+            outcome = Outcome(FAILED, job.path, f"filesystem safety check failed: {exc}")
         except Exception as exc:
             journal.mark(job, "failed", f"unexpected processing error: {exc}")
             raise

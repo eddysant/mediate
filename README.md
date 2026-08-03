@@ -45,6 +45,10 @@ goes through ffprobe preflight and the same strict validation pipeline.
 - `cwebp`, `ffmpeg`, `ffprobe` on PATH: `brew install webp ffmpeg`
 - HEIC conversion additionally needs macOS (`sips` is built in)
 
+Before conversion, mediate checks tool versions and performs a tiny h264/AAC
+MP4 encode plus JSON probe. Missing encoders and mismatched FFmpeg builds fail
+up front with an installation or upgrade hint.
+
 ## Install
 
 ```sh
@@ -61,6 +65,7 @@ from a checkout with no install at all.
 python3 -m mediate ~/Pictures/Library --dry-run   # from the project root
 mediate ~/Pictures/Library --dry-run              # brew / pip install .
 mediate ~/Pictures/Library                        # convert; originals -> Trash
+mediate ~/Pictures/Library --validate-existing    # optional health scan + repair
 ```
 
 A sensible full-strength invocation for a real library:
@@ -137,6 +142,9 @@ Options:
   Compatible text subtitles and JPEG/PNG cover streams are always preserved.
 - `--allow-video-downgrade` — explicitly permit 8-bit h264 conversion of
   HDR/high-bit-depth, alpha, interlaced, or variable/unusual-frame-rate video.
+- `--validate-existing` — fully decode already-standardized MP4s and attempt
+  repair when corruption is found. This potentially expensive library-health
+  pass is off by default; newly converted outputs are always validated.
 - `--graveyard DIR` — move originals to DIR (mirroring the folder structure)
   instead of the Trash.
 - `--hard-delete` — permanently delete originals (the pre-Trash behavior).
@@ -189,13 +197,12 @@ An original is disposed of **only** after all of these pass:
 On any failure the partial output is removed, the original is untouched, and
 the reason is logged.
 
-Already-standardized MP4s are not trusted solely because their codecs match.
-Mediate fully decodes every video and audio stream once, caches that health
-result using filesystem identity plus sampled content, and reuses it on later
-scans. Repair is lossless-first: rebuild the container/index/timestamps with
-stream copy, validate it, then fall back to tolerant re-encoding only if that
-still fails. Every repaired file must pass the complete checklist above.
-Otherwise it is discarded and the original stays put.
+By default, already-standardized MP4s are classified by stream format and
+skipped without a full decode. `--validate-existing` enables the library-health
+pass: mediate fully decodes every video and audio stream, caches the result
+using filesystem identity plus sampled content, and repairs detected damage.
+Repair is lossless-first (container/index/timestamp rebuild), then tolerant
+re-encoding. Every repaired file still passes the complete checklist above.
 Damaged HEVC remains opt-in through `--reencode-hevc`.
 
 Additional safeguards beyond the checklist:
@@ -205,17 +212,26 @@ Additional safeguards beyond the checklist:
   `.trashinfo` on Linux). Video re-encoding is lossy — once an original is
   hard-deleted, that quality is gone forever, so recoverability is the default.
   Use `--graveyard DIR` for a reviewable folder or `--hard-delete` to opt out.
-- Conversions write to a hidden temp name (`.name.<rand>.part.ext`) in the
-  same directory and are renamed into place only after validation, so a crash
-  never leaves a half-written file wearing the final name.
+- Conversions write to a hidden temp name (`.name.<rand>.part.ext`) and enter a
+  durable two-phase replacement transaction only after validation. The
+  original is staged locally, the output is installed atomically, and the
+  recorded Trash/graveyard/delete policy runs last. On startup, interrupted
+  transactions either restore the original or finish a proven installation.
 - Video commands explicitly map the primary video plus **all** audio tracks
   and chapters. FFmpeg's implicit “best stream” selection is never trusted.
   A rotated video gets a short lossless remux after encoding to restore its
   display matrix before validation.
 - Before work starts, the source must be a readable regular file with no
   symlink or hard-link ambiguity, its output directory must be writable, and
-  conservative temporary free space must be available. Device/inode/size/mtime
-  are checked again before disposal so a moving source is never replaced.
+  conservative temporary free space must be available. Concurrent workers
+  reserve that budget per filesystem, so they cannot all spend the same free
+  bytes; work waits when another conversion holds the budget. Device/inode/
+  size/mtime are checked again before disposal so a moving source is never
+  replaced.
+- FFmpeg, ffprobe, libx264, AAC, MP4 muxing, JSON probing, progress support,
+  and rotation support are checked before media work begins. Unsupported
+  rotation tooling warns and fails affected files safely; core failures stop
+  the run with upgrade instructions.
 - Ctrl-C terminates active FFmpeg children, removes partial outputs, records
   queued/running work in `.mediate-run.json`, and prioritizes matching
   unfinished files on the next run.
@@ -231,7 +247,7 @@ Additional safeguards beyond the checklist:
   disposed of after conversion, its sidecars travel with it.
 - ffprobe results are cached (`~/Library/Caches/mediate` / `$XDG_CACHE_HOME`),
   keyed by path, nanosecond mtime/ctime, size, device, and inode. Expensive
-  full-decode health entries also include a sampled BLAKE2 fingerprint.
+  optional full-decode health entries also include a sampled BLAKE2 fingerprint.
   Completed MP4s are reported as one aggregate “already standardized” count.
 - An unexpected exception in one worker is recorded as that file's failure;
   it no longer stops collection of the rest of the scan and makes untouched

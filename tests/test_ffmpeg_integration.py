@@ -20,6 +20,7 @@ from mediate.converters import (
     Options,
     process_job,
 )
+from mediate.disposal import DisposalPolicy, HARD
 from mediate.probe import (
     audio_stream_label,
     attached_artwork_streams,
@@ -99,6 +100,29 @@ class FFmpegIntegrationTests(unittest.TestCase):
                 inventory = video_inventory(output)
                 self.assertEqual(len(primary_video_streams(inventory)), 1)
                 self.assertEqual(len(inventory_streams(inventory, "audio")), 1)
+
+    def test_validated_conversion_uses_transactional_hard_delete(self):
+        self.require_encoders("ffv1", "flac", "aac")
+        source = self.root / "transactional.mkv"
+        sidecar = self.root / "transactional.xmp"
+        sidecar.write_text("metadata", encoding="utf-8")
+        self.ffmpeg(
+            "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=12:duration=1",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+            "-c:v", "ffv1", "-level", "3", "-c:a", "flac", source,
+        )
+        outcome = process_job(
+            MediaJob(source, "video"),
+            Options(
+                dispose=DisposalPolicy(HARD, self.root),
+                transaction_root=self.root,
+            ),
+        )
+        self.assertEqual(outcome.status, CONVERTED, outcome.detail)
+        self.assertFalse(source.exists())
+        self.assertFalse(sidecar.exists())
+        self.assertTrue(source.with_suffix(".mp4").exists())
+        self.assertEqual(list(self.root.glob(".mediate-txn-*")), [])
 
     def test_multiple_audio_tracks_commentary_and_chapters_survive(self):
         self.require_encoders("ffv1", "flac", "aac")
