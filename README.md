@@ -43,6 +43,9 @@ goes through ffprobe preflight and the same strict validation pipeline.
 
 - Python ≥ 3.9 (no Python dependencies)
 - `cwebp`, `ffmpeg`, `ffprobe` on PATH: `brew install webp ffmpeg`
+- `jpegtran` from jpeg-turbo is optional for direct installs and enables
+  automatic lossless recovery of truncated JPEGs. The Homebrew mediate formula
+  includes it: `brew install jpeg-turbo`.
 - HEIC conversion additionally needs macOS (`sips` is built in)
 
 Before conversion, mediate checks tool versions and performs a tiny h264/AAC
@@ -196,6 +199,13 @@ An original is disposed of **only** after all of these pass:
 
 On any failure the partial output is removed, the original is untouched, and
 the reason is logged.
+
+When cwebp/libjpeg reports a truncated JPEG, mediate first runs the source
+through `jpegtran -copy all`. This rebuilds the JPEG structure while copying
+compressed image coefficients and metadata without another lossy encode, then
+retries the normal conversion and validation. The repair is performed on a
+temporary file; the source remains untouched until the validated replacement
+transaction commits.
 
 By default, already-standardized MP4s are classified by stream format and
 skipped without a full decode. `--validate-existing` enables the library-health

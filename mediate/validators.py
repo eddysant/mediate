@@ -22,7 +22,7 @@ from .probe import (
 )
 
 
-def _tail(stderr: str, lines: int = 3) -> str:
+def _tail(stderr: str, lines: int = 6) -> str:
     kept = [ln for ln in stderr.strip().splitlines() if ln.strip()]
     return " | ".join(kept[-lines:]) if kept else "(no stderr)"
 

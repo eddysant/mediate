@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import uuid
@@ -286,6 +287,97 @@ def _run(cmd: List[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
+def _jpegtran_path() -> Optional[str]:
+    """Find jpegtran, including Homebrew's keg-only jpeg-turbo install.
+
+    Homebrew deliberately does not link jpeg-turbo's command-line programs
+    into its global bin directory.  Deriving the prefix from cwebp keeps the
+    standalone app useful without spawning Homebrew during a conversion.
+    """
+    found = shutil.which("jpegtran")
+    if found:
+        return found
+    prefixes = []
+    cwebp = shutil.which("cwebp")
+    if cwebp:
+        prefixes.append(Path(cwebp).parent.parent)
+    prefixes.extend((Path("/opt/homebrew"), Path("/usr/local")))
+    seen = set()
+    for prefix in prefixes:
+        candidate = prefix / "opt" / "jpeg-turbo" / "bin" / "jpegtran"
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+def _convert_photo(src: Path, tmp: Path) -> subprocess.CompletedProcess:
+    """Convert a still, losslessly normalising a damaged JPEG if needed."""
+    direct = _run(_build_command("photo", src, tmp))
+    decode_failure = any(
+        marker in direct.stderr
+        for marker in (
+            "Cannot read input picture file",
+            "Could not process file",
+            "`jpegtran -copy all` MAY be able to process this file",
+        )
+    )
+    if (
+        direct.returncode == 0
+        or src.suffix.lower() not in (".jpg", ".jpeg")
+        or not decode_failure
+    ):
+        return direct
+
+    jpegtran = _jpegtran_path()
+    if jpegtran is None:
+        direct.stderr += (
+            "\nAutomatic lossless JPEG repair is unavailable: install jpeg-turbo "
+            "(`brew install jpeg-turbo`) and retry."
+        )
+        return direct
+
+    repaired = tmp.with_name(f".{tmp.name}.jpegtran.jpg")
+    try:
+        repaired.unlink(missing_ok=True)
+        normalise = _run([
+            jpegtran, "-copy", "all", "-outfile", str(repaired), str(src),
+        ])
+        # jpegtran commonly returns 2 for a truncated input even after it has
+        # emitted a complete, usable JPEG.  Treat the repaired artifact—not the
+        # warning exit—as authoritative and let cwebp plus validation decide.
+        if not repaired.is_file() or repaired.stat().st_size == 0:
+            detail = normalise.stderr.strip() or "jpegtran produced no usable output"
+            return subprocess.CompletedProcess(
+                normalise.args,
+                normalise.returncode or 1,
+                direct.stdout + normalise.stdout,
+                direct.stderr + f"\nLossless jpegtran repair failed: {detail}",
+            )
+        tmp.unlink(missing_ok=True)
+        retry = _run(_build_command("photo", repaired, tmp))
+        if retry.returncode == 0:
+            log.warning(
+                "       %s: repaired truncated JPEG losslessly with jpegtran before conversion",
+                src.name,
+            )
+        else:
+            normalise_detail = normalise.stderr.strip()
+            if normalise_detail:
+                normalise_detail = f"\njpegtran diagnostic: {normalise_detail}"
+            retry.stderr = (
+                direct.stderr
+                + normalise_detail
+                + "\njpegtran normalised the JPEG, but cwebp still rejected it:\n"
+                + retry.stderr
+            )
+        return retry
+    finally:
+        repaired.unlink(missing_ok=True)
+
+
 def _convert(
     kind: str,
     src: Path,
@@ -325,6 +417,8 @@ def _convert(
             )
         finally:
             encode_output.unlink(missing_ok=True)
+    if kind == "photo":
+        return _convert_photo(src, tmp)
     if kind != "heic":
         return _run(_build_command(kind, src, tmp))
 
