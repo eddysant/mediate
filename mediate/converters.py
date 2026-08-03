@@ -6,7 +6,6 @@ import logging
 import os
 import subprocess
 import sys
-import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,13 +23,16 @@ from .probe import (
     inventory_streams,
     is_commentary_stream,
     media_duration,
+    mark_video_healthy,
     mp4_status,
     preservation_summary,
     primary_video_streams,
     stream_removal_risks,
     video_inventory,
+    video_health,
     video_stream_status,
 )
+from .progress import run_ffmpeg_progress
 from .scanner import MediaJob
 from .validators import (
     validate_output,
@@ -44,6 +46,7 @@ log = logging.getLogger("mediate")
 # Outcome statuses
 CONVERTED = "converted"
 REMUXED = "remuxed"
+REPAIRED = "repaired"
 SKIPPED = "skipped"
 FAILED = "failed"
 PLANNED = "planned"  # dry-run
@@ -153,6 +156,7 @@ def _build_command(
     input_path: Path,
     output_path: Path,
     inventory: Optional[dict] = None,
+    repair: bool = False,
 ) -> List[str]:
     if kind == "photo":
         return [
@@ -162,8 +166,12 @@ def _build_command(
     if kind == "video":
         if inventory is None:
             raise ValueError("video conversion requires a stream inventory")
+        input_repair = [
+            "-fflags", "+genpts+discardcorrupt", "-err_detect", "ignore_err",
+        ] if repair else []
         return [
-            "ffmpeg", "-nostdin", "-y", "-noautorotate", "-i", str(input_path),
+            "ffmpeg", "-nostdin", "-y", *input_repair,
+            "-noautorotate", "-i", str(input_path),
             *_video_mapping_args(inventory),
             "-map_metadata", "0", "-map_metadata:s:v:0", "0:s:v:0",
             "-map_chapters", "0",
@@ -220,42 +228,12 @@ def _run(cmd: List[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
-# Encodes shorter than this don't get progress reporting.
-PROGRESS_MIN_SECONDS = 60.0
-
-
-def _run_ffmpeg_progress(cmd: List[str], src: Path, total: float) -> subprocess.CompletedProcess:
-    """Run ffmpeg with `-progress pipe:1` and log 25/50/75% marks. stderr is
-    drained on a thread (validation needs it; blocking would deadlock)."""
-    cmd = [cmd[0], "-progress", "pipe:1", "-nostats", *cmd[1:]]
-    log.debug("running: %s", " ".join(cmd))
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, encoding="utf-8", errors="replace",
-    )
-    stderr_chunks: List[str] = []
-    drain = threading.Thread(target=lambda: stderr_chunks.append(proc.stderr.read()))
-    drain.start()
-    reported = 0
-    for line in proc.stdout:
-        if line.startswith("out_time_ms="):  # microseconds, despite the name
-            try:
-                pct = int(int(line.split("=", 1)[1]) / 1_000_000 / total * 100)
-            except (ValueError, ZeroDivisionError):
-                continue
-            if pct >= reported + 25 and pct < 100:
-                reported = pct - pct % 25
-                log.info("       %s: %d%%", src.name, reported)
-    proc.wait()
-    drain.join()
-    return subprocess.CompletedProcess(cmd, proc.returncode, "", stderr_chunks[0] if stderr_chunks else "")
-
-
 def _convert(
     kind: str,
     src: Path,
     tmp: Path,
     inventory: Optional[dict] = None,
+    repair: bool = False,
 ) -> subprocess.CompletedProcess:
     """Run the conversion subprocess(es) for a job. HEIC goes through a
     two-step pipeline: sips (built into macOS, decodes HEVC-compressed
@@ -270,12 +248,10 @@ def _convert(
             rotation = primary_video_streams(inventory)[0].get("rotation")
             if rotation is not None:
                 encode_output = tmp.with_name(f".{tmp.name}.encoded.mp4")
-        cmd = _build_command(kind, src, encode_output, inventory)
+        cmd = _build_command(kind, src, encode_output, inventory, repair=repair)
         total = media_duration(src)
-        if total and total >= PROGRESS_MIN_SECONDS:
-            proc = _run_ffmpeg_progress(cmd, src, total)
-        else:
-            proc = _run(cmd)
+        log.debug("running: %s", " ".join(cmd))
+        proc = run_ffmpeg_progress(cmd, src, total, "repairing" if repair else "encoding")
         if rotation is None:
             return proc
         if proc.returncode != 0:
@@ -319,13 +295,26 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
     src = job.path
     kind = job.kind
     remux = False  # set True when we can use -c copy instead of re-encoding
+    repair = False
     inventory = None
 
     if kind == "mp4":
         status = mp4_status(src)
         if status == MP4_STANDARD:
-            return Outcome(SKIPPED, src, "already standardized MP4 (h264/yuv420p/aac)")
+            health = video_health(src)
+            if health.get("ok"):
+                return Outcome(
+                    SKIPPED, src, "already standardized and healthy MP4 (h264/yuv420p/aac)"
+                )
+            repair = True
         if status == MP4_HEVC and not opts.reencode_hevc:
+            health = video_health(src)
+            if not health.get("ok"):
+                return Outcome(
+                    SKIPPED,
+                    src,
+                    "damaged HEVC MP4; --reencode-hevc is required to attempt repair",
+                )
             return Outcome(
                 SKIPPED, src,
                 "HEVC MP4 (smaller than h264 and Apple-native; --reencode-hevc to convert anyway)",
@@ -371,13 +360,14 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
     # Re-encoding a non-standard .mp4 targets its own name; that only works
     # if the original is removed first, so pick a new name when keeping it.
     if final == src and opts.keep_originals:
-        final = src.with_name(src.stem + ".standardized.mp4")
+        suffix = ".repaired.mp4" if repair else ".standardized.mp4"
+        final = src.with_name(src.stem + suffix)
 
     if final != src and final.exists():
         return Outcome(SKIPPED, src, f"output already exists: {final.name}")
 
     if opts.dry_run:
-        verb = "remux" if remux else "convert"
+        verb = "repair" if repair else "remux" if remux else "convert"
         action = verb if opts.keep_originals else f"{verb} and {opts.dispose_label}"
         detail = f"would {action} -> {final.name}"
         if inventory is not None:
@@ -394,7 +384,9 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
     # wearing the final name.
     tmp = final.with_name(f".{final.stem}.{uuid.uuid4().hex[:8]}.part{final.suffix}")
     src_size_pre = src.stat().st_size
-    if remux:
+    if repair:
+        log.info("       repairing %s (%s), damaged packets may be discarded...", src.name, _fmt_size(src_size_pre))
+    elif remux:
         log.debug("remuxing %s (%s) with -c copy", src.name, _fmt_size(src_size_pre))
     else:
         # A big video at -preset slow can encode for many minutes: say so.
@@ -402,13 +394,38 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
         log.info("       %s", started) if src_size_pre >= 100 * 1024 * 1024 else log.debug("%s", started)
     try:
         if remux:
-            proc = _run(_build_remux_command(src, tmp, inventory))
+            cmd = _build_remux_command(src, tmp, inventory)
+            log.debug("running: %s", " ".join(cmd))
+            proc = run_ffmpeg_progress(cmd, src, media_duration(src), "remuxing")
         else:
-            proc = _convert(kind, src, tmp, inventory)
+            proc = _convert(kind, src, tmp, inventory, repair=repair)
     except FileNotFoundError as exc:
         return Outcome(FAILED, src, f"converter not found: {exc}")
 
-    ok, reason = validate_output(proc.returncode, proc.stderr, tmp, is_video=(new_ext == ".mp4"))
+    ok, reason = validate_output(
+        proc.returncode,
+        proc.stderr,
+        tmp,
+        is_video=(new_ext == ".mp4"),
+        progress_path=src,
+    )
+    repairable_failure = (
+        kind == "video"
+        and not repair
+        and (proc.returncode != 0 or reason.startswith("integrity check failed"))
+    )
+    if not ok and repairable_failure:
+        log.warning("       %s: normal conversion failed; attempting tolerant repair", src.name)
+        tmp.unlink(missing_ok=True)
+        try:
+            proc = _convert("video", src, tmp, inventory, repair=True)
+        except FileNotFoundError as exc:
+            return Outcome(FAILED, src, f"converter not found: {exc}")
+        repair = True
+        remux = False
+        ok, reason = validate_output(
+            proc.returncode, proc.stderr, tmp, is_video=True, progress_path=src
+        )
     if ok:
         # 5. Metadata/duration verification, beyond structural integrity.
         if new_ext == ".webp":
@@ -459,8 +476,10 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
     os.utime(final, (src_stat.st_atime, src_stat.st_mtime))
     if src_birthtime is not None:
         set_birthtime(final, src_birthtime)
+    if new_ext == ".mp4":
+        mark_video_healthy(final)
 
-    outcome_status = REMUXED if remux else CONVERTED
+    outcome_status = REPAIRED if repair else REMUXED if remux else CONVERTED
     return Outcome(
         outcome_status,
         src,

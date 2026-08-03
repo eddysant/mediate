@@ -137,10 +137,19 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   user cache dir, loaded/saved by cli) — a 50k-file re-run would otherwise
   spawn ffprobe per MP4/GIF. `load_probe_cache()` must run before the pool.
   `media_duration()` lives here too (shared by validation and progress).
-- **ffmpeg progress** (`_run_ffmpeg_progress` in converters): `-progress
-  pipe:1 -nostats`, parse `out_time_ms=` (microseconds despite the name),
-  log 25/50/75% marks; stderr MUST be drained on a thread or the pipe fills
-  and ffmpeg deadlocks. Only for encodes with known duration ≥ 60s.
+- **Concurrent FFmpeg progress** (`progress.py`): all encodes, remuxes, and
+  integrity decodes use `-progress pipe:1 -nostats`. Interactive terminals get
+  one stable line per active worker (bar/time/speed/ETA); redirected logs get
+  10% updates plus one-minute heartbeats. The console logging handler clears
+  and redraws live lines around ordinary records. stderr MUST be drained on a
+  thread or the pipe fills and FFmpeg deadlocks.
+- **Standard MP4 health is full-decode cached** (`video_health`, keyed by the
+  usual path+mtime+size). Healthy MP4s disappear from candidate work; damaged
+  h264 MP4s get one `+genpts+discardcorrupt`/`ignore_err` re-encode and then the
+  complete strict validator. Normal video conversions that fail structurally
+  receive the same one-time fallback. HEVC repair still requires
+  `--reencode-hevc`. `mark_video_healthy()` avoids decoding a just-validated
+  output again on the next scan.
 - **Plan files** (`write_plan`/`load_plan`): editable JSON, `--plan-file` to
   write, `--apply-plan` to execute. `load_plan` rejects absolute paths and
   `..` segments — a plan file is user input. Applied plans are recorded in
@@ -161,8 +170,10 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 
 ## Testing
 
-- `python3 -m unittest discover tests` — scanner classification, hidden/bundle
-  skips, Live Photo pairing rules. Pure-tmpdir, no media tools needed.
+- `python3 -m unittest discover tests` — pure-Python scanner/rename/probe tests
+  plus generated-media FFmpeg integration coverage for ASF/VOB, multi-audio
+  chapters, subtitle/artwork policy, and rotation. Media tests auto-skip when
+  ffmpeg/ffprobe/libx264 are unavailable.
 - End-to-end verification is manual but scriptable: generate fixtures with
   ffmpeg lavfi (`testsrc=size=321x239` exercises the odd-dimension GIF filter;
   `sips -s format heic` fabricates HEICs; `exiftool` seeds EXIF), run against a

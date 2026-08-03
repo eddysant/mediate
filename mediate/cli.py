@@ -15,6 +15,7 @@ from .converters import (
     CONVERTED,
     FAILED,
     PLANNED,
+    REPAIRED,
     REMUXED,
     SKIPPED,
     Options,
@@ -23,6 +24,7 @@ from .converters import (
     process_job,
 )
 from .disposal import GRAVEYARD, HARD, TRASH, make_disposer
+from .progress import LIVE_PROGRESS
 from .scanner import find_live_photo_companions, iter_media
 
 log = logging.getLogger("mediate")
@@ -31,11 +33,20 @@ REQUIRED_TOOLS = ("cwebp", "ffmpeg", "ffprobe")
 
 STATUS_MARKS = {
     CONVERTED: "[ok]",
+    REPAIRED: "[fix]",
     REMUXED: "[ok]",
     SKIPPED: "[skip]",
     FAILED: "[FAIL]",
     PLANNED: "[dry]",
 }
+
+
+class ProgressStreamHandler(logging.StreamHandler):
+    """Keep ordinary log records from overwriting live progress lines."""
+
+    def emit(self, record) -> None:
+        with LIVE_PROGRESS.logging_context():
+            super().emit(record)
 
 
 def _resolve_future(future: Future, job) -> Outcome:
@@ -52,16 +63,33 @@ def _resolve_future(future: Future, job) -> Outcome:
         return Outcome(FAILED, job.path, f"unexpected processing error: {exc}")
 
 
-def _filter_standardized_mp4(jobs, status_fn, standard_status):
-    """Separate completed MP4 outputs from files that still need evaluation."""
-    candidates = []
-    standardized_count = 0
-    for job in jobs:
-        if job.kind == "mp4" and status_fn(job.path) == standard_status:
-            standardized_count += 1
-        else:
-            candidates.append(job)
-    return candidates, standardized_count
+def _filter_standardized_mp4(
+    jobs, status_fn, standard_status, health_fn=None, workers=2
+):
+    """Separate completed, healthy MP4 outputs from remaining work."""
+    if health_fn is None:
+        from .probe import video_health
+
+        health_fn = video_health
+
+    possible = [
+        job for job in jobs
+        if job.kind == "mp4" and status_fn(job.path) == standard_status
+    ]
+    healthy = set()
+    if possible:
+        log.info("validating integrity: %d standardized MP4 file(s)", len(possible))
+        with ThreadPoolExecutor(max_workers=min(max(1, workers), len(possible))) as pool:
+            futures = {pool.submit(health_fn, job.path): job for job in possible}
+            for future in as_completed(futures):
+                try:
+                    if future.result().get("ok"):
+                        healthy.add(futures[future].path)
+                except Exception:
+                    log.debug(
+                        "health check failed for %s", futures[future].path, exc_info=True
+                    )
+    return [job for job in jobs if job.path not in healthy], len(healthy)
 
 
 def config_file_path() -> Path:
@@ -237,7 +265,8 @@ def parse_args(argv=None) -> argparse.Namespace:
 def setup_logging(log_path: Path, verbose: bool) -> None:
     log.setLevel(logging.DEBUG)
 
-    console = logging.StreamHandler(sys.stdout)
+    LIVE_PROGRESS.configure(sys.stdout, enabled=True)
+    console = ProgressStreamHandler(sys.stdout)
     console.setLevel(logging.DEBUG if verbose else logging.INFO)
     console.setFormatter(logging.Formatter("%(message)s"))
     log.addHandler(console)
@@ -324,8 +353,11 @@ def main(argv=None) -> int:
     # work. Filtering them before the headline count stops repeat runs over a
     # completed library from looking as though files were missed previously.
     jobs, standardized_count = _filter_standardized_mp4(
-        recognized, mp4_status, MP4_STANDARD
+        recognized, mp4_status, MP4_STANDARD, workers=args.workers
     )
+    # Preserve expensive integrity results even if a later conversion is
+    # interrupted; newly produced outputs are saved again at the end.
+    save_probe_cache()
     run_mode = " (dry run)" if args.dry_run else ""
     log.info("scanning %s%s: %d candidate file(s), log: %s", root, run_mode, len(jobs), log_path)
     if standardized_count:
@@ -370,7 +402,14 @@ def main(argv=None) -> int:
             claimed[out] = job.path
             runnable.append(job)
 
-    tally = {CONVERTED: 0, REMUXED: 0, SKIPPED: 0, FAILED: 0, PLANNED: 0}
+    tally = {
+        CONVERTED: 0,
+        REMUXED: 0,
+        REPAIRED: 0,
+        SKIPPED: 0,
+        FAILED: 0,
+        PLANNED: 0,
+    }
     bytes_saved = 0
     for outcome in planned_skips:
         tally[outcome.status] += 1
@@ -401,6 +440,8 @@ def main(argv=None) -> int:
             parts.append(f"{tally[CONVERTED]} converted")
         if tally[REMUXED]:
             parts.append(f"{tally[REMUXED]} remuxed")
+        if tally[REPAIRED]:
+            parts.append(f"{tally[REPAIRED]} repaired")
         parts.append(f"{tally[SKIPPED]} skipped")
         parts.append(f"{tally[FAILED]} failed")
         parts.append(f"{saved_mb:.1f} MB saved")

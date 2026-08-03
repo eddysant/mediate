@@ -183,6 +183,15 @@ An original is disposed of **only** after all of these pass:
 On any failure the partial output is removed, the original is untouched, and
 the reason is logged.
 
+Already-standardized MP4s are not trusted solely because their codecs match.
+Mediate fully decodes every video and audio stream once, caches that health
+result by path/mtime/size, and reuses it on later scans. A damaged h264 MP4—or
+a nonstandard video whose normal conversion fails—gets one tolerant repair
+attempt that regenerates timestamps and discards corrupt packets. The repaired
+file must still pass every integrity, duration, stream, chapter, rotation, and
+colour check above. Otherwise it is discarded and the original stays put.
+Damaged HEVC remains opt-in through `--reencode-hevc`.
+
 Additional safeguards beyond the checklist:
 
 - **Originals go to the Trash by default** (per-volume `.Trashes` on macOS so
@@ -214,9 +223,10 @@ Additional safeguards beyond the checklist:
 - An unexpected exception in one worker is recorded as that file's failure;
   it no longer stops collection of the rest of the scan and makes untouched
   files appear only on the next run.
-- Videos longer than a minute report live encode progress (25/50/75% marks
-  via ffmpeg's `-progress` pipe); files over 100 MB additionally announce
-  themselves up front.
+- Interactive terminals show one live progress bar for every concurrent video
+  encode, remux, and integrity check, including media time, percent, speed, and
+  ETA. Redirected/non-interactive logs receive 10% updates and a heartbeat at
+  least once per minute. Files over 100 MB also announce themselves up front.
 - exiftool queries (metadata validation, `--date-prefix`, Live Photo
   verification) go through a persistent `-stay_open` daemon — one process
   for the whole run instead of one per file.
@@ -239,3 +249,8 @@ Additional safeguards beyond the checklist:
 ```sh
 python3 -m unittest discover tests
 ```
+
+The suite includes small generated-media integration tests for ASF/VOB,
+multiple audio tracks and chapters, subtitle/artwork safety, and rotation.
+They run automatically when `ffmpeg`, `ffprobe`, and `libx264` are available,
+and otherwise skip without making the pure-Python tests unavailable.

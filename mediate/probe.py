@@ -15,6 +15,8 @@ import threading
 from pathlib import Path
 from typing import List, Optional
 
+from .progress import run_ffmpeg_progress
+
 log = logging.getLogger("mediate")
 
 # mp4_status() results
@@ -404,6 +406,50 @@ def _media_duration_uncached(path: Path) -> "float | None":
         return float(proc.stdout.strip())
     except ValueError:
         return None
+
+
+def _stderr_tail(stderr: str, lines: int = 3) -> str:
+    kept = [line for line in stderr.strip().splitlines() if line.strip()]
+    return " | ".join(kept[-lines:]) if kept else "(no stderr)"
+
+
+def check_video_integrity(path: Path, progress_path: Optional[Path] = None) -> dict:
+    """Fully decode every video/audio stream and report strict health."""
+    cmd = [
+        "ffmpeg", "-nostdin", "-v", "error", "-i", str(path),
+        "-map", "0:v?", "-map", "0:a?", "-f", "null", "-",
+    ]
+    try:
+        proc = run_ffmpeg_progress(
+            cmd, progress_path or path, media_duration(path), "validating"
+        )
+    except FileNotFoundError:
+        return {"ok": False, "reason": "ffmpeg not found"}
+    if proc.returncode != 0 or proc.stderr.strip():
+        return {"ok": False, "reason": _stderr_tail(proc.stderr)}
+    return {"ok": True, "reason": "ok"}
+
+
+def video_health(path: Path) -> dict:
+    """Cached full-decode health for an existing standardized video."""
+    return _cached("health1", path, lambda: check_video_integrity(path))
+
+
+def mark_video_healthy(path: Path) -> None:
+    """Seed the cache after a new output already passed full validation."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return
+    key = f"health1:{path}"
+    global _cache_dirty
+    with _cache_lock:
+        _cache[key] = {
+            "m": stat.st_mtime,
+            "s": stat.st_size,
+            "v": {"ok": True, "reason": "ok"},
+        }
+        _cache_dirty = True
 
 
 def gif_is_animated(path: Path) -> bool:

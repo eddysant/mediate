@@ -184,10 +184,27 @@ class ScanCompletionTests(unittest.TestCase):
         complete = MediaJob(Path("complete.mp4"), "mp4")
         legacy = MediaJob(Path("legacy.vob"), "video")
         candidates, count = _filter_standardized_mp4(
-            [complete, legacy], lambda _path: "standard", "standard"
+            [complete, legacy],
+            lambda _path: "standard",
+            "standard",
+            health_fn=lambda _path: {"ok": True, "reason": "ok"},
         )
         self.assertEqual(candidates, [legacy])
         self.assertEqual(count, 1)
+
+    def test_damaged_standard_mp4_remains_a_repair_candidate(self):
+        from mediate.cli import _filter_standardized_mp4
+        from mediate.scanner import MediaJob
+
+        damaged = MediaJob(Path("damaged.mp4"), "mp4")
+        candidates, count = _filter_standardized_mp4(
+            [damaged],
+            lambda _path: "standard",
+            "standard",
+            health_fn=lambda _path: {"ok": False, "reason": "decode error"},
+        )
+        self.assertEqual(candidates, [damaged])
+        self.assertEqual(count, 0)
 
     def test_one_worker_exception_does_not_abort_result_collection(self):
         from mediate.cli import _resolve_future

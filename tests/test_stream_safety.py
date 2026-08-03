@@ -130,6 +130,15 @@ class StreamPreflightTests(unittest.TestCase):
         self.assertIn("stream safety warning", result.detail)
         self.assertIn("--allow-stream-removal", result.detail)
 
+    def test_process_job_fails_closed_when_stream_preflight_is_unreadable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "broken.asf"
+            path.write_bytes(b"not media")
+            with patch("mediate.converters.video_inventory", return_value=None):
+                result = process_job(MediaJob(path, "video"), Options(dry_run=True))
+        self.assertEqual(result.status, SKIPPED)
+        self.assertIn("stream preflight failed", result.detail)
+
 
 class StreamCommandTests(unittest.TestCase):
     def setUp(self):
@@ -162,6 +171,15 @@ class StreamCommandTests(unittest.TestCase):
         self.assertIn("-map_chapters 0", joined)
         self.assertIn("-color_primaries:v:0 bt709", joined)
         self.assertNotIn("0:s?", joined)
+
+    def test_repair_command_enables_tolerant_timestamp_and_packet_handling(self):
+        command = _build_command(
+            "video", Path("broken.mp4"), Path("repaired.mp4"), self.inventory,
+            repair=True,
+        )
+        joined = " ".join(command)
+        self.assertIn("-fflags +genpts+discardcorrupt", joined)
+        self.assertIn("-err_detect ignore_err", joined)
 
     def test_remux_uses_the_same_explicit_mapping(self):
         command = _build_remux_command(Path("in.mov"), Path("out.mp4"), self.inventory)
@@ -315,14 +333,13 @@ class DecodeIntegrityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "output.mp4"
             output.write_bytes(b"not-empty")
-            with patch("mediate.validators.subprocess.run") as run:
-                run.return_value.returncode = 0
-                run.return_value.stderr = ""
+            with patch(
+                "mediate.validators.check_video_integrity",
+                return_value={"ok": True, "reason": "ok"},
+            ) as check:
                 result = validate_output(0, "", output, is_video=True)
         self.assertEqual(result, (True, "ok"))
-        command = run.call_args.args[0]
-        self.assertIn("0:v?", command)
-        self.assertIn("0:a?", command)
+        check.assert_called_once_with(output, progress_path=None)
 
 
 if __name__ == "__main__":

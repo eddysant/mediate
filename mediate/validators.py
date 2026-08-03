@@ -3,13 +3,13 @@ original file may be deleted."""
 
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 from typing import Tuple
 
 from .exiftool import exiftool_available, run_exiftool
 from .probe import (
     COLOR_FIELDS,
+    check_video_integrity,
     inventory_streams,
     is_commentary_stream,
     media_duration,
@@ -28,6 +28,7 @@ def validate_output(
     stderr: str,
     output_path: Path,
     is_video: bool,
+    progress_path: "Path | None" = None,
 ) -> Tuple[bool, str]:
     """Run the validation checklist. Returns (ok, reason)."""
     # 1. Exit code check
@@ -46,16 +47,9 @@ def validate_output(
     # not merely FFmpeg's default selections, and require a clean exit plus
     # empty stderr.
     if is_video:
-        proc = subprocess.run(
-            [
-                "ffmpeg", "-nostdin", "-v", "error", "-i", str(output_path),
-                "-map", "0:v?", "-map", "0:a?", "-f", "null", "-",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if proc.returncode != 0 or proc.stderr.strip():
-            return False, f"integrity check failed: {_tail(proc.stderr)}"
+        health = check_video_integrity(output_path, progress_path=progress_path)
+        if not health["ok"]:
+            return False, f"integrity check failed: {health['reason']}"
 
     return True, "ok"
 
