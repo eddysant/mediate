@@ -19,6 +19,7 @@ from .probe import (
     STREAM_HEVC,
     STREAM_STANDARD,
     COLOR_FIELDS,
+    audio_stream_label,
     gif_is_animated,
     inventory_streams,
     is_commentary_stream,
@@ -84,14 +85,17 @@ def _video_mapping_args(inventory: dict) -> List[str]:
         language = tags.get("language")
         if language:
             args.extend([f"-metadata:s:a:{audio_index}", f"language={language}"])
-        title = tags.get("title") or tags.get("name")
+        title = audio_stream_label(stream)
         if not title and is_commentary_stream(stream):
             title = "Commentary"
         if title:
-            # MOV reports this field as `name`; Matroska generally reports
-            # `title`. Setting title explicitly lets the muxer use its native
-            # representation rather than silently losing the label.
-            args.extend([f"-metadata:s:a:{audio_index}", f"title={title}"])
+            # MOV reports this field as `name` or `handler_name`; Matroska
+            # generally reports `title`. Older FFmpeg MP4 muxers only retain
+            # handler_name, so write both forms and validate them equivalently.
+            args.extend([
+                f"-metadata:s:a:{audio_index}", f"title={title}",
+                f"-metadata:s:a:{audio_index}", f"handler_name={title}",
+            ])
         dispositions = [
             name for name, enabled in stream.get("disposition", {}).items()
             if enabled

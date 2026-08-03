@@ -9,6 +9,7 @@ from typing import Tuple
 from .exiftool import exiftool_available, run_exiftool
 from .probe import (
     COLOR_FIELDS,
+    audio_stream_label,
     check_video_integrity,
     inventory_streams,
     is_commentary_stream,
@@ -114,7 +115,7 @@ def _normalised_color(field: str, value):
 def _stream_identity(stream: dict) -> dict:
     """Metadata whose loss can change the meaning or selection of a track."""
     tags = stream.get("tags", {})
-    title = tags.get("title") or tags.get("name")
+    title = audio_stream_label(stream)
     if not title and is_commentary_stream(stream):
         title = "Commentary"
     language = tags.get("language")

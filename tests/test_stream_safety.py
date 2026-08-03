@@ -168,6 +168,7 @@ class StreamCommandTests(unittest.TestCase):
         self.assertIn("-map_metadata:s:a:1 0:s:a:1", joined)
         self.assertIn("-metadata:s:a:0 language=jpn", joined)
         self.assertIn("-metadata:s:a:1 title=Commentary", joined)
+        self.assertIn("-metadata:s:a:1 handler_name=Commentary", joined)
         self.assertIn("-map_chapters 0", joined)
         self.assertIn("-color_primaries:v:0 bt709", joined)
         self.assertNotIn("0:s?", joined)
@@ -230,6 +231,22 @@ class StreamValidationTests(unittest.TestCase):
     def test_accepts_preserved_tracks_and_metadata(self):
         inventory = _inventory(self.video, self.japanese, self.commentary, chapters=[self.chapter])
         self.assertEqual(self._verify(inventory, inventory), (True, "ok"))
+
+    def test_accepts_mp4_handler_name_as_the_preserved_track_title(self):
+        output_audio = dict(self.japanese)
+        output_audio["tags"] = {"language": "jpn", "handler_name": "Japanese"}
+        source = _inventory(self.video, self.japanese)
+        output = _inventory(self.video, output_audio)
+        self.assertEqual(self._verify(source, output), (True, "ok"))
+
+    def test_ignores_a_generic_mp4_audio_handler_name(self):
+        source_audio = dict(self.japanese)
+        source_audio["tags"] = {"language": "jpn"}
+        output_audio = dict(source_audio)
+        output_audio["tags"] = {"language": "jpn", "handler_name": "SoundHandler"}
+        source = _inventory(self.video, source_audio)
+        output = _inventory(self.video, output_audio)
+        self.assertEqual(self._verify(source, output), (True, "ok"))
 
     def test_rejects_a_quietly_dropped_japanese_track(self):
         source = _inventory(self.video, self.japanese, self.commentary)

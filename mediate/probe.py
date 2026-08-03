@@ -324,6 +324,29 @@ def is_commentary_stream(stream: dict) -> bool:
     return "commentary" in text.lower()
 
 
+def audio_stream_label(stream: dict) -> Optional[str]:
+    """Return a meaningful audio label across Matroska and MOV/MP4 dialects.
+
+    Older MP4 muxers expose a user track title only as ``handler_name``. They
+    also synthesize generic handler names for untitled tracks; those are
+    container boilerplate and must not be mistaken for user metadata.
+    """
+    tags = stream.get("tags", {})
+    title = tags.get("title") or tags.get("name")
+    if title:
+        return str(title)
+    handler = str(tags.get("handler_name") or "").strip()
+    generic = {
+        "soundhandler",
+        "audiohandler",
+        "audiomediahandler",
+        "soundmediahandler",
+        "coremediaaudio",
+    }
+    compact = "".join(character for character in handler.lower() if character.isalnum())
+    return None if not handler or compact in generic else handler
+
+
 def _is_chapter_carrier(stream: dict, inventory: dict) -> bool:
     """MOV/MP4 exposes its chapter text table as a generated data stream."""
     return bool(inventory.get("chapters")) and (
