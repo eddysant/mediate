@@ -35,6 +35,19 @@ class ScannerTests(unittest.TestCase):
             },
         )
 
+    def test_classifies_legacy_video_containers(self):
+        extensions = (
+            "asf", "vob", "mov", "qt", "rm", "rmvb", "ogv", "ogm",
+            "f4v", "ts", "mxf", "mod", "tod", "vro", "dv", "3g2",
+            "dvr-ms", "wtv", "m1v", "m2v", "m2p", "mpv", "divx", "xvid",
+        )
+        for extension in extensions:
+            self.touch(f"legacy-{extension}.{extension.upper()}")
+        self.assertEqual(
+            self.scan(),
+            {f"legacy-{extension}.{extension.upper()}": "video" for extension in extensions},
+        )
+
     def test_recurses_subdirectories(self):
         self.touch("sub/deep/x.tiff")
         self.assertEqual(self.scan(), {"sub/deep/x.tiff": "photo"})

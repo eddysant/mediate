@@ -9,7 +9,7 @@ validation checklist (and even then, it goes to the Trash, not oblivion).
 |---|---|---|
 | JPEG / PNG / TIFF | Lossless WebP (`-metadata all` preserves EXIF/ICC/dates) | `cwebp` |
 | HEIC / HEIF (opt-in, macOS) | Lossless WebP via a sips PNG intermediate, EXIF preserved | `sips` + `cwebp` |
-| MOV / MKV / AVI / WMV / WebM / … | MP4 (h264 `-crf 18 -preset slow`, AAC 256k, `yuv420p`) | `ffmpeg` |
+| MOV / MKV / AVI / WMV / WebM / ASF / VOB / legacy video | MP4 (h264 `-crf 18 -preset slow`, AAC 256k, `yuv420p`) | `ffmpeg` |
 | Animated GIF | MP4 (`faststart`, even-dimension scale filter) | `ffmpeg` |
 
 Skipped automatically:
@@ -22,9 +22,19 @@ Skipped automatically:
 - **Live Photo pairs** — a `.mov` next to a same-named still (both halves are
   left alone, since converting either breaks the pairing in Apple Photos;
   `--convert-live-photos` to force).
+- Videos whose MP4 conversion would discard subtitles, attached artwork,
+  extra video angles, or arbitrary data/attachment streams. The skip message
+  inventories them; `--allow-stream-removal` is the explicit opt-in to drop
+  those streams.
 - **Application bundles** — `*.photoslibrary`, `*.app`, `*.fcpbundle`, etc.
   are never traversed. Converting files inside an Apple Photos library would
   corrupt it, so this cannot be overridden.
+
+Legacy coverage includes QuickTime (`.mov`, `.qt`), Windows Media (`.asf`,
+`.wmv`, `.dvr-ms`, `.wtv`), DVD/camcorder formats (`.vob`, `.vro`, `.mod`,
+`.tod`, `.dv`), RealMedia, Ogg video, MPEG transport/elementary streams, MXF,
+3GPP/3GPP2, Flash video, and common DivX/Xvid extensions. Every format still
+goes through ffprobe preflight and the same strict validation pipeline.
 
 ## Requirements
 
@@ -119,6 +129,9 @@ Options:
   accepting the size increase.
 - `--convert-heic` — convert HEIC/HEIF to lossless WebP (macOS only).
 - `--convert-live-photos` — convert Live Photo pairs anyway.
+- `--allow-stream-removal` — allow MP4 conversion to discard subtitles,
+  attached artwork, extra video tracks, and unsupported data/attachment
+  streams. Without this flag those files are warned about and skipped.
 - `--graveyard DIR` — move originals to DIR (mirroring the folder structure)
   instead of the Trash.
 - `--hard-delete` — permanently delete originals (the pre-Trash behavior).
@@ -161,8 +174,11 @@ An original is disposed of **only** after all of these pass:
 5. Metadata survived: a photo whose source has an EXIF capture date must
    carry the same date in the WebP (exiftool when installed, structural
    EXIF-block check otherwise) — this is what catches e.g. cwebp silently
-   dropping TIFF metadata. A video's duration must match the source within
-   1s/2%, catching truncated encodes that still decode cleanly.
+   dropping TIFF metadata.
+6. A video's duration matches within 1s/2%, and its full stream inventory is
+   checked: every audio track is still present in order with its duration,
+   language, title/commentary identity, and dispositions; chapters retain their count,
+   titles, and timing; rotation and declared colour properties still match.
 
 On any failure the partial output is removed, the original is untouched, and
 the reason is logged.
@@ -177,6 +193,10 @@ Additional safeguards beyond the checklist:
 - Conversions write to a hidden temp name (`.name.<rand>.part.ext`) in the
   same directory and are renamed into place only after validation, so a crash
   never leaves a half-written file wearing the final name.
+- Video commands explicitly map the primary video plus **all** audio tracks
+  and chapters. FFmpeg's implicit “best stream” selection is never trusted.
+  A rotated video gets a short lossless remux after encoding to restore its
+  display matrix before validation.
 - If the target name already exists (e.g. `a.jpg` and `a.png` both map to
   `a.webp`), the file is skipped and logged rather than overwritten.
 - The output inherits the original's modification time **and, on macOS, its
@@ -189,7 +209,11 @@ Additional safeguards beyond the checklist:
   disposed of after conversion, its sidecars travel with it.
 - ffprobe results are cached (`~/Library/Caches/mediate` / `$XDG_CACHE_HOME`),
   keyed by path+mtime+size, so re-running over a large already-standardized
-  library is near-instant.
+  library is near-instant. Completed MP4s are reported as one aggregate
+  “already standardized” count rather than returning as conversion candidates.
+- An unexpected exception in one worker is recorded as that file's failure;
+  it no longer stops collection of the rest of the scan and makes untouched
+  files appear only on the next run.
 - Videos longer than a minute report live encode progress (25/50/75% marks
   via ffmpeg's `-progress` pipe); files over 100 MB additionally announce
   themselves up front.
@@ -198,8 +222,9 @@ Additional safeguards beyond the checklist:
   for the whole run instead of one per file.
 - Windows: the Recycle Bin is not supported — mediate requires
   `--graveyard DIR` or `--hard-delete` there.
-- MKVs with text subtitle tracks can fail to mux into MP4; those files fail
-  validation and the originals are kept (visible in the log).
+- Subtitle and attached-art streams are detected before conversion and skipped
+  by default because MP4 cannot faithfully represent every source codec and
+  styling format. `--allow-stream-removal` makes their removal deliberate.
 - `.tif` inputs whose EXIF matters will fail the new metadata check (cwebp
   cannot carry TIFF metadata) and stay untouched — by design.
 - Live Photo detection is by naming convention (same directory + stem,

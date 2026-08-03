@@ -7,7 +7,7 @@ import logging
 import os
 import shutil
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from . import __version__
@@ -15,6 +15,7 @@ from .converters import (
     CONVERTED,
     FAILED,
     PLANNED,
+    REMUXED,
     SKIPPED,
     Options,
     Outcome,
@@ -30,10 +31,37 @@ REQUIRED_TOOLS = ("cwebp", "ffmpeg", "ffprobe")
 
 STATUS_MARKS = {
     CONVERTED: "[ok]",
+    REMUXED: "[ok]",
     SKIPPED: "[skip]",
     FAILED: "[FAIL]",
     PLANNED: "[dry]",
 }
+
+
+def _resolve_future(future: Future, job) -> Outcome:
+    """Turn an unexpected worker exception into one failed outcome.
+
+    Without this boundary, a single unusual file aborts result collection for
+    the entire scan. Remaining files then appear to have been "missed" when
+    the command is run again, even though their worker futures were submitted.
+    """
+    try:
+        return future.result()
+    except Exception as exc:  # process one bad media file without aborting the scan
+        log.debug("unexpected worker failure for %s", job.path, exc_info=True)
+        return Outcome(FAILED, job.path, f"unexpected processing error: {exc}")
+
+
+def _filter_standardized_mp4(jobs, status_fn, standard_status):
+    """Separate completed MP4 outputs from files that still need evaluation."""
+    candidates = []
+    standardized_count = 0
+    for job in jobs:
+        if job.kind == "mp4" and status_fn(job.path) == standard_status:
+            standardized_count += 1
+        else:
+            candidates.append(job)
+    return candidates, standardized_count
 
 
 def config_file_path() -> Path:
@@ -114,6 +142,14 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="convert .mov files even when a same-named still image sits next to "
         "them (default: skip such pairs, since converting the video half breaks "
         "Live Photo pairing in Apple Photos)",
+    )
+    parser.add_argument(
+        "--allow-stream-removal",
+        action="store_true",
+        help="allow video conversion to discard streams MP4 standardisation cannot "
+        "safely preserve (subtitles, attached artwork, extra video tracks, and "
+        "data/attachment streams); audio tracks, chapters, rotation, and colour "
+        "metadata are still preserved and verified",
     )
     parser.add_argument(
         "--rename",
@@ -272,6 +308,7 @@ def main(argv=None) -> int:
         only_if_smaller=args.only_if_smaller,
         reencode_hevc=args.reencode_hevc,
         convert_heic=args.convert_heic,
+        allow_stream_removal=args.allow_stream_removal,
         dispose=dispose,
         dispose_label=dispose_label,
     )
@@ -279,12 +316,20 @@ def main(argv=None) -> int:
     if args.rename_only:
         return run_rename_phase(root, args)
 
-    from .probe import load_probe_cache, save_probe_cache
+    from .probe import MP4_STANDARD, load_probe_cache, mp4_status, save_probe_cache
 
     load_probe_cache()
-    jobs = list(iter_media(root))
+    recognized = list(iter_media(root))
+    # Already-standardized MP4 outputs are recognized media, not unfinished
+    # work. Filtering them before the headline count stops repeat runs over a
+    # completed library from looking as though files were missed previously.
+    jobs, standardized_count = _filter_standardized_mp4(
+        recognized, mp4_status, MP4_STANDARD
+    )
     run_mode = " (dry run)" if args.dry_run else ""
     log.info("scanning %s%s: %d candidate file(s), log: %s", root, run_mode, len(jobs), log_path)
+    if standardized_count:
+        log.info("already standardized: %d MP4 file(s)", standardized_count)
     if not args.keep_originals and not args.dry_run:
         log.info("originals: %s after validation", dispose_label)
     if missing:
@@ -294,6 +339,7 @@ def main(argv=None) -> int:
         )
     if not jobs:
         log.info("nothing to convert")
+        save_probe_cache()
         return run_rename_phase(root, args) if args.rename else 0
 
     # Planning-time skips, resolved before the pool starts:
@@ -324,7 +370,7 @@ def main(argv=None) -> int:
             claimed[out] = job.path
             runnable.append(job)
 
-    tally = {CONVERTED: 0, SKIPPED: 0, FAILED: 0, PLANNED: 0}
+    tally = {CONVERTED: 0, REMUXED: 0, SKIPPED: 0, FAILED: 0, PLANNED: 0}
     bytes_saved = 0
     for outcome in planned_skips:
         tally[outcome.status] += 1
@@ -333,7 +379,7 @@ def main(argv=None) -> int:
         with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
             futures = {pool.submit(process_job, job, opts): job for job in runnable}
             for future in as_completed(futures):
-                outcome: Outcome = future.result()
+                outcome = _resolve_future(future, futures[future])
                 tally[outcome.status] += 1
                 bytes_saved += outcome.bytes_saved
                 rel = outcome.path.relative_to(root)
@@ -350,10 +396,15 @@ def main(argv=None) -> int:
         )
     else:
         saved_mb = bytes_saved / (1024 * 1024)
-        log.info(
-            "done: %d converted, %d skipped, %d failed, %.1f MB saved",
-            tally[CONVERTED], tally[SKIPPED], tally[FAILED], saved_mb,
-        )
+        parts = []
+        if tally[CONVERTED]:
+            parts.append(f"{tally[CONVERTED]} converted")
+        if tally[REMUXED]:
+            parts.append(f"{tally[REMUXED]} remuxed")
+        parts.append(f"{tally[SKIPPED]} skipped")
+        parts.append(f"{tally[FAILED]} failed")
+        parts.append(f"{saved_mb:.1f} MB saved")
+        log.info("done: %s", ", ".join(parts))
     save_probe_cache()
     if args.rename:
         # Rename runs after conversion so freshly produced .webp/.mp4 files

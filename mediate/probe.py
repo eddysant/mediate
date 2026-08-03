@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+from typing import List, Optional
 
 log = logging.getLogger("mediate")
 
@@ -74,11 +75,14 @@ def _cached(kind: str, path: Path, compute):
 
 
 def _ffprobe_json(args: list) -> dict | None:
-    proc = subprocess.run(
-        ["ffprobe", "-v", "error", "-of", "json", *args],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-of", "json", *args],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None
     if proc.returncode != 0:
         return None
     try:
@@ -98,12 +102,20 @@ def mp4_status(path: Path) -> str:
 
 def _mp4_status_uncached(path: Path) -> str:
     data = _ffprobe_json(
-        ["-show_entries", "stream=codec_type,codec_name,pix_fmt", str(path)]
+        [
+            "-show_entries",
+            "stream=codec_type,codec_name,pix_fmt:stream_disposition=attached_pic",
+            str(path),
+        ]
     )
     if data is None:
         return MP4_NEEDS_CONVERSION
     streams = data.get("streams", [])
-    video = [s for s in streams if s.get("codec_type") == "video"]
+    video = [
+        s for s in streams
+        if s.get("codec_type") == "video"
+        and not s.get("disposition", {}).get("attached_pic")
+    ]
     audio = [s for s in streams if s.get("codec_type") == "audio"]
     if not video:
         return MP4_NEEDS_CONVERSION
@@ -116,17 +128,278 @@ def _mp4_status_uncached(path: Path) -> str:
     return MP4_NEEDS_CONVERSION
 
 
+# video_stream_status() results — usable for any container, not just .mp4
+STREAM_STANDARD = "standard"       # h264/yuv420p video, aac (or no) audio
+STREAM_HEVC = "hevc"               # hevc video, aac (or no) audio
+STREAM_NEEDS_CONVERSION = "convert"
+
+
+def video_stream_status(path: Path) -> str:
+    """Classify *any* video file's streams (not just .mp4). Returns
+    STREAM_STANDARD when the streams are already h264/yuv420p + AAC and can
+    be remuxed into MP4 with ``-c copy``, STREAM_HEVC for HEVC + AAC, or
+    STREAM_NEEDS_CONVERSION when re-encoding is required."""
+    return _cached("vstream", path, lambda: _video_stream_status_uncached(path))
+
+
+def _video_stream_status_uncached(path: Path) -> str:
+    data = _ffprobe_json(
+        [
+            "-show_entries",
+            "stream=codec_type,codec_name,pix_fmt:stream_disposition=attached_pic",
+            str(path),
+        ]
+    )
+    if data is None:
+        return STREAM_NEEDS_CONVERSION
+    streams = data.get("streams", [])
+    video = [
+        s for s in streams
+        if s.get("codec_type") == "video"
+        and not s.get("disposition", {}).get("attached_pic")
+    ]
+    audio = [s for s in streams if s.get("codec_type") == "audio"]
+    if not video:
+        return STREAM_NEEDS_CONVERSION
+    # Audio must be AAC (or absent — some screen recordings have no audio)
+    if any(s.get("codec_name") != "aac" for s in audio):
+        return STREAM_NEEDS_CONVERSION
+    if all(s.get("codec_name") == "h264" and s.get("pix_fmt") == "yuv420p" for s in video):
+        return STREAM_STANDARD
+    if all(s.get("codec_name") == "hevc" for s in video):
+        return STREAM_HEVC
+    return STREAM_NEEDS_CONVERSION
+
+
+# Stream metadata that must survive a video conversion. Values omitted by
+# ffprobe are intentionally distinct from explicit "unknown" values.
+COLOR_FIELDS = (
+    "color_range",
+    "color_space",
+    "color_transfer",
+    "color_primaries",
+    "chroma_location",
+)
+IDENTITY_TAGS = (
+    "language",
+    "title",
+    "name",
+    "handler_name",
+    "filename",
+    "mimetype",
+)
+DISPOSITION_FIELDS = (
+    "default",
+    "dub",
+    "original",
+    "comment",
+    "lyrics",
+    "karaoke",
+    "forced",
+    "hearing_impaired",
+    "visual_impaired",
+    "captions",
+    "descriptions",
+    "metadata",
+    "dependent",
+    "still_image",
+)
+
+
+def _selected(source: dict, names) -> dict:
+    return {name: source[name] for name in names if name in source}
+
+
+def _rotation(stream: dict) -> "float | int | None":
+    """Read rotation from modern display-matrix side data or legacy tags."""
+    for side_data in stream.get("side_data_list", []):
+        if "rotation" in side_data:
+            try:
+                value = float(side_data["rotation"])
+                return int(value) if value.is_integer() else value
+            except (TypeError, ValueError):
+                pass
+    value = stream.get("tags", {}).get("rotate")
+    try:
+        number = float(value)
+        return int(number) if number.is_integer() else number
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalise_stream(stream: dict) -> dict:
+    tags = {
+        str(name).lower(): value
+        for name, value in (stream.get("tags") or {}).items()
+    }
+    disposition = stream.get("disposition") or {}
+    result = {
+        "index": stream.get("index"),
+        "codec_type": stream.get("codec_type", "unknown"),
+        "codec_name": stream.get("codec_name", "unknown"),
+        "codec_tag_string": stream.get("codec_tag_string"),
+        "duration": stream.get("duration"),
+        "tags": _selected(tags, IDENTITY_TAGS),
+        "disposition": _selected(disposition, DISPOSITION_FIELDS),
+    }
+    if stream.get("codec_type") == "video":
+        result["pix_fmt"] = stream.get("pix_fmt")
+        result["rotation"] = _rotation(stream)
+        result["color"] = _selected(stream, COLOR_FIELDS)
+        result["attached_pic"] = bool(disposition.get("attached_pic"))
+    return result
+
+
+def _normalise_chapter(chapter: dict) -> dict:
+    tags = {
+        str(name).lower(): value
+        for name, value in (chapter.get("tags") or {}).items()
+    }
+    return {
+        "start_time": chapter.get("start_time"),
+        "end_time": chapter.get("end_time"),
+        "title": tags.get("title"),
+    }
+
+
+def video_inventory(path: Path) -> Optional[dict]:
+    """Return a cached, JSON-serialisable inventory of every video stream.
+
+    The inventory is used both before conversion (to prevent implicit FFmpeg
+    stream selection from losing content) and after conversion (to verify the
+    streams and metadata that were meant to survive).
+    """
+    return _cached("vinv2", path, lambda: _video_inventory_uncached(path))
+
+
+def _video_inventory_uncached(path: Path) -> Optional[dict]:
+    data = _ffprobe_json(["-show_streams", "-show_chapters", str(path)])
+    if data is None:
+        return None
+    streams = [_normalise_stream(stream) for stream in data.get("streams", [])]
+    return {
+        "streams": streams,
+        "chapters": [_normalise_chapter(chapter) for chapter in data.get("chapters", [])],
+    }
+
+
+def inventory_streams(inventory: dict, codec_type: str) -> List[dict]:
+    return [
+        stream for stream in inventory.get("streams", [])
+        if stream.get("codec_type") == codec_type
+    ]
+
+
+def primary_video_streams(inventory: dict) -> List[dict]:
+    return [
+        stream for stream in inventory_streams(inventory, "video")
+        if not stream.get("attached_pic")
+    ]
+
+
+def attached_artwork_streams(inventory: dict) -> List[dict]:
+    pictures = [
+        stream for stream in inventory_streams(inventory, "video")
+        if stream.get("attached_pic")
+    ]
+    image_extensions = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff")
+    for stream in inventory_streams(inventory, "attachment"):
+        tags = stream.get("tags", {})
+        mimetype = str(tags.get("mimetype", "")).lower()
+        filename = str(tags.get("filename", "")).lower()
+        if mimetype.startswith("image/") or filename.endswith(image_extensions):
+            pictures.append(stream)
+    return pictures
+
+
+def is_commentary_stream(stream: dict) -> bool:
+    if stream.get("disposition", {}).get("comment"):
+        return True
+    tags = stream.get("tags", {})
+    text = " ".join(
+        str(tags.get(name, "")) for name in ("title", "name", "handler_name")
+    )
+    return "commentary" in text.lower()
+
+
+def _is_chapter_carrier(stream: dict, inventory: dict) -> bool:
+    """MOV/MP4 exposes its chapter text table as a generated data stream."""
+    return bool(inventory.get("chapters")) and (
+        stream.get("codec_type") == "data"
+        and stream.get("codec_name") == "bin_data"
+        and stream.get("codec_tag_string") == "text"
+    )
+
+
+def stream_removal_risks(inventory: dict) -> List[str]:
+    """Describe streams the MP4 standardisation command cannot preserve.
+
+    Audio tracks (including commentary), chapters, rotation, and colour data
+    are supported. The returned categories are blocked unless the user opts
+    into their removal.
+    """
+    risks = []
+    videos = primary_video_streams(inventory)
+    if len(videos) > 1:
+        risks.append(f"{len(videos) - 1} additional video track(s)")
+    subtitles = inventory_streams(inventory, "subtitle")
+    if subtitles:
+        codecs = ", ".join(sorted({s.get("codec_name", "unknown") for s in subtitles}))
+        risks.append(f"{len(subtitles)} subtitle track(s) ({codecs})")
+    artwork = attached_artwork_streams(inventory)
+    if artwork:
+        risks.append(f"{len(artwork)} attached artwork stream(s)")
+    others = [
+        stream for stream in inventory.get("streams", [])
+        if stream.get("codec_type") not in ("video", "audio", "subtitle")
+        and not _is_chapter_carrier(stream, inventory)
+        and stream not in artwork
+    ]
+    if others:
+        kinds = ", ".join(sorted({s.get("codec_type", "unknown") for s in others}))
+        risks.append(f"{len(others)} unsupported {kinds} stream(s)")
+    return risks
+
+
+def preservation_summary(inventory: dict) -> str:
+    """Human-readable preflight summary for logs and dry runs."""
+    parts = []
+    audio = inventory_streams(inventory, "audio")
+    commentary = sum(1 for stream in audio if is_commentary_stream(stream))
+    if len(audio) > 1:
+        detail = f"{len(audio)} audio tracks"
+        if commentary:
+            detail += f" ({commentary} commentary)"
+        parts.append(detail)
+    elif commentary:
+        parts.append("1 commentary audio track")
+    chapters = inventory.get("chapters", [])
+    if chapters:
+        parts.append(f"{len(chapters)} chapter(s)")
+    videos = primary_video_streams(inventory)
+    if videos:
+        video = videos[0]
+        if video.get("rotation") is not None:
+            parts.append(f"rotation {video['rotation']} degrees")
+        if video.get("color"):
+            parts.append("colour metadata")
+    return ", ".join(parts)
+
+
 def media_duration(path: Path) -> "float | None":
     """Container duration in seconds, or None if unreadable. Cached."""
     return _cached("dur", path, lambda: _media_duration_uncached(path))
 
 
 def _media_duration_uncached(path: Path) -> "float | None":
-    proc = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "csv=p=0", str(path)],
-        capture_output=True, text=True,
-    )
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True,
+        )
+    except FileNotFoundError:
+        return None
     try:
         return float(proc.stdout.strip())
     except ValueError:

@@ -14,14 +14,36 @@ from typing import List, Optional
 
 from .disposal import Disposer
 from .macmeta import get_birthtime, set_birthtime
-from .probe import MP4_HEVC, MP4_STANDARD, gif_is_animated, media_duration, mp4_status
+from .probe import (
+    MP4_HEVC,
+    MP4_STANDARD,
+    STREAM_HEVC,
+    STREAM_STANDARD,
+    COLOR_FIELDS,
+    gif_is_animated,
+    inventory_streams,
+    is_commentary_stream,
+    media_duration,
+    mp4_status,
+    preservation_summary,
+    primary_video_streams,
+    stream_removal_risks,
+    video_inventory,
+    video_stream_status,
+)
 from .scanner import MediaJob
-from .validators import validate_output, verify_photo_metadata, verify_video_duration
+from .validators import (
+    validate_output,
+    verify_photo_metadata,
+    verify_video_duration,
+    verify_video_streams,
+)
 
 log = logging.getLogger("mediate")
 
 # Outcome statuses
 CONVERTED = "converted"
+REMUXED = "remuxed"
 SKIPPED = "skipped"
 FAILED = "failed"
 PLANNED = "planned"  # dry-run
@@ -34,6 +56,7 @@ class Options:
     only_if_smaller: bool = False
     reencode_hevc: bool = False
     convert_heic: bool = False
+    allow_stream_removal: bool = False
     dispose: Optional[Disposer] = None
     dispose_label: str = "delete original"
 
@@ -46,19 +69,109 @@ class Outcome:
     bytes_saved: int = 0
 
 
-def _build_command(kind: str, input_path: Path, output_path: Path) -> List[str]:
+def _video_mapping_args(inventory: dict) -> List[str]:
+    """Map the primary picture and every audio track, with metadata explicit."""
+    args = ["-map", "0:v:0", "-map", "0:a?"]
+    for audio_index, stream in enumerate(inventory_streams(inventory, "audio")):
+        args.extend([
+            f"-map_metadata:s:a:{audio_index}",
+            f"0:s:a:{audio_index}",
+        ])
+        tags = stream.get("tags", {})
+        language = tags.get("language")
+        if language:
+            args.extend([f"-metadata:s:a:{audio_index}", f"language={language}"])
+        title = tags.get("title") or tags.get("name")
+        if not title and is_commentary_stream(stream):
+            title = "Commentary"
+        if title:
+            # MOV reports this field as `name`; Matroska generally reports
+            # `title`. Setting title explicitly lets the muxer use its native
+            # representation rather than silently losing the label.
+            args.extend([f"-metadata:s:a:{audio_index}", f"title={title}"])
+        dispositions = [
+            name for name, enabled in stream.get("disposition", {}).items()
+            if enabled
+        ]
+        args.extend([
+            f"-disposition:a:{audio_index}",
+            "+".join(dispositions) if dispositions else "0",
+        ])
+    return args
+
+
+def _video_metadata_args(inventory: dict) -> List[str]:
+    """Carry source colour declarations onto the primary output video."""
+    videos = primary_video_streams(inventory)
+    if not videos:
+        return []
+    video = videos[0]
+    args: List[str] = []
+    option_names = {
+        "color_range": "color_range",
+        "color_space": "colorspace",
+        "color_transfer": "color_trc",
+        "color_primaries": "color_primaries",
+        "chroma_location": "chroma_sample_location",
+    }
+    for field in COLOR_FIELDS:
+        value = video.get("color", {}).get(field)
+        if value and value != "unknown":
+            args.extend([f"-{option_names[field]}:v:0", str(value)])
+    return args
+
+
+def _build_rotation_command(
+    input_path: Path,
+    output_path: Path,
+    inventory: dict,
+) -> List[str]:
+    """Remux an encoded MP4 while writing an explicit display matrix.
+
+    FFmpeg preserves a display matrix during stream copy, but does not carry
+    it through video encoding. Its legacy output `rotate` metadata also has
+    container/version-dependent behaviour, so a short second pass applies the
+    documented input-side display override and copies the encoded streams.
+    """
+    rotation = primary_video_streams(inventory)[0].get("rotation")
+    return [
+        "ffmpeg", "-nostdin", "-y",
+        "-display_rotation:v:0", str(rotation),
+        "-i", str(input_path),
+        *_video_mapping_args(inventory),
+        "-map_metadata", "0", "-map_metadata:s:v:0", "0:s:v:0",
+        "-map_chapters", "0",
+        "-c", "copy",
+        *_video_metadata_args(inventory),
+        "-movflags", "faststart",
+        str(output_path),
+    ]
+
+
+def _build_command(
+    kind: str,
+    input_path: Path,
+    output_path: Path,
+    inventory: Optional[dict] = None,
+) -> List[str]:
     if kind == "photo":
         return [
             "cwebp", "-lossless", "-metadata", "all", "-preset", "photo",
             str(input_path), "-o", str(output_path),
         ]
     if kind == "video":
+        if inventory is None:
+            raise ValueError("video conversion requires a stream inventory")
         return [
-            "ffmpeg", "-nostdin", "-y", "-i", str(input_path),
-            "-c:v", "libx264", "-preset", "slow", "-crf", "18",
+            "ffmpeg", "-nostdin", "-y", "-noautorotate", "-i", str(input_path),
+            *_video_mapping_args(inventory),
+            "-map_metadata", "0", "-map_metadata:s:v:0", "0:s:v:0",
+            "-map_chapters", "0",
+            "-c:v:0", "libx264", "-preset", "slow", "-crf", "18",
             "-c:a", "aac", "-b:a", "256k",
             "-pix_fmt", "yuv420p",
-            "-map_metadata", "0",
+            *_video_metadata_args(inventory),
+            "-movflags", "faststart",
             str(output_path),
         ]
     if kind == "gif":
@@ -71,6 +184,20 @@ def _build_command(kind: str, input_path: Path, output_path: Path) -> List[str]:
             str(output_path),
         ]
     raise ValueError(f"unknown job kind: {kind}")
+
+
+def _build_remux_command(input_path: Path, output_path: Path, inventory: dict) -> List[str]:
+    """Remux into MP4 with ``-c copy`` — no re-encoding."""
+    return [
+        "ffmpeg", "-nostdin", "-y", "-noautorotate", "-i", str(input_path),
+        *_video_mapping_args(inventory),
+        "-map_metadata", "0", "-map_metadata:s:v:0", "0:s:v:0",
+        "-map_chapters", "0",
+        "-c", "copy",
+        *_video_metadata_args(inventory),
+        "-movflags", "faststart",
+        str(output_path),
+    ]
 
 
 def intended_output(job: MediaJob) -> Path:
@@ -124,7 +251,12 @@ def _run_ffmpeg_progress(cmd: List[str], src: Path, total: float) -> subprocess.
     return subprocess.CompletedProcess(cmd, proc.returncode, "", stderr_chunks[0] if stderr_chunks else "")
 
 
-def _convert(kind: str, src: Path, tmp: Path) -> subprocess.CompletedProcess:
+def _convert(
+    kind: str,
+    src: Path,
+    tmp: Path,
+    inventory: Optional[dict] = None,
+) -> subprocess.CompletedProcess:
     """Run the conversion subprocess(es) for a job. HEIC goes through a
     two-step pipeline: sips (built into macOS, decodes HEVC-compressed
     stills that cwebp cannot read) to a temporary PNG, then the normal
@@ -132,11 +264,33 @@ def _convert(kind: str, src: Path, tmp: Path) -> subprocess.CompletedProcess:
     into it and cwebp extracts EXIF from PNG — with a TIFF intermediate
     cwebp drops the metadata ("EXIF extraction from TIFF is unsupported")."""
     if kind in ("video", "gif"):
-        cmd = _build_command(kind, src, tmp)
+        rotation = None
+        encode_output = tmp
+        if kind == "video" and inventory is not None:
+            rotation = primary_video_streams(inventory)[0].get("rotation")
+            if rotation is not None:
+                encode_output = tmp.with_name(f".{tmp.name}.encoded.mp4")
+        cmd = _build_command(kind, src, encode_output, inventory)
         total = media_duration(src)
         if total and total >= PROGRESS_MIN_SECONDS:
-            return _run_ffmpeg_progress(cmd, src, total)
-        return _run(cmd)
+            proc = _run_ffmpeg_progress(cmd, src, total)
+        else:
+            proc = _run(cmd)
+        if rotation is None:
+            return proc
+        if proc.returncode != 0:
+            encode_output.unlink(missing_ok=True)
+            return proc
+        try:
+            rotated = _run(_build_rotation_command(encode_output, tmp, inventory))
+            return subprocess.CompletedProcess(
+                rotated.args,
+                rotated.returncode,
+                rotated.stdout,
+                proc.stderr + rotated.stderr,
+            )
+        finally:
+            encode_output.unlink(missing_ok=True)
     if kind != "heic":
         return _run(_build_command(kind, src, tmp))
 
@@ -164,6 +318,8 @@ def _sidecars_of(src: Path):
 def process_job(job: MediaJob, opts: Options) -> Outcome:
     src = job.path
     kind = job.kind
+    remux = False  # set True when we can use -c copy instead of re-encoding
+    inventory = None
 
     if kind == "mp4":
         status = mp4_status(src)
@@ -175,6 +331,30 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
                 "HEVC MP4 (smaller than h264 and Apple-native; --reencode-hevc to convert anyway)",
             )
         kind = "video"
+
+    if kind == "video":
+        inventory = video_inventory(src)
+        if inventory is None or not primary_video_streams(inventory):
+            return Outcome(SKIPPED, src, "stream preflight failed; original kept")
+        risks = stream_removal_risks(inventory)
+        if risks and not opts.allow_stream_removal:
+            return Outcome(
+                SKIPPED,
+                src,
+                "stream safety warning: would remove " + "; ".join(risks)
+                + " (--allow-stream-removal to permit)",
+            )
+
+    if kind == "video" and job.kind != "mp4":
+        # Non-MP4 containers: probe streams to decide remux vs re-encode.
+        stream_st = video_stream_status(src)
+        if stream_st == STREAM_STANDARD:
+            remux = True
+        elif stream_st == STREAM_HEVC and not opts.reencode_hevc:
+            return Outcome(
+                SKIPPED, src,
+                "HEVC streams (smaller than h264 and Apple-native; --reencode-hevc to convert anyway)",
+            )
 
     if kind == "gif" and not gif_is_animated(src):
         return Outcome(SKIPPED, src, "static GIF (only animated GIFs are converted)")
@@ -197,19 +377,34 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
         return Outcome(SKIPPED, src, f"output already exists: {final.name}")
 
     if opts.dry_run:
-        action = "convert" if opts.keep_originals else f"convert and {opts.dispose_label}"
-        return Outcome(PLANNED, src, f"would {action} -> {final.name}")
+        verb = "remux" if remux else "convert"
+        action = verb if opts.keep_originals else f"{verb} and {opts.dispose_label}"
+        detail = f"would {action} -> {final.name}"
+        if inventory is not None:
+            preserved = preservation_summary(inventory)
+            if preserved:
+                detail += f"; preserve {preserved}"
+            risks = stream_removal_risks(inventory)
+            if risks:
+                detail += f"; explicitly remove {'; '.join(risks)}"
+        return Outcome(PLANNED, src, detail)
 
     # Convert into a temp name in the same directory, then rename into place
     # only after validation, so a crash never leaves a half-written file
     # wearing the final name.
     tmp = final.with_name(f".{final.stem}.{uuid.uuid4().hex[:8]}.part{final.suffix}")
     src_size_pre = src.stat().st_size
-    # A big video at -preset slow can encode for many minutes: say so.
-    started = f"converting {src.name} ({_fmt_size(src_size_pre)}), this may take a while..."
-    log.info("       %s", started) if src_size_pre >= 100 * 1024 * 1024 else log.debug("%s", started)
+    if remux:
+        log.debug("remuxing %s (%s) with -c copy", src.name, _fmt_size(src_size_pre))
+    else:
+        # A big video at -preset slow can encode for many minutes: say so.
+        started = f"converting {src.name} ({_fmt_size(src_size_pre)}), this may take a while..."
+        log.info("       %s", started) if src_size_pre >= 100 * 1024 * 1024 else log.debug("%s", started)
     try:
-        proc = _convert(kind, src, tmp)
+        if remux:
+            proc = _run(_build_remux_command(src, tmp, inventory))
+        else:
+            proc = _convert(kind, src, tmp, inventory)
     except FileNotFoundError as exc:
         return Outcome(FAILED, src, f"converter not found: {exc}")
 
@@ -218,8 +413,15 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
         # 5. Metadata/duration verification, beyond structural integrity.
         if new_ext == ".webp":
             ok, reason = verify_photo_metadata(src, tmp)
-        else:
+        elif kind == "gif":
             ok, reason = verify_video_duration(src, tmp)
+        else:
+            ok, reason = verify_video_streams(
+                src,
+                tmp,
+                inventory,
+                allow_stream_removal=opts.allow_stream_removal,
+            )
     if not ok:
         log.debug("stderr for %s:\n%s", src, proc.stderr.strip())
         tmp.unlink(missing_ok=True)
@@ -258,8 +460,9 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
     if src_birthtime is not None:
         set_birthtime(final, src_birthtime)
 
+    outcome_status = REMUXED if remux else CONVERTED
     return Outcome(
-        CONVERTED,
+        outcome_status,
         src,
         f"-> {final.name} ({_fmt_size(src_stat.st_size)} -> {_fmt_size(new_size)}){disposed}",
         bytes_saved=src_stat.st_size - new_size,

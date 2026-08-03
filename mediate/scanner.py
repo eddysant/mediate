@@ -20,10 +20,18 @@ HEIC_EXTS = {".heic", ".heif"}
 
 GIF_EXTS = {".gif"}
 
-# Video containers that always get re-encoded to standard MP4.
+# Video containers that are remuxed when already compatible, otherwise
+# re-encoded to standard MP4. Keep this to formats ffprobe can identify from
+# the file itself; raw frame dumps such as .yuv need external parameters.
 VIDEO_EXTS = {
-    ".mov", ".mkv", ".avi", ".wmv", ".flv", ".m4v",
-    ".mpg", ".mpeg", ".webm", ".3gp", ".mts", ".m2ts",
+    # Current/common non-MP4 containers.
+    ".mov", ".mkv", ".avi", ".wmv", ".flv", ".m4v", ".webm",
+    ".mpg", ".mpeg", ".3gp", ".mts", ".m2ts", ".ts", ".mxf",
+    # Legacy QuickTime, Windows Media, RealMedia, Flash, Ogg, and DVD/camcorder.
+    ".qt", ".asf", ".dvr-ms", ".wtv", ".rm", ".rmvb", ".f4v",
+    ".ogv", ".ogm", ".vob", ".vro", ".mod", ".tod", ".dv", ".3g2",
+    # MPEG elementary/program streams and common codec-branded AVI variants.
+    ".m1v", ".m2v", ".m2p", ".mpv", ".divx", ".xvid",
 }
 
 # MP4s are probed first: correctly encoded ones (h264/yuv420p/aac) are skipped.
