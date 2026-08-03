@@ -15,6 +15,9 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 | `probe.py` | cached `ffprobe -of json` helpers: codec/remux classification plus a normalized inventory of all streams, chapters, track identity, rotation, colour, and artwork |
 | `converters.py` | command construction, stream-safety policy, temp-file protocol, `process_job()`; includes `-c copy` remuxing for compatible containers and a rotation display-matrix finalizer |
 | `validators.py` | exit/existence/size/full-decode checks plus photo metadata and video duration/stream/track/chapter/rotation/colour verification |
+| `progress.py` | concurrent FFmpeg progress plus cooperative cancellation and child termination |
+| `safety.py` | source snapshots, link/readability policy, output writability and free-space preflight |
+| `journal.py` | atomic `.mediate-run.json` state and interrupted-job prioritization |
 | `disposal.py` | Trash (macOS per-volume `.Trashes`, freedesktop elsewhere) / `--graveyard DIR` / `--hard-delete` |
 | `macmeta.py` | ctypes `setattrlist(2)` to copy the original's birthtime (Finder "date created") onto outputs; no-op off macOS |
 | `exiftool.py` | persistent `exiftool -stay_open` daemon behind `run_exiftool(args)` (thread-safe, atexit-stopped, one-shot fallback); all exiftool queries go through it |
@@ -27,8 +30,10 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 1. Probe-based skips (standard/HEVC mp4, static gif, HEIC without `--convert-heic`).
 1a. Before altering a video, inventory every stream and chapter. All audio
     tracks (including commentary) are mapped; chapters, rotation, and colour
-    are preserved. Subtitles, attached art, extra video tracks, and arbitrary
-    data/attachments cause a safety skip unless `--allow-stream-removal`.
+    are preserved. Compatible text subtitles and cover streams are mapped;
+    incompatible streams cause a safety skip unless `--allow-stream-removal`.
+    HDR/high-bit-depth, alpha, interlaced, and unusual/VFR video is blocked
+    before an 8-bit encode unless `--allow-video-downgrade`.
 1b. For non-MP4 video containers (MOV/MKV/etc): probe streams via
     `video_stream_status()`. If streams are already h264/yuv420p + AAC, set
     the remux flag so `_build_remux_command()` (`-c copy`) is used instead of
@@ -40,8 +45,9 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 3. Validate (`validators.py`). Failure → delete temp, keep original, log stderr.
 4. Metadata verification: photos must keep their EXIF `DateTimeOriginal`.
    Videos must keep duration within 1s/2%, every audio track's duration/language/
-   title/commentary/dispositions, chapters and timings, rotation, and declared colour
-   fields. This is what stops cwebp's silent TIFF metadata drop and FFmpeg's
+   title/commentary/dispositions/channel layout/sample rate/profile/A-V offset,
+   chapters and timings, rotation, compatible subtitle/art streams, and advanced
+   picture metadata. This is what stops cwebp's silent TIFF metadata drop and FFmpeg's
    default “best stream” selection from quietly losing an alternate track.
 5. `--only-if-smaller` check (after validation, before disposal).
 6. Dispose of the original (**before** `os.replace`, because a re-encoded
@@ -133,8 +139,9 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   reversed, so folder renames undo before the files inside them. Folder
   plans are applied only after all file renames resolved — file plan paths
   are computed against pre-rename folder names.
-- **Probe results are cached** (`probe.py`: path+mtime+size keyed JSON in the
-  user cache dir, loaded/saved by cli) — a 50k-file re-run would otherwise
+- **Probe results are cached** (`probe.py`: path+mtime_ns+ctime_ns+size+device+
+  inode keyed JSON; health adds a sampled BLAKE2 fingerprint) in the user cache
+  dir, loaded/saved by cli — a 50k-file re-run would otherwise
   spawn ffprobe per MP4/GIF. `load_probe_cache()` must run before the pool.
   `media_duration()` lives here too (shared by validation and progress).
 - **Concurrent FFmpeg progress** (`progress.py`): all encodes, remuxes, and
@@ -143,11 +150,10 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   10% updates plus one-minute heartbeats. The console logging handler clears
   and redraws live lines around ordinary records. stderr MUST be drained on a
   thread or the pipe fills and FFmpeg deadlocks.
-- **Standard MP4 health is full-decode cached** (`video_health`, keyed by the
-  usual path+mtime+size). Healthy MP4s disappear from candidate work; damaged
-  h264 MP4s get one `+genpts+discardcorrupt`/`ignore_err` re-encode and then the
-  complete strict validator. Normal video conversions that fail structurally
-  receive the same one-time fallback. HEVC repair still requires
+- **Standard MP4 health is full-decode cached**. Healthy MP4s disappear from
+  candidate work; damaged files first get a lossless tolerant remux and only
+  then a `+genpts+discardcorrupt`/`ignore_err` re-encode. Every rung gets the
+  complete strict validator. HEVC repair still requires
   `--reencode-hevc`. `mark_video_healthy()` avoids decoding a just-validated
   output again on the next scan.
 - **Plan files** (`write_plan`/`load_plan`): editable JSON, `--plan-file` to
@@ -171,8 +177,9 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 ## Testing
 
 - `python3 -m unittest discover tests` — pure-Python scanner/rename/probe tests
-  plus generated-media FFmpeg integration coverage for ASF/VOB, multi-audio
-  chapters, subtitle/artwork policy, and rotation. Media tests auto-skip when
+  plus generated-media FFmpeg integration coverage for ASF/VOB, surround and
+  multi-audio, chapters, subtitle/artwork policy, corruption, advanced-video
+  blocking, and rotation. Media tests auto-skip when
   ffmpeg/ffprobe/libx264 are unavailable.
 - End-to-end verification is manual but scriptable: generate fixtures with
   ffmpeg lavfi (`testsrc=size=321x239` exercises the odd-dimension GIF filter;
@@ -184,10 +191,5 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 
 ## Improvement ideas (not yet done)
 
-1. **CI** — a GitHub Actions workflow running the unit tests on push.
-2. **Sidecar awareness** — `.xmp`/`.aae` files are orphaned when their media
-   converts; could be renamed alongside or flagged.
-3. **Resume/skip cache** — remember validated conversions so a re-run over a
-   huge library doesn’t re-probe every mp4.
-4. **`--convert-heic` off macOS** — could fall back to ffmpeg ≥7 HEIC demuxing
+1. **`--convert-heic` off macOS** — could fall back to ffmpeg ≥7 HEIC demuxing
    where available instead of hard-requiring sips.

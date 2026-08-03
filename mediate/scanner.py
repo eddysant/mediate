@@ -70,6 +70,9 @@ def iter_media(root: Path) -> Iterator[MediaJob]:
                 continue
             ext = Path(name).suffix.lower()
             path = Path(dirpath) / name
+            if path.is_symlink():
+                log.warning("[skip] %s: symbolic-link media is outside the safe conversion model", path)
+                continue
             if ext in PHOTO_EXTS:
                 yield MediaJob(path, "photo")
             elif ext in HEIC_EXTS:

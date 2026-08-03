@@ -220,5 +220,26 @@ class ScanCompletionTests(unittest.TestCase):
         self.assertIn("bad container", outcome.detail)
 
 
+class ProbeCacheIdentityTests(unittest.TestCase):
+    def test_strong_cache_recomputes_when_same_size_and_mtime_content_changes(self):
+        import mediate.probe as probe
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "movie.mp4"
+            path.write_bytes(b"A" * 200000)
+            original = path.stat()
+            calls = []
+
+            def compute():
+                calls.append(True)
+                return len(calls)
+
+            kind = f"test-{id(path)}"
+            self.assertEqual(probe._cached(kind, path, compute, strong=True), 1)
+            path.write_bytes(b"B" * 200000)
+            os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
+            self.assertEqual(probe._cached(kind, path, compute, strong=True), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

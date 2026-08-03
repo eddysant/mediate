@@ -4,6 +4,7 @@ original file may be deleted."""
 from __future__ import annotations
 
 from pathlib import Path
+from fractions import Fraction
 from typing import Tuple
 
 from .exiftool import exiftool_available, run_exiftool
@@ -14,6 +15,8 @@ from .probe import (
     inventory_streams,
     is_commentary_stream,
     media_duration,
+    preservable_artwork_streams,
+    preservable_subtitle_streams,
     primary_video_streams,
     video_inventory,
 )
@@ -140,11 +143,47 @@ def _stream_identity(stream: dict) -> dict:
     }
 
 
+def _number(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _rate(value):
+    try:
+        rate = Fraction(str(value))
+        return float(rate) if rate.denominator else None
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def _normalised_layout(value):
+    if value in (None, "", "unknown"):
+        return None
+    return str(value).lower().replace(" ", "")
+
+
+def _subtitle_identity(stream: dict) -> dict:
+    tags = stream.get("tags", {})
+    title = tags.get("title") or tags.get("name") or tags.get("handler_name")
+    if str(title or "").lower().replace(" ", "") in {
+        "subtitlehandler", "texthandler", "subtitlemediahandler"
+    }:
+        title = None
+    return {
+        "language": None if tags.get("language") in (None, "", "und") else tags.get("language"),
+        "title": title,
+        "forced": bool(stream.get("disposition", {}).get("forced")),
+    }
+
+
 def verify_video_streams(
     src: Path,
     output: Path,
     source_inventory: "dict | None" = None,
     allow_stream_removal: bool = False,
+    allow_video_downgrade: bool = False,
 ) -> Tuple[bool, str]:
     """Verify duration plus all stream/metadata promises made by conversion."""
     ok, reason = verify_video_duration(src, output)
@@ -190,6 +229,8 @@ def verify_video_streams(
             f"output {target_defaults}"
         )
     for index, (before, after) in enumerate(zip(source_audio, target_audio), 1):
+        if after.get("codec_name") != "aac":
+            return False, f"audio track {index} output codec is not AAC"
         if _stream_identity(before) != _stream_identity(after):
             return False, f"audio track {index} language/title/disposition metadata changed"
         before_duration = before.get("duration")
@@ -205,6 +246,79 @@ def verify_video_streams(
                     f"audio track {index} duration changed: source {before_seconds:.2f}s, "
                     f"output {after_seconds:.2f}s"
                 )
+        for field, label in (("channels", "channel count"), ("sample_rate", "sample rate")):
+            before_value = before.get(field)
+            after_value = after.get(field)
+            if before_value is not None and str(before_value) != str(after_value):
+                return False, (
+                    f"audio track {index} {label} changed: "
+                    f"source {before_value} vs output {after_value}"
+                )
+        before_layout = _normalised_layout(before.get("channel_layout"))
+        after_layout = _normalised_layout(after.get("channel_layout"))
+        if before_layout is not None and before_layout != after_layout:
+            return False, (
+                f"audio track {index} channel layout changed: "
+                f"source {before.get('channel_layout')} vs output {after.get('channel_layout')}"
+            )
+        if before.get("codec_name") == after.get("codec_name"):
+            before_profile = before.get("profile")
+            after_profile = after.get("profile")
+            if before_profile not in (None, "unknown") and before_profile != after_profile:
+                return False, (
+                    f"audio track {index} codec profile changed: "
+                    f"source {before_profile} vs output {after_profile}"
+                )
+        source_video_start = _number(source_video[0].get("start_time"))
+        before_start = _number(before.get("start_time"))
+        target_video_start = _number(target_video[0].get("start_time"))
+        after_start = _number(after.get("start_time"))
+        if None not in (source_video_start, before_start, target_video_start, after_start):
+            before_offset = before_start - source_video_start
+            after_offset = after_start - target_video_start
+            if abs(before_offset - after_offset) > 0.05:
+                return False, f"audio track {index} A/V start offset changed"
+
+    source_subtitles = preservable_subtitle_streams(source)
+    target_subtitles = inventory_streams(target, "subtitle")
+    if len(source_subtitles) != len(target_subtitles):
+        return False, (
+            f"compatible subtitle track count changed: source {len(source_subtitles)}, "
+            f"output {len(target_subtitles)}"
+        )
+    source_subtitle_defaults = [
+        index for index, stream in enumerate(source_subtitles)
+        if stream.get("disposition", {}).get("default")
+    ]
+    target_subtitle_defaults = [
+        index for index, stream in enumerate(target_subtitles)
+        if stream.get("disposition", {}).get("default")
+    ]
+    allowed_subtitle_defaults = (
+        source_subtitle_defaults
+        if source_subtitle_defaults
+        else ([] if not source_subtitles else [0])
+    )
+    if target_subtitle_defaults not in (source_subtitle_defaults, allowed_subtitle_defaults):
+        return False, "default subtitle selection changed"
+    for index, (before, after) in enumerate(zip(source_subtitles, target_subtitles), 1):
+        if after.get("codec_name") != "mov_text":
+            return False, f"subtitle track {index} is not MP4 mov_text"
+        if _subtitle_identity(before) != _subtitle_identity(after):
+            return False, f"subtitle track {index} language/title/disposition metadata changed"
+
+    source_artwork = preservable_artwork_streams(source)
+    target_artwork = preservable_artwork_streams(target)
+    if len(source_artwork) != len(target_artwork):
+        return False, (
+            f"compatible artwork count changed: source {len(source_artwork)}, "
+            f"output {len(target_artwork)}"
+        )
+    for index, (before, after) in enumerate(zip(source_artwork, target_artwork), 1):
+        for field in ("codec_name", "width", "height"):
+            before_value = before.get(field)
+            if before_value is not None and before_value != after.get(field):
+                return False, f"artwork stream {index} {field} changed"
 
     source_chapters = source.get("chapters", [])
     target_chapters = target.get("chapters", [])
@@ -226,6 +340,11 @@ def verify_video_streams(
 
     before_video = source_video[0]
     after_video = target_video[0]
+    if after_video.get("codec_name") != "h264" or after_video.get("pix_fmt") != "yuv420p":
+        return False, (
+            "primary output is not h264/yuv420p: "
+            f"{after_video.get('codec_name')}/{after_video.get('pix_fmt')}"
+        )
     if _normalised_rotation(before_video.get("rotation")) != _normalised_rotation(
         after_video.get("rotation")
     ):
@@ -237,5 +356,32 @@ def verify_video_streams(
             field, after
         ):
             return False, f"video {field} metadata changed: source {before}, output {after}"
+
+    if not allow_video_downgrade:
+        for field, label in (
+            ("field_order", "field order"),
+            ("sample_aspect_ratio", "sample aspect ratio"),
+        ):
+            before = before_video.get(field)
+            after = after_video.get(field)
+            if before not in (None, "", "unknown", "0:1") and before != after:
+                return False, f"video {label} changed: source {before} vs output {after}"
+        before_rate = _rate(before_video.get("avg_frame_rate"))
+        after_rate = _rate(after_video.get("avg_frame_rate"))
+        if before_rate and after_rate and abs(before_rate - after_rate) > max(0.5, before_rate * 0.005):
+            return False, (
+                f"video average frame rate changed: source {before_rate:.3f} "
+                f"vs output {after_rate:.3f}"
+            )
+        before_side_data = set(before_video.get("side_data_types", []))
+        after_side_data = set(after_video.get("side_data_types", []))
+        important = {
+            value for value in before_side_data
+            if any(marker in value.lower() for marker in (
+                "mastering display", "content light", "dolby vision", "dovi", "hdr10"
+            ))
+        }
+        if not important.issubset(after_side_data):
+            return False, "video HDR/dynamic-range side data changed"
 
     return True, "ok"

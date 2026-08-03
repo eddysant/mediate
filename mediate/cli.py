@@ -24,7 +24,8 @@ from .converters import (
     process_job,
 )
 from .disposal import GRAVEYARD, HARD, TRASH, make_disposer
-from .progress import LIVE_PROGRESS
+from .journal import RunJournal
+from .progress import CANCELLATION, LIVE_PROGRESS, ConversionCancelled
 from .scanner import find_live_photo_companions, iter_media
 
 log = logging.getLogger("mediate")
@@ -58,6 +59,8 @@ def _resolve_future(future: Future, job) -> Outcome:
     """
     try:
         return future.result()
+    except ConversionCancelled:
+        return Outcome(SKIPPED, job.path, "cancelled; partial output removed, original kept")
     except Exception as exc:  # process one bad media file without aborting the scan
         log.debug("unexpected worker failure for %s", job.path, exc_info=True)
         return Outcome(FAILED, job.path, f"unexpected processing error: {exc}")
@@ -79,8 +82,10 @@ def _filter_standardized_mp4(
     healthy = set()
     if possible:
         log.info("validating integrity: %d standardized MP4 file(s)", len(possible))
-        with ThreadPoolExecutor(max_workers=min(max(1, workers), len(possible))) as pool:
-            futures = {pool.submit(health_fn, job.path): job for job in possible}
+        pool = ThreadPoolExecutor(max_workers=min(max(1, workers), len(possible)))
+        futures = {pool.submit(health_fn, job.path): job for job in possible}
+        interrupted = False
+        try:
             for future in as_completed(futures):
                 try:
                     if future.result().get("ok"):
@@ -89,6 +94,16 @@ def _filter_standardized_mp4(
                     log.debug(
                         "health check failed for %s", futures[future].path, exc_info=True
                     )
+        except KeyboardInterrupt:
+            interrupted = True
+            CANCELLATION.request()
+            for future in futures:
+                future.cancel()
+            raise
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+            if interrupted:
+                LIVE_PROGRESS.clear()
     return [job for job in jobs if job.path not in healthy], len(healthy)
 
 
@@ -175,9 +190,15 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--allow-stream-removal",
         action="store_true",
         help="allow video conversion to discard streams MP4 standardisation cannot "
-        "safely preserve (subtitles, attached artwork, extra video tracks, and "
-        "data/attachment streams); audio tracks, chapters, rotation, and colour "
-        "metadata are still preserved and verified",
+        "safely preserve; compatible text subtitles and JPEG/PNG cover streams "
+        "are retained automatically",
+    )
+    parser.add_argument(
+        "--allow-video-downgrade",
+        action="store_true",
+        help="allow 8-bit h264 conversion of HDR/high-bit-depth, alpha, interlaced, "
+        "or variable/unusual-frame-rate video (default: warn and skip because "
+        "picture semantics may change)",
     )
     parser.add_argument(
         "--rename",
@@ -281,6 +302,7 @@ def setup_logging(log_path: Path, verbose: bool) -> None:
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    CANCELLATION.reset()
 
     root = args.directory.expanduser().resolve()
     if not root.is_dir():
@@ -338,6 +360,7 @@ def main(argv=None) -> int:
         reencode_hevc=args.reencode_hevc,
         convert_heic=args.convert_heic,
         allow_stream_removal=args.allow_stream_removal,
+        allow_video_downgrade=args.allow_video_downgrade,
         dispose=dispose,
         dispose_label=dispose_label,
     )
@@ -352,9 +375,14 @@ def main(argv=None) -> int:
     # Already-standardized MP4 outputs are recognized media, not unfinished
     # work. Filtering them before the headline count stops repeat runs over a
     # completed library from looking as though files were missed previously.
-    jobs, standardized_count = _filter_standardized_mp4(
-        recognized, mp4_status, MP4_STANDARD, workers=args.workers
-    )
+    try:
+        jobs, standardized_count = _filter_standardized_mp4(
+            recognized, mp4_status, MP4_STANDARD, workers=args.workers
+        )
+    except KeyboardInterrupt:
+        log.error("interrupted during integrity validation; originals untouched")
+        save_probe_cache()
+        return 130
     # Preserve expensive integrity results even if a later conversion is
     # interrupted; newly produced outputs are saved again at the end.
     save_probe_cache()
@@ -402,6 +430,24 @@ def main(argv=None) -> int:
             claimed[out] = job.path
             runnable.append(job)
 
+    journal = RunJournal(root, enabled=not args.dry_run)
+    runnable, resumed_count = journal.prepare(runnable)
+    if resumed_count:
+        log.info("resume journal: prioritizing %d interrupted/unfinished file(s)", resumed_count)
+
+    def process_journaled(job):
+        journal.mark(job, "running")
+        try:
+            outcome = process_job(job, opts)
+        except ConversionCancelled:
+            journal.mark(job, "interrupted", "cancelled; original kept")
+            raise
+        except Exception as exc:
+            journal.mark(job, "failed", f"unexpected processing error: {exc}")
+            raise
+        journal.mark(job, outcome.status, outcome.detail)
+        return outcome
+
     tally = {
         CONVERTED: 0,
         REMUXED: 0,
@@ -414,19 +460,31 @@ def main(argv=None) -> int:
     for outcome in planned_skips:
         tally[outcome.status] += 1
         log.info("%-6s %s %s", STATUS_MARKS[outcome.status], outcome.path.relative_to(root), outcome.detail)
+    pool = ThreadPoolExecutor(max_workers=max(1, args.workers))
+    futures = {pool.submit(process_journaled, job): job for job in runnable}
+    interrupted = False
     try:
-        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-            futures = {pool.submit(process_job, job, opts): job for job in runnable}
-            for future in as_completed(futures):
-                outcome = _resolve_future(future, futures[future])
-                tally[outcome.status] += 1
-                bytes_saved += outcome.bytes_saved
-                rel = outcome.path.relative_to(root)
-                level = logging.ERROR if outcome.status == FAILED else logging.INFO
-                log.log(level, "%-6s %s %s", STATUS_MARKS[outcome.status], rel, outcome.detail)
+        for future in as_completed(futures):
+            outcome = _resolve_future(future, futures[future])
+            tally[outcome.status] += 1
+            bytes_saved += outcome.bytes_saved
+            rel = outcome.path.relative_to(root)
+            level = logging.ERROR if outcome.status == FAILED else logging.INFO
+            log.log(level, "%-6s %s %s", STATUS_MARKS[outcome.status], rel, outcome.detail)
     except KeyboardInterrupt:
+        interrupted = True
+        CANCELLATION.request()
+        for future in futures:
+            future.cancel()
         log.error("interrupted; conversions already validated are kept, others untouched")
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+        LIVE_PROGRESS.clear()
+    if interrupted:
+        journal.finish(interrupted=True)
+        save_probe_cache()
         return 130
+    journal.finish(interrupted=False)
 
     if args.dry_run:
         log.info(

@@ -1,12 +1,14 @@
 """ffprobe helpers for deciding whether a file needs conversion.
 
-Probe results are cached (keyed by path + mtime + size) in the user cache
-directory, so re-running over a large already-standardized library doesn't
-re-spawn ffprobe for every file."""
+Probe results are cached by filesystem identity; expensive decode-health
+entries also include a sampled content fingerprint. Re-running over a large
+already-standardized library therefore does not re-spawn ffprobe/ffmpeg for
+every unchanged file."""
 
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import subprocess
@@ -58,20 +60,51 @@ def save_probe_cache() -> None:
         log.debug("could not write probe cache: %s", exc)
 
 
-def _cached(kind: str, path: Path, compute):
+def _sample_fingerprint(path: Path) -> str | None:
+    """Hash small samples from across a file without rereading large media."""
+    try:
+        size = path.stat().st_size
+        digest = hashlib.blake2b(digest_size=16)
+        with path.open("rb") as handle:
+            for offset in sorted({0, max(0, size // 2 - 32768), max(0, size - 65536)}):
+                handle.seek(offset)
+                digest.update(offset.to_bytes(8, "little"))
+                digest.update(handle.read(65536))
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _file_identity(path: Path, strong: bool = False) -> dict | None:
     try:
         st = path.stat()
     except OSError:
+        return None
+    identity = {
+        "m": st.st_mtime_ns,
+        "c": st.st_ctime_ns,
+        "s": st.st_size,
+        "i": st.st_ino,
+        "d": st.st_dev,
+    }
+    if strong:
+        identity["f"] = _sample_fingerprint(path)
+    return identity
+
+
+def _cached(kind: str, path: Path, compute, strong: bool = False):
+    identity = _file_identity(path, strong=strong)
+    if identity is None:
         return compute()
     key = f"{kind}:{path}"
     with _cache_lock:
         entry = _cache.get(key)
-        if entry and entry.get("m") == st.st_mtime and entry.get("s") == st.st_size:
+        if entry and all(entry.get(name) == value for name, value in identity.items()):
             return entry["v"]
     value = compute()
     global _cache_dirty
     with _cache_lock:
-        _cache[key] = {"m": st.st_mtime, "s": st.st_size, "v": value}
+        _cache[key] = {**identity, "v": value}
         _cache_dirty = True
     return value
 
@@ -182,6 +215,8 @@ COLOR_FIELDS = (
     "color_primaries",
     "chroma_location",
 )
+SIMPLE_SUBTITLE_CODECS = {"mov_text", "subrip", "srt", "text", "webvtt"}
+MP4_ARTWORK_CODECS = {"mjpeg", "png"}
 IDENTITY_TAGS = (
     "language",
     "title",
@@ -240,15 +275,34 @@ def _normalise_stream(stream: dict) -> dict:
         "codec_type": stream.get("codec_type", "unknown"),
         "codec_name": stream.get("codec_name", "unknown"),
         "codec_tag_string": stream.get("codec_tag_string"),
+        "profile": stream.get("profile"),
+        "start_time": stream.get("start_time"),
         "duration": stream.get("duration"),
         "tags": _selected(tags, IDENTITY_TAGS),
         "disposition": _selected(disposition, DISPOSITION_FIELDS),
     }
     if stream.get("codec_type") == "video":
+        result["width"] = stream.get("width")
+        result["height"] = stream.get("height")
         result["pix_fmt"] = stream.get("pix_fmt")
+        result["bits_per_raw_sample"] = stream.get("bits_per_raw_sample")
+        result["field_order"] = stream.get("field_order")
+        result["avg_frame_rate"] = stream.get("avg_frame_rate")
+        result["r_frame_rate"] = stream.get("r_frame_rate")
+        result["sample_aspect_ratio"] = stream.get("sample_aspect_ratio")
         result["rotation"] = _rotation(stream)
         result["color"] = _selected(stream, COLOR_FIELDS)
         result["attached_pic"] = bool(disposition.get("attached_pic"))
+        result["side_data_types"] = sorted({
+            str(item.get("side_data_type"))
+            for item in stream.get("side_data_list", [])
+            if item.get("side_data_type")
+        })
+    elif stream.get("codec_type") == "audio":
+        result["sample_rate"] = stream.get("sample_rate")
+        result["channels"] = stream.get("channels")
+        result["channel_layout"] = stream.get("channel_layout")
+        result["sample_fmt"] = stream.get("sample_fmt")
     return result
 
 
@@ -314,6 +368,79 @@ def attached_artwork_streams(inventory: dict) -> List[dict]:
     return pictures
 
 
+def preservable_subtitle_streams(inventory: dict) -> List[dict]:
+    """Text subtitle streams MP4 can carry safely as mov_text."""
+    return [
+        stream for stream in inventory_streams(inventory, "subtitle")
+        if stream.get("codec_name") in SIMPLE_SUBTITLE_CODECS
+    ]
+
+
+def preservable_artwork_streams(inventory: dict) -> List[dict]:
+    """Already-decoded cover streams MP4 can retain without extraction."""
+    return [
+        stream for stream in attached_artwork_streams(inventory)
+        if stream.get("codec_type") == "video"
+        and stream.get("codec_name") in MP4_ARTWORK_CODECS
+    ]
+
+
+def _pixel_depth(stream: dict) -> int | None:
+    value = stream.get("bits_per_raw_sample")
+    try:
+        depth = int(value)
+        if depth:
+            return depth
+    except (TypeError, ValueError):
+        pass
+    pix_fmt = str(stream.get("pix_fmt") or "")
+    for depth in (16, 14, 12, 10, 9):
+        if str(depth) in pix_fmt:
+            return depth
+    return 8 if pix_fmt else None
+
+
+def _rate_float(value) -> float | None:
+    try:
+        numerator, denominator = str(value).split("/", 1)
+        denominator_value = float(denominator)
+        return float(numerator) / denominator_value if denominator_value else None
+    except (TypeError, ValueError):
+        return None
+
+
+def advanced_video_features(inventory: dict) -> List[str]:
+    """Describe picture properties that an ordinary 8-bit encode may damage."""
+    videos = primary_video_streams(inventory)
+    if not videos:
+        return []
+    stream = videos[0]
+    features: List[str] = []
+    depth = _pixel_depth(stream)
+    if depth and depth > 8:
+        features.append(f"{depth}-bit video")
+    transfer = str(stream.get("color", {}).get("color_transfer") or "").lower()
+    side_data = " ".join(stream.get("side_data_types", [])).lower()
+    if transfer in {"smpte2084", "arib-std-b67"} or any(
+        marker in side_data
+        for marker in ("mastering display", "content light", "dolby vision", "dovi", "hdr10")
+    ):
+        features.append("HDR/dynamic-range metadata")
+    pix_fmt = str(stream.get("pix_fmt") or "").lower()
+    if pix_fmt.startswith(("rgba", "argb", "bgra", "abgr", "yuva", "gbrap")):
+        features.append("alpha channel")
+    field_order = str(stream.get("field_order") or "").lower()
+    if field_order not in ("", "unknown", "progressive"):
+        features.append(f"interlaced video ({field_order})")
+    average_rate = _rate_float(stream.get("avg_frame_rate"))
+    nominal_rate = _rate_float(stream.get("r_frame_rate"))
+    if average_rate and nominal_rate and abs(average_rate - nominal_rate) > max(0.01, nominal_rate * 0.01):
+        features.append("variable frame rate")
+    elif average_rate and (average_rate < 10 or average_rate > 120):
+        features.append(f"unusual frame rate ({average_rate:.3f} fps)")
+    return features
+
+
 def is_commentary_stream(stream: dict) -> bool:
     if stream.get("disposition", {}).get("comment"):
         return True
@@ -367,11 +494,19 @@ def stream_removal_risks(inventory: dict) -> List[str]:
     videos = primary_video_streams(inventory)
     if len(videos) > 1:
         risks.append(f"{len(videos) - 1} additional video track(s)")
-    subtitles = inventory_streams(inventory, "subtitle")
+    preservable_subtitles = preservable_subtitle_streams(inventory)
+    subtitles = [
+        stream for stream in inventory_streams(inventory, "subtitle")
+        if stream not in preservable_subtitles
+    ]
     if subtitles:
         codecs = ", ".join(sorted({s.get("codec_name", "unknown") for s in subtitles}))
         risks.append(f"{len(subtitles)} subtitle track(s) ({codecs})")
-    artwork = attached_artwork_streams(inventory)
+    preservable_artwork = preservable_artwork_streams(inventory)
+    artwork = [
+        stream for stream in attached_artwork_streams(inventory)
+        if stream not in preservable_artwork
+    ]
     if artwork:
         risks.append(f"{len(artwork)} attached artwork stream(s)")
     others = [
@@ -379,6 +514,7 @@ def stream_removal_risks(inventory: dict) -> List[str]:
         if stream.get("codec_type") not in ("video", "audio", "subtitle")
         and not _is_chapter_carrier(stream, inventory)
         and stream not in artwork
+        and stream not in preservable_artwork
     ]
     if others:
         kinds = ", ".join(sorted({s.get("codec_type", "unknown") for s in others}))
@@ -408,6 +544,12 @@ def preservation_summary(inventory: dict) -> str:
             parts.append(f"rotation {video['rotation']} degrees")
         if video.get("color"):
             parts.append("colour metadata")
+    subtitles = preservable_subtitle_streams(inventory)
+    if subtitles:
+        parts.append(f"{len(subtitles)} compatible subtitle track(s)")
+    artwork = preservable_artwork_streams(inventory)
+    if artwork:
+        parts.append(f"{len(artwork)} compatible artwork stream(s)")
     return ", ".join(parts)
 
 
@@ -455,23 +597,18 @@ def check_video_integrity(path: Path, progress_path: Optional[Path] = None) -> d
 
 def video_health(path: Path) -> dict:
     """Cached full-decode health for an existing standardized video."""
-    return _cached("health1", path, lambda: check_video_integrity(path))
+    return _cached("health2", path, lambda: check_video_integrity(path), strong=True)
 
 
 def mark_video_healthy(path: Path) -> None:
     """Seed the cache after a new output already passed full validation."""
-    try:
-        stat = path.stat()
-    except OSError:
+    key = f"health2:{path}"
+    identity = _file_identity(path, strong=True)
+    if identity is None:
         return
-    key = f"health1:{path}"
     global _cache_dirty
     with _cache_lock:
-        _cache[key] = {
-            "m": stat.st_mtime,
-            "s": stat.st_size,
-            "v": {"ok": True, "reason": "ok"},
-        }
+        _cache[key] = {**identity, "v": {"ok": True, "reason": "ok"}}
         _cache_dirty = True
 
 

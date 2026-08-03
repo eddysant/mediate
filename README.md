@@ -22,10 +22,13 @@ Skipped automatically:
 - **Live Photo pairs** — a `.mov` next to a same-named still (both halves are
   left alone, since converting either breaks the pairing in Apple Photos;
   `--convert-live-photos` to force).
-- Videos whose MP4 conversion would discard subtitles, attached artwork,
-  extra video angles, or arbitrary data/attachment streams. The skip message
-  inventories them; `--allow-stream-removal` is the explicit opt-in to drop
-  those streams.
+- Videos whose MP4 conversion would discard styled/bitmap subtitles,
+  incompatible attachments, extra video angles, or arbitrary data streams.
+  Simple text subtitles become `mov_text` and JPEG/PNG cover streams are
+  retained automatically; `--allow-stream-removal` opts into dropping the rest.
+- Video that would silently lose HDR/high-bit-depth, alpha, interlacing, or
+  variable/unusual-frame-rate semantics during the standard 8-bit encode
+  (`--allow-video-downgrade` is the explicit opt-in).
 - **Application bundles** — `*.photoslibrary`, `*.app`, `*.fcpbundle`, etc.
   are never traversed. Converting files inside an Apple Photos library would
   corrupt it, so this cannot be overridden.
@@ -129,9 +132,11 @@ Options:
   accepting the size increase.
 - `--convert-heic` — convert HEIC/HEIF to lossless WebP (macOS only).
 - `--convert-live-photos` — convert Live Photo pairs anyway.
-- `--allow-stream-removal` — allow MP4 conversion to discard subtitles,
-  attached artwork, extra video tracks, and unsupported data/attachment
-  streams. Without this flag those files are warned about and skipped.
+- `--allow-stream-removal` — allow MP4 conversion to discard incompatible
+  subtitles, artwork, extra video tracks, and data/attachment streams.
+  Compatible text subtitles and JPEG/PNG cover streams are always preserved.
+- `--allow-video-downgrade` — explicitly permit 8-bit h264 conversion of
+  HDR/high-bit-depth, alpha, interlaced, or variable/unusual-frame-rate video.
 - `--graveyard DIR` — move originals to DIR (mirroring the folder structure)
   instead of the Trash.
 - `--hard-delete` — permanently delete originals (the pre-Trash behavior).
@@ -176,20 +181,21 @@ An original is disposed of **only** after all of these pass:
    EXIF-block check otherwise) — this is what catches e.g. cwebp silently
    dropping TIFF metadata.
 6. A video's duration matches within 1s/2%, and its full stream inventory is
-   checked: every audio track is still present in order with its duration,
-   language, title/commentary identity, and dispositions; chapters retain their count,
-   titles, and timing; rotation and declared colour properties still match.
+   checked: every audio track retains duration, language, title/commentary,
+   dispositions, channel count/layout, sample rate, profile, and A/V start
+   offset; chapters, rotation, colour, aspect ratio, field order, frame rate,
+   compatible subtitles, artwork, and HDR side data are also verified.
 
 On any failure the partial output is removed, the original is untouched, and
 the reason is logged.
 
 Already-standardized MP4s are not trusted solely because their codecs match.
 Mediate fully decodes every video and audio stream once, caches that health
-result by path/mtime/size, and reuses it on later scans. A damaged h264 MP4—or
-a nonstandard video whose normal conversion fails—gets one tolerant repair
-attempt that regenerates timestamps and discards corrupt packets. The repaired
-file must still pass every integrity, duration, stream, chapter, rotation, and
-colour check above. Otherwise it is discarded and the original stays put.
+result using filesystem identity plus sampled content, and reuses it on later
+scans. Repair is lossless-first: rebuild the container/index/timestamps with
+stream copy, validate it, then fall back to tolerant re-encoding only if that
+still fails. Every repaired file must pass the complete checklist above.
+Otherwise it is discarded and the original stays put.
 Damaged HEVC remains opt-in through `--reencode-hevc`.
 
 Additional safeguards beyond the checklist:
@@ -206,6 +212,13 @@ Additional safeguards beyond the checklist:
   and chapters. FFmpeg's implicit “best stream” selection is never trusted.
   A rotated video gets a short lossless remux after encoding to restore its
   display matrix before validation.
+- Before work starts, the source must be a readable regular file with no
+  symlink or hard-link ambiguity, its output directory must be writable, and
+  conservative temporary free space must be available. Device/inode/size/mtime
+  are checked again before disposal so a moving source is never replaced.
+- Ctrl-C terminates active FFmpeg children, removes partial outputs, records
+  queued/running work in `.mediate-run.json`, and prioritizes matching
+  unfinished files on the next run.
 - If the target name already exists (e.g. `a.jpg` and `a.png` both map to
   `a.webp`), the file is skipped and logged rather than overwritten.
 - The output inherits the original's modification time **and, on macOS, its
@@ -217,9 +230,9 @@ Additional safeguards beyond the checklist:
 - `.aae`/`.xmp` sidecars describe their original file, so when an original is
   disposed of after conversion, its sidecars travel with it.
 - ffprobe results are cached (`~/Library/Caches/mediate` / `$XDG_CACHE_HOME`),
-  keyed by path+mtime+size, so re-running over a large already-standardized
-  library is near-instant. Completed MP4s are reported as one aggregate
-  “already standardized” count rather than returning as conversion candidates.
+  keyed by path, nanosecond mtime/ctime, size, device, and inode. Expensive
+  full-decode health entries also include a sampled BLAKE2 fingerprint.
+  Completed MP4s are reported as one aggregate “already standardized” count.
 - An unexpected exception in one worker is recorded as that file's failure;
   it no longer stops collection of the rest of the scan and makes untouched
   files appear only on the next run.
@@ -232,9 +245,9 @@ Additional safeguards beyond the checklist:
   for the whole run instead of one per file.
 - Windows: the Recycle Bin is not supported — mediate requires
   `--graveyard DIR` or `--hard-delete` there.
-- Subtitle and attached-art streams are detected before conversion and skipped
-  by default because MP4 cannot faithfully represent every source codec and
-  styling format. `--allow-stream-removal` makes their removal deliberate.
+- Simple text subtitles are converted to MP4 `mov_text`; JPEG/PNG cover streams
+  are copied. Styled/bitmap subtitles and incompatible attachments remain
+  blocked unless `--allow-stream-removal` makes their removal deliberate.
 - `.tif` inputs whose EXIF matters will fail the new metadata check (cwebp
   cannot carry TIFF metadata) and stay untouched — by design.
 - Live Photo detection is by naming convention (same directory + stem,
@@ -250,7 +263,8 @@ Additional safeguards beyond the checklist:
 python3 -m unittest discover tests
 ```
 
-The suite includes small generated-media integration tests for ASF/VOB,
-multiple audio tracks and chapters, subtitle/artwork safety, and rotation.
+The suite includes generated-media integration tests for ASF/VOB, surround and
+multiple audio tracks, chapters, subtitle/artwork preservation, rotation,
+high-bit-depth blocking, corrupt packets, and missing MP4 indexes.
 They run automatically when `ffmpeg`, `ffprobe`, and `libx264` are available,
 and otherwise skip without making the pure-Python tests unavailable.

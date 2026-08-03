@@ -12,6 +12,9 @@ from mediate.converters import (
     process_job,
 )
 from mediate.probe import (
+    advanced_video_features,
+    preservable_artwork_streams,
+    preservable_subtitle_streams,
     preservation_summary,
     stream_removal_risks,
 )
@@ -64,7 +67,6 @@ class StreamPreflightTests(unittest.TestCase):
             [
                 "1 additional video track(s)",
                 "1 subtitle track(s) (ass)",
-                "1 attached artwork stream(s)",
                 "1 unsupported data stream(s)",
             ],
         )
@@ -126,9 +128,8 @@ class StreamPreflightTests(unittest.TestCase):
             path.write_bytes(b"fixture")
             with patch("mediate.converters.video_inventory", return_value=inventory):
                 result = process_job(MediaJob(path, "video"), Options(dry_run=True))
-        self.assertEqual(result.status, SKIPPED)
-        self.assertIn("stream safety warning", result.detail)
-        self.assertIn("--allow-stream-removal", result.detail)
+        self.assertEqual(result.status, "planned")
+        self.assertIn("compatible subtitle track", result.detail)
 
     def test_process_job_fails_closed_when_stream_preflight_is_unreadable(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -138,6 +139,30 @@ class StreamPreflightTests(unittest.TestCase):
                 result = process_job(MediaJob(path, "video"), Options(dry_run=True))
         self.assertEqual(result.status, SKIPPED)
         self.assertIn("stream preflight failed", result.detail)
+
+    def test_process_job_blocks_high_bit_depth_reencode_without_permission(self):
+        video = _stream("video", "prores", index=0)
+        video.update({
+            "pix_fmt": "yuv422p10le",
+            "bits_per_raw_sample": "10",
+            "field_order": "progressive",
+        })
+        inventory = _inventory(video)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "hdr.mov"
+            path.write_bytes(b"fixture")
+            with patch("mediate.converters.video_inventory", return_value=inventory), patch(
+                "mediate.converters.video_stream_status", return_value="convert"
+            ):
+                blocked = process_job(MediaJob(path, "video"), Options(dry_run=True))
+                allowed = process_job(
+                    MediaJob(path, "video"),
+                    Options(dry_run=True, allow_video_downgrade=True),
+                )
+        self.assertEqual(blocked.status, SKIPPED)
+        self.assertIn("10-bit video", blocked.detail)
+        self.assertIn("--allow-video-downgrade", blocked.detail)
+        self.assertEqual(allowed.status, "planned")
 
 
 class StreamCommandTests(unittest.TestCase):
@@ -163,7 +188,8 @@ class StreamCommandTests(unittest.TestCase):
         command = _build_command("video", Path("in.mkv"), Path("out.mp4"), self.inventory)
         joined = " ".join(command)
         self.assertIn("-noautorotate -i in.mkv", joined)
-        self.assertIn("-map 0:v:0 -map 0:a?", joined)
+        self.assertIn("-map 0:0 -map 0:1", joined)
+        self.assertIn("-map 0:2", joined)
         self.assertIn("-map_metadata:s:a:0 0:s:a:0", joined)
         self.assertIn("-map_metadata:s:a:1 0:s:a:1", joined)
         self.assertIn("-metadata:s:a:0 language=jpn", joined)
@@ -185,9 +211,44 @@ class StreamCommandTests(unittest.TestCase):
     def test_remux_uses_the_same_explicit_mapping(self):
         command = _build_remux_command(Path("in.mov"), Path("out.mp4"), self.inventory)
         joined = " ".join(command)
-        self.assertIn("-map 0:v:0 -map 0:a?", joined)
+        self.assertIn("-map 0:0 -map 0:1", joined)
+        self.assertIn("-map 0:2", joined)
         self.assertIn("-map_chapters 0", joined)
         self.assertIn("-c copy", joined)
+
+    def test_tolerant_repair_remux_regenerates_timestamps_before_reencoding(self):
+        command = _build_remux_command(
+            Path("broken.mp4"), Path("repaired.mp4"), self.inventory, repair=True
+        )
+        joined = " ".join(command)
+        self.assertIn("-fflags +genpts+discardcorrupt", joined)
+        self.assertIn("-err_detect ignore_err", joined)
+        self.assertIn("-c copy", joined)
+
+    def test_compatible_subtitles_and_cover_art_are_explicitly_mapped(self):
+        artwork = _stream("video", "mjpeg", index=4, attached_pic=True)
+        subtitle = _stream(
+            "subtitle",
+            "subrip",
+            index=3,
+            tags={"language": "eng", "title": "English"},
+            disposition={"forced": 1},
+        )
+        inventory = _inventory(
+            _stream("video", "h264", index=0),
+            _stream("audio", "aac", index=1),
+            subtitle,
+            artwork,
+        )
+        command = _build_command("video", Path("in.mkv"), Path("out.mp4"), inventory)
+        joined = " ".join(command)
+        self.assertEqual(preservable_subtitle_streams(inventory), [subtitle])
+        self.assertEqual(preservable_artwork_streams(inventory), [artwork])
+        self.assertIn("-map 0:3", joined)
+        self.assertIn("-c:s mov_text", joined)
+        self.assertIn("-map 0:4", joined)
+        self.assertIn("-c:v:1 copy", joined)
+        self.assertIn("-disposition:v:1 attached_pic", joined)
 
     def test_rotation_finalizer_writes_display_matrix_without_reencoding(self):
         command = _build_rotation_command(
@@ -206,6 +267,7 @@ class StreamValidationTests(unittest.TestCase):
             rotation=90,
             color={"color_primaries": "bt709", "color_space": "bt709"},
         )
+        self.video["pix_fmt"] = "yuv420p"
         self.japanese = _stream(
             "audio",
             "aac",
@@ -268,6 +330,51 @@ class StreamValidationTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("audio track 2 duration changed", reason)
 
+    def test_rejects_audio_channel_layout_sample_rate_or_profile_changes(self):
+        source_audio = dict(self.japanese)
+        source_audio.update({
+            "channels": 6,
+            "channel_layout": "5.1(side)",
+            "sample_rate": "48000",
+            "profile": "LC",
+        })
+        source = _inventory(self.video, source_audio)
+        changes = (
+            ("channels", 2, "channel count"),
+            ("channel_layout", "stereo", "channel layout"),
+            ("sample_rate", "44100", "sample rate"),
+            ("profile", "HE-AAC", "codec profile"),
+        )
+        for field, value, message in changes:
+            with self.subTest(field=field):
+                changed = dict(source_audio)
+                changed[field] = value
+                ok, reason = self._verify(source, _inventory(self.video, changed))
+                self.assertFalse(ok)
+                self.assertIn(message, reason)
+
+    def test_detects_advanced_video_that_needs_explicit_downgrade_permission(self):
+        advanced = _stream(
+            "video",
+            "prores",
+            index=0,
+            color={"color_transfer": "smpte2084"},
+        )
+        advanced.update({
+            "pix_fmt": "yuva444p10le",
+            "bits_per_raw_sample": "10",
+            "field_order": "tt",
+            "side_data_types": ["Mastering display metadata"],
+            "avg_frame_rate": "24000/1001",
+            "r_frame_rate": "30/1",
+        })
+        features = advanced_video_features(_inventory(advanced))
+        self.assertIn("10-bit video", features)
+        self.assertIn("HDR/dynamic-range metadata", features)
+        self.assertIn("alpha channel", features)
+        self.assertIn("interlaced video (tt)", features)
+        self.assertIn("variable frame rate", features)
+
     def test_rejects_changed_commentary_identity(self):
         source = _inventory(self.video, self.japanese, self.commentary)
         changed = dict(self.commentary)
@@ -316,6 +423,15 @@ class StreamValidationTests(unittest.TestCase):
         ok, reason = self._verify(source, _inventory(recoloured, self.japanese, chapters=[self.chapter]))
         self.assertFalse(ok)
         self.assertIn("color_space", reason)
+
+    def test_rejects_a_primary_output_that_is_not_the_target_codec(self):
+        source = _inventory(self.video, self.japanese)
+        wrong_video = dict(self.video)
+        wrong_video["codec_name"] = "hevc"
+        wrong_video["pix_fmt"] = "yuv420p10le"
+        ok, reason = self._verify(source, _inventory(wrong_video, self.japanese))
+        self.assertFalse(ok)
+        self.assertIn("not h264/yuv420p", reason)
 
     def test_accepts_implicit_h264_limited_range(self):
         source_video = dict(self.video)

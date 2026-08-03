@@ -166,6 +166,62 @@ class ProgressDisplay:
 LIVE_PROGRESS = ProgressDisplay()
 
 
+class ConversionCancelled(RuntimeError):
+    """Raised in workers after the user requests a cooperative stop."""
+
+
+class CancellationController:
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._lock = threading.Lock()
+        self._processes: set[subprocess.Popen] = set()
+
+    def reset(self) -> None:
+        self._event.clear()
+
+    def requested(self) -> bool:
+        return self._event.is_set()
+
+    def register(self, process: subprocess.Popen) -> None:
+        with self._lock:
+            self._processes.add(process)
+            cancelled = self._event.is_set()
+        if cancelled:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+
+    def unregister(self, process: subprocess.Popen) -> None:
+        with self._lock:
+            self._processes.discard(process)
+
+    def request(self) -> None:
+        self._event.set()
+        with self._lock:
+            processes = list(self._processes)
+        for process in processes:
+            if process.poll() is None:
+                try:
+                    process.terminate()
+                    timer = threading.Timer(2.0, self._kill_if_alive, args=(process,))
+                    timer.daemon = True
+                    timer.start()
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _kill_if_alive(process: subprocess.Popen) -> None:
+        if process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+
+CANCELLATION = CancellationController()
+
+
 def _parse_speed(value: str) -> Optional[float]:
     try:
         return float(value.rstrip("x"))
@@ -180,6 +236,8 @@ def run_ffmpeg_progress(
     action: str,
 ) -> subprocess.CompletedProcess:
     """Run FFmpeg while forwarding machine progress to the shared display."""
+    if CANCELLATION.requested():
+        raise ConversionCancelled("conversion cancelled")
     progress_cmd = [cmd[0], "-progress", "pipe:1", "-nostats", *cmd[1:]]
     key = f"{threading.get_ident()}:{src}:{action}"
     LIVE_PROGRESS.start(key, src.name, action, total)
@@ -195,6 +253,7 @@ def run_ffmpeg_progress(
     except Exception:
         LIVE_PROGRESS.finish(key)
         raise
+    CANCELLATION.register(proc)
     stderr_chunks: List[str] = []
     drain = threading.Thread(target=lambda: stderr_chunks.append(proc.stderr.read()))
     drain.start()
@@ -219,7 +278,12 @@ def run_ffmpeg_progress(
         proc.stdout.close()
         proc.stderr.close()
     finally:
+        CANCELLATION.unregister(proc)
+        if proc.poll() is None:
+            proc.terminate()
         LIVE_PROGRESS.finish(key)
+    if CANCELLATION.requested():
+        raise ConversionCancelled("conversion cancelled")
     return subprocess.CompletedProcess(
         progress_cmd,
         proc.returncode,

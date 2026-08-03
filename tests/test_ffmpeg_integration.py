@@ -137,7 +137,22 @@ class FFmpegIntegrationTests(unittest.TestCase):
         self.assertIn("Commentary", audio_stream_label(audio[1]) or "")
         self.assertEqual([chapter["title"] for chapter in output["chapters"]], ["Opening", "Ending"])
 
-    def test_subtitles_and_artwork_require_explicit_removal(self):
+    def test_surround_channel_layout_and_sample_rate_survive(self):
+        self.require_encoders("ffv1", "flac", "aac")
+        source = self.root / "surround.mkv"
+        self.ffmpeg(
+            "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=12:duration=1",
+            "-f", "lavfi", "-i", "anullsrc=channel_layout=5.1:sample_rate=48000",
+            "-t", "1", "-c:v", "ffv1", "-c:a", "flac", source,
+        )
+        outcome = self.convert(source)
+        self.assertEqual(outcome.status, CONVERTED, outcome.detail)
+        audio = inventory_streams(video_inventory(source.with_suffix(".mp4")), "audio")[0]
+        self.assertEqual(audio["channels"], 6)
+        self.assertIn("5.1", audio["channel_layout"])
+        self.assertEqual(audio["sample_rate"], "48000")
+
+    def test_compatible_subtitles_and_artwork_are_preserved(self):
         self.require_encoders("aac", "mjpeg")
         base = self.root / "base.mkv"
         subtitle = self.root / "captions.srt"
@@ -165,18 +180,49 @@ class FFmpegIntegrationTests(unittest.TestCase):
             guarded,
         )
 
-        blocked = self.convert(guarded)
-        self.assertEqual(blocked.status, SKIPPED, blocked.detail)
-        self.assertIn("subtitle", blocked.detail)
-        self.assertIn("attached artwork", blocked.detail)
-        self.assertFalse(guarded.with_suffix(".mp4").exists())
-
-        allowed = self.convert(guarded, allow_stream_removal=True)
+        allowed = self.convert(guarded)
         self.assertEqual(allowed.status, REMUXED, allowed.detail)
         output = video_inventory(guarded.with_suffix(".mp4"))
-        self.assertEqual(inventory_streams(output, "subtitle"), [])
-        self.assertEqual(attached_artwork_streams(output), [])
+        self.assertEqual(
+            [stream["codec_name"] for stream in inventory_streams(output, "subtitle")],
+            ["mov_text"],
+        )
+        self.assertEqual(len(attached_artwork_streams(output)), 1)
         self.assertEqual(len(inventory_streams(output, "audio")), 1)
+
+    def test_styled_subtitles_still_require_explicit_removal(self):
+        subtitle = self.root / "styled.ass"
+        subtitle.write_text(
+            "[Script Info]\nScriptType: v4.00+\n"
+            "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, "
+            "SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, "
+            "StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
+            "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+            "Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
+            "0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1\n"
+            "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, "
+            "MarginV, Effect, Text\n"
+            "Dialogue: 0,0:00:00.00,0:00:00.80,Default,,0,0,0,,Styled text\n",
+            encoding="utf-8",
+        )
+        source = self.root / "styled.mkv"
+        self.ffmpeg(
+            "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=12:duration=1",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+            "-i", subtitle,
+            "-map", "0:v:0", "-map", "1:a:0", "-map", "2:s:0",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+            "-c:s", "ass", source,
+        )
+        blocked = self.convert(source)
+        self.assertEqual(blocked.status, SKIPPED, blocked.detail)
+        self.assertIn("subtitle track", blocked.detail)
+        allowed = self.convert(source, allow_stream_removal=True)
+        self.assertEqual(allowed.status, REMUXED, allowed.detail)
+        self.assertEqual(
+            inventory_streams(video_inventory(source.with_suffix(".mp4")), "subtitle"),
+            [],
+        )
 
     def test_rotation_display_matrix_survives_a_real_reencode(self):
         help_text = subprocess.run(
@@ -229,6 +275,34 @@ class FFmpegIntegrationTests(unittest.TestCase):
         self.assertTrue(source.exists())
         self.assertTrue(repaired.exists())
         self.assertTrue(video_health(repaired)["ok"])
+
+    def test_high_bit_depth_source_is_blocked_before_destructive_encode(self):
+        self.require_encoders("ffv1")
+        source = self.root / "ten-bit.mkv"
+        self.ffmpeg(
+            "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=12:duration=1",
+            "-c:v", "ffv1", "-pix_fmt", "yuv420p10le", source,
+        )
+        outcome = self.convert(source)
+        self.assertEqual(outcome.status, SKIPPED, outcome.detail)
+        self.assertIn("10-bit video", outcome.detail)
+        self.assertFalse(source.with_suffix(".mp4").exists())
+
+    def test_missing_moov_atom_fails_closed_without_replacing_source(self):
+        source = self.root / "missing-moov.mp4"
+        self.ffmpeg(
+            "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=12:duration=1",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", source,
+        )
+        data = source.read_bytes()
+        moov = data.find(b"moov")
+        self.assertGreater(moov, 4)
+        source.write_bytes(data[:moov - 4])
+        outcome = process_job(MediaJob(source, "mp4"), Options(keep_originals=True))
+        self.assertEqual(outcome.status, SKIPPED, outcome.detail)
+        self.assertIn("stream preflight failed", outcome.detail)
+        self.assertTrue(source.exists())
+        self.assertFalse((self.root / "missing-moov.repaired.mp4").exists())
 
 
 if __name__ == "__main__":

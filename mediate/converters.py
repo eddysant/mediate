@@ -19,6 +19,7 @@ from .probe import (
     STREAM_HEVC,
     STREAM_STANDARD,
     COLOR_FIELDS,
+    advanced_video_features,
     audio_stream_label,
     gif_is_animated,
     inventory_streams,
@@ -27,14 +28,17 @@ from .probe import (
     mark_video_healthy,
     mp4_status,
     preservation_summary,
+    preservable_artwork_streams,
+    preservable_subtitle_streams,
     primary_video_streams,
     stream_removal_risks,
     video_inventory,
     video_health,
     video_stream_status,
 )
-from .progress import run_ffmpeg_progress
+from .progress import ConversionCancelled, run_ffmpeg_progress
 from .scanner import MediaJob
+from .safety import SafetyError, SourceSnapshot, ensure_output_capacity
 from .validators import (
     validate_output,
     verify_photo_metadata,
@@ -61,6 +65,7 @@ class Options:
     reencode_hevc: bool = False
     convert_heic: bool = False
     allow_stream_removal: bool = False
+    allow_video_downgrade: bool = False
     dispose: Optional[Disposer] = None
     dispose_label: str = "delete original"
 
@@ -74,9 +79,13 @@ class Outcome:
 
 
 def _video_mapping_args(inventory: dict) -> List[str]:
-    """Map the primary picture and every audio track, with metadata explicit."""
-    args = ["-map", "0:v:0", "-map", "0:a?"]
+    """Map the primary picture and each preservable stream by absolute index."""
+    primary = primary_video_streams(inventory)[0]
+    primary_index = primary.get("index")
+    args = ["-map", f"0:{primary_index}" if primary_index is not None else "0:v:0"]
     for audio_index, stream in enumerate(inventory_streams(inventory, "audio")):
+        source_index = stream.get("index")
+        args.extend(["-map", f"0:{source_index}" if source_index is not None else f"0:a:{audio_index}"])
         args.extend([
             f"-map_metadata:s:a:{audio_index}",
             f"0:s:a:{audio_index}",
@@ -104,6 +113,38 @@ def _video_mapping_args(inventory: dict) -> List[str]:
             f"-disposition:a:{audio_index}",
             "+".join(dispositions) if dispositions else "0",
         ])
+    for subtitle_index, stream in enumerate(preservable_subtitle_streams(inventory)):
+        source_index = stream.get("index")
+        args.extend(["-map", f"0:{source_index}"])
+        tags = stream.get("tags", {})
+        for name in ("language", "title"):
+            if tags.get(name):
+                args.extend([
+                    f"-metadata:s:s:{subtitle_index}", f"{name}={tags[name]}"
+                ])
+        dispositions = [
+            name for name, enabled in stream.get("disposition", {}).items()
+            if enabled
+        ]
+        args.extend([
+            f"-disposition:s:{subtitle_index}",
+            "+".join(dispositions) if dispositions else "0",
+        ])
+    for artwork_index, stream in enumerate(preservable_artwork_streams(inventory), 1):
+        source_index = stream.get("index")
+        if source_index is None:
+            continue
+        args.extend(["-map", f"0:{source_index}"])
+        args.extend([f"-disposition:v:{artwork_index}", "attached_pic"])
+    return args
+
+
+def _preserved_stream_codec_args(inventory: dict) -> List[str]:
+    args: List[str] = []
+    if preservable_subtitle_streams(inventory):
+        args.extend(["-c:s", "mov_text"])
+    for artwork_index, _stream in enumerate(preservable_artwork_streams(inventory), 1):
+        args.extend([f"-c:v:{artwork_index}", "copy"])
     return args
 
 
@@ -145,7 +186,7 @@ def _build_rotation_command(
         "ffmpeg", "-nostdin", "-y",
         "-display_rotation:v:0", str(rotation),
         "-i", str(input_path),
-        *_video_mapping_args(inventory),
+        "-map", "0:v?", "-map", "0:a?", "-map", "0:s?",
         "-map_metadata", "0", "-map_metadata:s:v:0", "0:s:v:0",
         "-map_chapters", "0",
         "-c", "copy",
@@ -181,6 +222,7 @@ def _build_command(
             "-map_chapters", "0",
             "-c:v:0", "libx264", "-preset", "slow", "-crf", "18",
             "-c:a", "aac", "-b:a", "256k",
+            *_preserved_stream_codec_args(inventory),
             "-pix_fmt", "yuv420p",
             *_video_metadata_args(inventory),
             "-movflags", "faststart",
@@ -198,14 +240,24 @@ def _build_command(
     raise ValueError(f"unknown job kind: {kind}")
 
 
-def _build_remux_command(input_path: Path, output_path: Path, inventory: dict) -> List[str]:
+def _build_remux_command(
+    input_path: Path,
+    output_path: Path,
+    inventory: dict,
+    repair: bool = False,
+) -> List[str]:
     """Remux into MP4 with ``-c copy`` — no re-encoding."""
+    input_repair = [
+        "-fflags", "+genpts+discardcorrupt", "-err_detect", "ignore_err",
+    ] if repair else []
     return [
-        "ffmpeg", "-nostdin", "-y", "-noautorotate", "-i", str(input_path),
+        "ffmpeg", "-nostdin", "-y", *input_repair,
+        "-noautorotate", "-i", str(input_path),
         *_video_mapping_args(inventory),
         "-map_metadata", "0", "-map_metadata:s:v:0", "0:s:v:0",
         "-map_chapters", "0",
         "-c", "copy",
+        *_preserved_stream_codec_args(inventory),
         *_video_metadata_args(inventory),
         "-movflags", "faststart",
         str(output_path),
@@ -297,6 +349,10 @@ def _sidecars_of(src: Path):
 
 def process_job(job: MediaJob, opts: Options) -> Outcome:
     src = job.path
+    try:
+        source_snapshot = SourceSnapshot.capture(src)
+    except SafetyError as exc:
+        return Outcome(FAILED, src, f"filesystem safety check failed: {exc}")
     kind = job.kind
     remux = False  # set True when we can use -c copy instead of re-encoding
     repair = False
@@ -329,6 +385,16 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
         inventory = video_inventory(src)
         if inventory is None or not primary_video_streams(inventory):
             return Outcome(SKIPPED, src, "stream preflight failed; original kept")
+        if job.kind != "mp4":
+            # Non-MP4 containers: probe streams to decide remux vs re-encode.
+            stream_st = video_stream_status(src)
+            if stream_st == STREAM_STANDARD:
+                remux = True
+            elif stream_st == STREAM_HEVC and not opts.reencode_hevc:
+                return Outcome(
+                    SKIPPED, src,
+                    "HEVC streams (smaller than h264 and Apple-native; --reencode-hevc to convert anyway)",
+                )
         risks = stream_removal_risks(inventory)
         if risks and not opts.allow_stream_removal:
             return Outcome(
@@ -337,16 +403,13 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
                 "stream safety warning: would remove " + "; ".join(risks)
                 + " (--allow-stream-removal to permit)",
             )
-
-    if kind == "video" and job.kind != "mp4":
-        # Non-MP4 containers: probe streams to decide remux vs re-encode.
-        stream_st = video_stream_status(src)
-        if stream_st == STREAM_STANDARD:
-            remux = True
-        elif stream_st == STREAM_HEVC and not opts.reencode_hevc:
+        advanced = advanced_video_features(inventory)
+        if advanced and not remux and not opts.allow_video_downgrade:
             return Outcome(
                 SKIPPED, src,
-                "HEVC streams (smaller than h264 and Apple-native; --reencode-hevc to convert anyway)",
+                "advanced video safety warning: 8-bit h264 conversion would change "
+                + ", ".join(advanced)
+                + " (--allow-video-downgrade to permit)",
             )
 
     if kind == "gif" and not gif_is_animated(src):
@@ -383,6 +446,11 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
                 detail += f"; explicitly remove {'; '.join(risks)}"
         return Outcome(PLANNED, src, detail)
 
+    try:
+        ensure_output_capacity(final.parent, source_snapshot.size)
+    except SafetyError as exc:
+        return Outcome(FAILED, src, f"filesystem safety check failed: {exc}")
+
     # Convert into a temp name in the same directory, then rename into place
     # only after validation, so a crash never leaves a half-written file
     # wearing the final name.
@@ -396,57 +464,104 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
         # A big video at -preset slow can encode for many minutes: say so.
         started = f"converting {src.name} ({_fmt_size(src_size_pre)}), this may take a while..."
         log.info("       %s", started) if src_size_pre >= 100 * 1024 * 1024 else log.debug("%s", started)
-    try:
-        if remux:
-            cmd = _build_remux_command(src, tmp, inventory)
-            log.debug("running: %s", " ".join(cmd))
-            proc = run_ffmpeg_progress(cmd, src, media_duration(src), "remuxing")
-        else:
-            proc = _convert(kind, src, tmp, inventory, repair=repair)
-    except FileNotFoundError as exc:
-        return Outcome(FAILED, src, f"converter not found: {exc}")
-
-    ok, reason = validate_output(
-        proc.returncode,
-        proc.stderr,
-        tmp,
-        is_video=(new_ext == ".mp4"),
-        progress_path=src,
-    )
-    repairable_failure = (
+    lossless_repair_possible = bool(
         kind == "video"
-        and not repair
-        and (proc.returncode != 0 or reason.startswith("integrity check failed"))
+        and video_stream_status(src) == STREAM_STANDARD
     )
-    if not ok and repairable_failure:
-        log.warning("       %s: normal conversion failed; attempting tolerant repair", src.name)
+
+    def run_attempt(stage: str):
         tmp.unlink(missing_ok=True)
+        if stage in ("remux", "repair-remux"):
+            tolerant = stage == "repair-remux"
+            cmd = _build_remux_command(src, tmp, inventory, repair=tolerant)
+            log.debug("running: %s", " ".join(cmd))
+            return run_ffmpeg_progress(
+                cmd,
+                src,
+                media_duration(src),
+                "repairing" if tolerant else "remuxing",
+            )
+        return _convert(
+            kind if stage == "convert" else "video",
+            src,
+            tmp,
+            inventory,
+            repair=(stage == "repair-encode"),
+        )
+
+    def validate_attempt(proc):
+        valid, why = validate_output(
+            proc.returncode,
+            proc.stderr,
+            tmp,
+            is_video=(new_ext == ".mp4"),
+            progress_path=src,
+        )
+        if not valid:
+            return valid, why
+        if new_ext == ".webp":
+            return verify_photo_metadata(src, tmp)
+        if kind == "gif":
+            return verify_video_duration(src, tmp)
+        return verify_video_streams(
+            src,
+            tmp,
+            inventory,
+            allow_stream_removal=opts.allow_stream_removal,
+            allow_video_downgrade=opts.allow_video_downgrade,
+        )
+
+    first_stage = (
+        "repair-remux" if repair and lossless_repair_possible
+        else "repair-encode" if repair
+        else "remux" if remux
+        else "convert"
+    )
+    attempted = []
+    proc = None
+    ok = False
+    reason = "conversion was not attempted"
+    stages = [first_stage]
+    if kind == "video":
+        if lossless_repair_possible and "repair-remux" not in stages:
+            stages.append("repair-remux")
+        if "repair-encode" not in stages:
+            stages.append("repair-encode")
+    for stage in stages:
+        if attempted:
+            log.warning(
+                "       %s: %s failed (%s); trying %s",
+                src.name,
+                attempted[-1],
+                reason,
+                "lossless tolerant remux" if stage == "repair-remux" else "tolerant re-encode",
+            )
         try:
-            proc = _convert("video", src, tmp, inventory, repair=True)
+            proc = run_attempt(stage)
+        except ConversionCancelled:
+            tmp.unlink(missing_ok=True)
+            tmp.with_name(f".{tmp.name}.encoded.mp4").unlink(missing_ok=True)
+            raise
         except FileNotFoundError as exc:
             return Outcome(FAILED, src, f"converter not found: {exc}")
-        repair = True
-        remux = False
-        ok, reason = validate_output(
-            proc.returncode, proc.stderr, tmp, is_video=True, progress_path=src
-        )
-    if ok:
-        # 5. Metadata/duration verification, beyond structural integrity.
-        if new_ext == ".webp":
-            ok, reason = verify_photo_metadata(src, tmp)
-        elif kind == "gif":
-            ok, reason = verify_video_duration(src, tmp)
-        else:
-            ok, reason = verify_video_streams(
-                src,
-                tmp,
-                inventory,
-                allow_stream_removal=opts.allow_stream_removal,
-            )
+        attempted.append(stage)
+        ok, reason = validate_attempt(proc)
+        if ok:
+            remux = stage == "remux"
+            repair = stage.startswith("repair-")
+            break
     if not ok:
-        log.debug("stderr for %s:\n%s", src, proc.stderr.strip())
+        log.debug("stderr for %s:\n%s", src, proc.stderr.strip() if proc else "")
         tmp.unlink(missing_ok=True)
         return Outcome(FAILED, src, f"validation failed, original kept: {reason}")
+
+    if not source_snapshot.unchanged(src):
+        tmp.unlink(missing_ok=True)
+        return Outcome(
+            FAILED,
+            src,
+            "source changed during conversion; output discarded and original kept",
+        )
 
     src_stat = src.stat()
     src_birthtime = get_birthtime(src)
