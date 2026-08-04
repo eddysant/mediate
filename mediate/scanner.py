@@ -6,7 +6,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterator, List, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 from .exiftool import exiftool_available, run_exiftool
 
@@ -50,6 +50,7 @@ BUNDLE_EXTS = {
 class MediaJob:
     path: Path
     kind: str  # "photo" | "heic" | "gif" | "video" | "mp4"
+    output: Optional[Path] = None
 
 
 def iter_media(root: Path) -> Iterator[MediaJob]:

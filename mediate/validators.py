@@ -3,6 +3,8 @@ original file may be deleted."""
 
 from __future__ import annotations
 
+import json
+import re
 from pathlib import Path
 from fractions import Fraction
 from typing import Tuple
@@ -59,20 +61,80 @@ def validate_output(
     return True, "ok"
 
 
-def _exif_date(path: Path) -> str:
-    out = run_exiftool(["-s3", "-DateTimeOriginal", str(path)])
-    return out.strip() if out else ""
+_CAPTURE_DATE_TAGS = (
+    "-EXIF:DateTimeOriginal",
+    "-XMP:DateTimeOriginal",
+    "-XMP-photoshop:DateCreated",
+    "-IPTC:DateCreated",
+    "-XMP-xmp:CreateDate",
+)
+
+
+def _normalise_capture_date(value) -> str:
+    """Compare equivalent EXIF/XMP dates without namespace formatting noise."""
+    text = str(value or "").strip()
+    match = re.match(
+        r"^(\d{4})[:-](\d{2})[:-](\d{2})"
+        r"(?:[ T](\d{2}):(\d{2}):(\d{2}))?",
+        text,
+    )
+    if not match:
+        return text
+    date = "-".join(match.groups()[:3])
+    time = match.groups()[3:]
+    return date + (" " + ":".join(time) if all(time) else "")
+
+
+def _photo_capture_dates(path: Path) -> set[str]:
+    """Return the highest-priority capture-date tier present in a photo.
+
+    Group-qualified tags avoid ExifTool's Composite DateTimeOriginal, which
+    may be synthesized from IPTC and then appear to vanish even when cwebp
+    preserved the equivalent XMP DateCreated value.
+    """
+    out = run_exiftool(["-j", "-G1", "-a", "-s", *_CAPTURE_DATE_TAGS, str(path)])
+    try:
+        rows = json.loads(out or "[]")
+        metadata = rows[0] if rows else {}
+    except (json.JSONDecodeError, TypeError, IndexError):
+        return set()
+
+    def values(keys) -> set[str]:
+        result = set()
+        for key, value in metadata.items():
+            if not keys(key):
+                continue
+            items = value if isinstance(value, list) else [value]
+            result.update(
+                normalised
+                for item in items
+                if (normalised := _normalise_capture_date(item))
+            )
+        return result
+
+    # DateTimeOriginal is the strongest capture-time signal. DateCreated is
+    # next; generic XMP CreateDate is only a fallback because editors also use
+    # it for document creation timestamps.
+    tiers = (
+        lambda key: key == "ExifIFD:DateTimeOriginal"
+        or (key.startswith("XMP-") and key.endswith(":DateTimeOriginal")),
+        lambda key: key == "IPTC:DateCreated"
+        or (key.startswith("XMP-") and key.endswith(":DateCreated")),
+        lambda key: key.startswith("XMP-") and key.endswith(":CreateDate"),
+    )
+    for tier in tiers:
+        found = values(tier)
+        if found:
+            return found
+    return set()
 
 
 def verify_photo_metadata(src: Path, output: Path) -> Tuple[bool, str]:
-    """Guard the spec's 'absolutely critical' EXIF requirement: if the source
-    carries a capture date, the WebP must carry the same one. Uses exiftool
-    when installed; otherwise falls back to a structural check (source had an
-    EXIF block, output WebP must contain an EXIF RIFF chunk)."""
+    """Require an equivalent capture date to survive in EXIF, XMP, or IPTC."""
     if exiftool_available():
-        src_date = _exif_date(src)
-        if src_date and _exif_date(output) != src_date:
-            return False, "EXIF DateTimeOriginal not preserved in output"
+        source_dates = _photo_capture_dates(src)
+        if source_dates and source_dates.isdisjoint(_photo_capture_dates(output)):
+            return False, "capture date metadata not preserved in output"
         return True, "ok"
     ext = src.suffix.lower()
     try:

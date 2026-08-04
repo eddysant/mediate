@@ -1,3 +1,3 @@
 """mediate — settles your media library's format disputes."""
 
-__version__ = "0.8.2"
+__version__ = "0.8.3"

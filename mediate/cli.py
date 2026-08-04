@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from pathlib import Path
 
 from . import __version__
@@ -22,6 +23,7 @@ from .converters import (
     Outcome,
     intended_output,
     process_job,
+    unique_output_path,
 )
 from .disposal import GRAVEYARD, HARD, TRASH, make_disposer
 from .journal import RunJournal
@@ -437,9 +439,8 @@ def main(argv=None) -> int:
 
     # Planning-time skips, resolved before the pool starts:
     # 1. Live Photo pairs — converting the .mov half breaks the pairing.
-    # 2. Two inputs mapping to the same output name (a.jpg + a.png -> a.webp):
-    #    concurrent workers would both pass the exists() pre-check and the
-    #    later rename would clobber.
+    # 2. Output collisions are assigned distinct GUID-suffixed names before
+    #    workers start, so concurrent conversions can never target one path.
     companions = {} if args.convert_live_photos else find_live_photo_companions(jobs)
     # Both halves of a pair are protected: converting either one breaks the
     # ContentIdentifier link Apple Photos uses to reunite them.
@@ -455,13 +456,11 @@ def main(argv=None) -> int:
             planned_skips.append(Outcome(SKIPPED, job.path, protected[job.path]))
             continue
         out = intended_output(job)
-        if out in claimed:
-            planned_skips.append(
-                Outcome(SKIPPED, job.path, f"output name collides with {claimed[out].name}")
-            )
-        else:
-            claimed[out] = job.path
-            runnable.append(job)
+        if out != job.path and (out in claimed or out.exists()):
+            out = unique_output_path(out, claimed)
+            job = replace(job, output=out)
+        claimed[out] = job.path
+        runnable.append(job)
 
     journal = RunJournal(root, enabled=not args.dry_run)
     runnable, resumed_count = journal.prepare(runnable)

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from .disposal import Disposer
+from .exiftool import exiftool_available, run_exiftool
 from .macmeta import get_birthtime, set_birthtime
 from .probe import (
     MP4_HEVC,
@@ -270,7 +271,21 @@ def _build_remux_command(
 def intended_output(job: MediaJob) -> Path:
     """The final path a job will produce, used to detect two inputs that
     map to the same output name before any conversion starts."""
-    return job.path.with_suffix(".webp" if job.kind in ("photo", "heic") else ".mp4")
+    return job.output or job.path.with_suffix(
+        ".webp" if job.kind in ("photo", "heic") else ".mp4"
+    )
+
+
+def unique_output_path(preferred: Path, unavailable=()) -> Path:
+    """Return an unused GUID-suffixed alternative without overwriting."""
+    blocked = set(unavailable)
+    if preferred not in blocked and not preferred.exists():
+        return preferred
+    while True:
+        token = uuid.uuid4().hex[:8]
+        candidate = preferred.with_name(f"{preferred.stem}.{token}{preferred.suffix}")
+        if candidate not in blocked and not candidate.exists():
+            return candidate
 
 
 def _fmt_size(n: int) -> str:
@@ -393,6 +408,25 @@ def _explain_source_truncation(reason: str, stderr: str) -> str:
             f"({reason})"
         )
     return reason
+
+
+def _repair_photo_metadata(src: Path, output: Path) -> bool:
+    """Ask ExifTool to restore WebP-compatible metadata cwebp omitted."""
+    if not exiftool_available():
+        return False
+    result = run_exiftool([
+        "-overwrite_original",
+        "-TagsFromFile",
+        str(src),
+        "-EXIF:All",
+        "-XMP:All",
+        "-ICC_Profile",
+        str(output),
+    ])
+    updated = bool(result and "image files updated" in result.lower())
+    if updated:
+        log.warning("       %s: restored dropped photo metadata with exiftool", src.name)
+    return updated
 
 
 def _convert(
@@ -537,7 +571,7 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
             return Outcome(SKIPPED, src, "HEIC conversion requires macOS (sips)")
 
     new_ext = ".webp" if kind in ("photo", "heic") else ".mp4"
-    final = src.with_suffix(new_ext)
+    final = intended_output(job)
 
     # Re-encoding a non-standard .mp4 targets its own name; that only works
     # if the original is removed first, so pick a new name when keeping it.
@@ -546,7 +580,9 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
         final = src.with_name(src.stem + suffix)
 
     if final != src and final.exists():
-        return Outcome(SKIPPED, src, f"output already exists: {final.name}")
+        previous = final
+        final = unique_output_path(final)
+        log.info("       %s: %s exists; using %s", src.name, previous.name, final.name)
 
     if opts.dry_run:
         verb = "repair" if repair else "remux" if remux else "convert"
@@ -615,7 +651,12 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
         if not valid:
             return valid, why
         if new_ext == ".webp":
-            return verify_photo_metadata(src, tmp)
+            metadata_result = verify_photo_metadata(src, tmp)
+            if metadata_result[0]:
+                return metadata_result
+            if _repair_photo_metadata(src, tmp):
+                return verify_photo_metadata(src, tmp)
+            return metadata_result
         if kind == "gif":
             return verify_video_duration(src, tmp)
         result = verify_video_streams(
