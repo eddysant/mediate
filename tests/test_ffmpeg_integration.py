@@ -24,6 +24,7 @@ from mediate.disposal import DisposalPolicy, HARD
 from mediate.probe import (
     audio_stream_label,
     attached_artwork_streams,
+    check_video_integrity,
     inventory_streams,
     primary_video_streams,
     video_health,
@@ -100,6 +101,25 @@ class FFmpegIntegrationTests(unittest.TestCase):
                 inventory = video_inventory(output)
                 self.assertEqual(len(primary_video_streams(inventory)), 1)
                 self.assertEqual(len(inventory_streams(inventory, "audio")), 1)
+
+    def test_odd_width_webm_is_padded_and_validates_end_to_end(self):
+        self.require_encoders("libvpx")
+        source = self.root / "odd-width.webm"
+        self.ffmpeg(
+            "-f", "lavfi", "-i", "testsrc=size=953x540:rate=5:duration=0.4",
+            "-c:v", "libvpx", "-pix_fmt", "yuv420p", source,
+        )
+
+        outcome = process_job(
+            MediaJob(source, "video"),
+            Options(keep_originals=True, allow_video_downgrade=True),
+        )
+        output = source.with_suffix(".mp4")
+        self.assertEqual(outcome.status, CONVERTED, outcome.detail)
+        self.assertTrue(source.exists())
+        video = primary_video_streams(video_inventory(output))[0]
+        self.assertEqual((video["width"], video["height"]), (954, 540))
+        self.assertEqual(check_video_integrity(output), {"ok": True, "reason": "ok"})
 
     def test_validated_conversion_uses_transactional_hard_delete(self):
         self.require_encoders("ffv1", "flac", "aac")

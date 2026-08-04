@@ -198,6 +198,7 @@ class StreamCommandTests(unittest.TestCase):
         self.assertIn("-metadata:s:a:1 handler_name=Commentary", joined)
         self.assertIn("-map_chapters 0", joined)
         self.assertIn("-color_primaries:v:0 bt709", joined)
+        self.assertIn("-vf pad=ceil(iw/2)*2:ceil(ih/2)*2", joined)
         self.assertNotIn("0:s?", joined)
 
     def test_repair_command_enables_tolerant_timestamp_and_packet_handling(self):
@@ -208,6 +209,11 @@ class StreamCommandTests(unittest.TestCase):
         joined = " ".join(command)
         self.assertIn("-fflags +genpts+discardcorrupt", joined)
         self.assertIn("-err_detect ignore_err", joined)
+        self.assertIn(
+            "-vf setpts=N/FRAME_RATE/TB,pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            joined,
+        )
+        self.assertIn("-fps_mode passthrough", joined)
 
     def test_remux_uses_the_same_explicit_mapping(self):
         command = _build_remux_command(Path("in.mov"), Path("out.mp4"), self.inventory)

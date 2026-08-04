@@ -228,6 +228,11 @@ def _build_command(
             "-c:a", "aac", "-b:a", "256k",
             *_preserved_stream_codec_args(inventory),
             "-pix_fmt", "yuv420p",
+            "-vf", (
+                "setpts=N/FRAME_RATE/TB,pad=ceil(iw/2)*2:ceil(ih/2)*2"
+                if repair else "pad=ceil(iw/2)*2:ceil(ih/2)*2"
+            ),
+            *(["-fps_mode", "passthrough"] if repair else []),
             *_video_metadata_args(inventory),
             "-movflags", "faststart",
             str(output_path),
