@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from mediate.scanner import find_live_photo_companions, iter_media
 
@@ -88,15 +89,35 @@ class LivePhotoTests(unittest.TestCase):
         heic = self.touch("IMG_0001.heic")
         mov = self.touch("IMG_0001.mov")
         self.touch("IMG_0002.mov")  # no still: not a pair
-        companions = find_live_photo_companions(self.jobs())
+        with patch("mediate.scanner.exiftool_available", return_value=True), patch(
+            "mediate.scanner._content_identifier", return_value="pair-id"
+        ):
+            companions = find_live_photo_companions(self.jobs())
         self.assertEqual(companions, {mov: heic})
 
     def test_pairing_is_per_directory_and_case_insensitive(self):
         jpg = self.touch("a/img_5.JPG")
         mov = self.touch("a/IMG_5.mov")
         self.touch("b/IMG_5.mov")  # same stem, different dir: not a pair
-        companions = find_live_photo_companions(self.jobs())
+        with patch("mediate.scanner.exiftool_available", return_value=True), patch(
+            "mediate.scanner._content_identifier", return_value="pair-id"
+        ):
+            companions = find_live_photo_companions(self.jobs())
         self.assertEqual(companions, {mov: jpg})
+
+    def test_same_stem_without_apple_identifiers_is_not_a_live_photo(self):
+        self.touch("ordinary.jpg")
+        self.touch("ordinary.mov")
+        with patch("mediate.scanner.exiftool_available", return_value=True), patch(
+            "mediate.scanner._content_identifier", return_value=""
+        ):
+            self.assertEqual(find_live_photo_companions(self.jobs()), {})
+
+    def test_missing_exiftool_keeps_conservative_filename_fallback(self):
+        jpg = self.touch("IMG_0003.jpg")
+        mov = self.touch("IMG_0003.mov")
+        with patch("mediate.scanner.exiftool_available", return_value=False):
+            self.assertEqual(find_live_photo_companions(self.jobs()), {mov: jpg})
 
     def test_only_mov_counts_as_companion(self):
         self.touch("clip.jpg")

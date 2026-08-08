@@ -76,9 +76,11 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   `os.walk`. `Photos Library.photoslibrary` is *not* hidden — without this,
   pointing mediate at `~/Pictures` would convert/delete Apple Photos' masters.
 - **Live Photo protection covers both halves** (`find_live_photo_companions` +
-  `cli.py`): a `.mov` sharing dir+stem with a still. Converting *either* half
-  breaks the ContentIdentifier pairing, so both are skipped unless
-  `--convert-live-photos`. Detection is naming-convention only (no exiftool dep).
+  `cli.py`): same-stem `.mov`/still files are candidates, but matching Apple
+  `ContentIdentifier` metadata is required when ExifTool is available.
+  Converting *either* verified half breaks the pairing, so both are skipped
+  unless `--convert-live-photos`. Without ExifTool, naming remains the
+  conservative fallback.
 - **HEVC MP4s are skipped by default**: re-encoding HEVC→h264 at crf 18 *grows*
   the file (verified 7.6 KB → 11.3 KB on a test clip) and Apple plays HEVC
   natively. `--reencode-hevc` opts into the size hit for non-Apple targets.
@@ -124,8 +126,9 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   dir+stem pairing the converter's Live Photo guard relies on. With
   `--date-prefix` the mirror/sidecar map must store the *prefixed* stem
   (`finalize()` returns what it actually emitted) or the pair diverges.
-  When exiftool is installed, stem-pairs whose `ContentIdentifier`s both
-  exist but differ are provably not Live Photos and get unprotected.
+  When ExifTool is installed, only stem-pairs with equal, non-empty
+  `ContentIdentifier`s are protected; missing or different identifiers mean
+  the files are not a verified Live Photo pair.
 - **Renamer parse-order matters**: recognized tags (`[N]`, `[site N]`,
   `[site]`) parse first; any *other* trailing `[…]` marks the name opaque
   (already standardized, e.g. a GUID tag) and only the extension case is

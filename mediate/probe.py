@@ -571,6 +571,36 @@ def media_duration(path: Path) -> "float | None":
     return _cached("dur", path, lambda: _media_duration_uncached(path))
 
 
+def decoded_stream_starts(path: Path) -> dict[str, float]:
+    """Return the first decoded timestamp for each stream.
+
+    Container ``start_time`` values can precede the first decodable audio
+    frame (notably in ASF/WMA), so they are not sufficient for A/V sync
+    validation after transcoding to a codec with different priming.
+    """
+    return _cached("decoded-starts", path, lambda: _decoded_stream_starts(path))
+
+
+def _decoded_stream_starts(path: Path) -> dict[str, float]:
+    data = _ffprobe_json([
+        "-read_intervals", "%+10",
+        "-show_frames",
+        "-show_entries", "frame=stream_index,best_effort_timestamp_time,pts_time",
+        str(path),
+    ])
+    starts: dict[str, float] = {}
+    for frame in (data or {}).get("frames", []):
+        key = str(frame.get("stream_index"))
+        if key in starts or key == "None":
+            continue
+        value = frame.get("best_effort_timestamp_time", frame.get("pts_time"))
+        try:
+            starts[key] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return starts
+
+
 def _media_duration_uncached(path: Path) -> "float | None":
     try:
         proc = subprocess.run(

@@ -20,8 +20,9 @@ Skipped automatically:
 - **HEVC MP4s** — smaller than h264 and Apple-native; re-encoding them to
   h264 only grows the file (`--reencode-hevc` to force).
 - **HEIC/HEIF** — already space-efficient (`--convert-heic` to convert).
-- **Live Photo pairs** — a `.mov` next to a same-named still (both halves are
-  left alone, since converting either breaks the pairing in Apple Photos;
+- **Live Photo pairs** — a `.mov` and same-named still whose Apple
+  `ContentIdentifier` metadata matches (both halves are left alone, since
+  converting either breaks the pairing in Apple Photos;
   `--convert-live-photos` to force).
 - Videos whose MP4 conversion would discard styled/bitmap subtitles,
   incompatible attachments, extra video angles, or arbitrary data streams.
@@ -283,9 +284,9 @@ Additional safeguards beyond the checklist:
   blocked unless `--allow-stream-removal` makes their removal deliberate.
 - `.tif` inputs whose EXIF matters will fail the new metadata check (cwebp
   cannot carry TIFF metadata) and stay untouched — by design.
-- Live Photo detection is by naming convention (same directory + stem,
-  `.mov` beside a still); unrelated files that happen to share a name are
-  skipped too — the log says why, and `--convert-live-photos` overrides.
+- Live Photo detection uses same-directory/stem naming to find candidates,
+  then requires matching Apple `ContentIdentifier` metadata when ExifTool is
+  available. Without ExifTool, the naming-only fallback remains conservative.
 - The HEIC pipeline uses a PNG intermediate deliberately: sips carries EXIF
   into PNG and cwebp extracts EXIF from PNG, whereas cwebp silently drops
   metadata from TIFF input.

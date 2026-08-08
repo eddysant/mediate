@@ -110,17 +110,25 @@ def _content_identifier(path: Path) -> str:
 
 
 def _verify_live_pairs(companions: Dict[Path, Path]) -> Dict[Path, Path]:
-    """When exiftool is available, drop stem-pairs whose ContentIdentifiers
-    both exist but differ — same name, provably not a Live Photo. Pairs stay
-    protected when in doubt (missing exiftool or missing identifiers)."""
+    """Require matching Apple identifiers when ExifTool is available.
+
+    A shared filename is only a candidate, not proof of a Live Photo. Without
+    ExifTool we retain the conservative naming fallback because converting a
+    real pair would irreversibly break its Apple Photos relationship.
+    """
     if not companions or not exiftool_available():
         return companions
     verified: Dict[Path, Path] = {}
     for mov, still in companions.items():
         cid_still = _content_identifier(still)
         cid_mov = _content_identifier(mov)
-        if cid_still and cid_mov and cid_still != cid_mov:
-            log.debug("%s and %s share a name but not a ContentIdentifier: not a Live Photo", still.name, mov.name)
+        if not cid_still or not cid_mov or cid_still != cid_mov:
+            log.debug(
+                "%s and %s share a name but lack a matching ContentIdentifier: "
+                "not a verified Live Photo",
+                still.name,
+                mov.name,
+            )
             continue
         verified[mov] = still
     return verified

@@ -380,6 +380,23 @@ class StreamValidationTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("A/V start offset changed", reason)
 
+    def test_audio_sync_uses_first_decoded_frames_when_container_starts_lie(self):
+        source_video = dict(self.video)
+        source_video.update({"start_time": "0.000", "avg_frame_rate": "30/1"})
+        source_audio = dict(self.japanese)
+        source_audio["start_time"] = "0.000"
+        output_video = dict(source_video)
+        output_audio = dict(source_audio)
+        output_audio["start_time"] = "0.063"
+
+        source = _inventory(source_video, source_audio)
+        output = _inventory(output_video, output_audio)
+        with patch(
+            "mediate.validators.decoded_stream_starts",
+            side_effect=[{"0": 0.0, "1": 0.085}, {"0": 0.0, "1": 0.063}],
+        ):
+            self.assertEqual(self._verify(source, output), (True, "ok"))
+
     def test_detects_advanced_video_that_needs_explicit_downgrade_permission(self):
         advanced = _stream(
             "video",

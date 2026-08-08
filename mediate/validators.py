@@ -15,6 +15,7 @@ from .probe import (
     STANDARD_H264_PIXEL_FORMATS,
     audio_stream_label,
     check_video_integrity,
+    decoded_stream_starts,
     inventory_streams,
     is_commentary_stream,
     media_duration,
@@ -304,6 +305,7 @@ def verify_video_streams(
             f"default audio selection changed: source {source_defaults}, "
             f"output {target_defaults}"
         )
+    decoded_starts = None
     for index, (before, after) in enumerate(zip(source_audio, target_audio), 1):
         if after.get("codec_name") != "aac":
             return False, f"audio track {index} output codec is not AAC"
@@ -354,11 +356,27 @@ def verify_video_streams(
             after_offset = after_start - target_video_start
             tolerance = _av_offset_tolerance(source_video[0])
             if abs(before_offset - after_offset) > tolerance:
-                return False, (
-                    f"audio track {index} A/V start offset changed: source "
-                    f"{before_offset:+.3f}s vs output {after_offset:+.3f}s "
-                    f"(tolerance {tolerance:.3f}s)"
+                if decoded_starts is None:
+                    decoded_starts = (
+                        decoded_stream_starts(src),
+                        decoded_stream_starts(output),
+                    )
+                source_starts, target_starts = decoded_starts
+                decoded_values = (
+                    source_starts.get(str(source_video[0].get("index"))),
+                    source_starts.get(str(before.get("index"))),
+                    target_starts.get(str(target_video[0].get("index"))),
+                    target_starts.get(str(after.get("index"))),
                 )
+                if None not in decoded_values:
+                    before_offset = decoded_values[1] - decoded_values[0]
+                    after_offset = decoded_values[3] - decoded_values[2]
+                if abs(before_offset - after_offset) > tolerance:
+                    return False, (
+                        f"audio track {index} A/V start offset changed: source "
+                        f"{before_offset:+.3f}s vs output {after_offset:+.3f}s "
+                        f"(tolerance {tolerance:.3f}s)"
+                    )
 
     source_subtitles = preservable_subtitle_streams(source)
     target_subtitles = inventory_streams(target, "subtitle")
