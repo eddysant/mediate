@@ -124,6 +124,18 @@ def _filter_completed_conversions(jobs, completed_fn):
     return [job for job in jobs if job.path not in completed], completed
 
 
+def _existing_mp4_health(path: Path) -> dict:
+    """Optional deep health check, including Apple's own playback stack."""
+    from .probe import video_health
+    from .validators import verify_apple_playback
+
+    health = video_health(path)
+    if not health.get("ok"):
+        return health
+    apple_ok, reason = verify_apple_playback(path)
+    return {"ok": apple_ok, "reason": "ok" if apple_ok else f"Apple playback: {reason}"}
+
+
 def config_file_path() -> Path:
     override = os.environ.get("MEDIATE_CONFIG")
     if override:
@@ -394,6 +406,7 @@ def main(argv=None) -> int:
         convert_heic=args.convert_heic,
         allow_stream_removal=args.allow_stream_removal,
         allow_video_downgrade=args.allow_video_downgrade,
+        validate_existing=args.validate_existing,
         dispose=dispose,
         dispose_label=dispose_label,
         transaction_root=root,
@@ -441,6 +454,7 @@ def main(argv=None) -> int:
             recognized,
             mp4_status,
             {MP4_STANDARD} if args.reencode_hevc else {MP4_STANDARD, MP4_HEVC},
+            health_fn=_existing_mp4_health,
             workers=args.workers,
             validate_health=args.validate_existing,
         )

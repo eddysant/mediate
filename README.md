@@ -220,8 +220,10 @@ partial video as a complete repair.
 
 By default, already-standardized MP4s are classified by stream format and
 skipped without a full decode. `--validate-existing` enables the library-health
-pass: mediate fully decodes every video and audio stream, caches the result
-using filesystem identity plus sampled content, and repairs detected damage.
+pass: mediate fully decodes every video and audio stream, asks AVFoundation or
+Quick Look to open each MP4 on macOS, caches the result using filesystem
+identity plus sampled content, and repairs detected damage or Apple playback
+rejection.
 Repair is lossless-first (container/index/timestamp rebuild), then tolerant
 re-encoding. Every repaired file still passes the complete checklist above.
 Damaged HEVC remains opt-in through `--reencode-hevc`.

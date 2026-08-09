@@ -224,6 +224,23 @@ class VideoStreamStatusTests(unittest.TestCase):
 
 
 class ScanCompletionTests(unittest.TestCase):
+    def test_optional_existing_health_includes_apple_playback(self):
+        from unittest.mock import patch
+        from mediate.cli import _existing_mp4_health
+
+        with patch(
+            "mediate.probe.video_health",
+            return_value={"ok": True, "reason": "ok"},
+        ), patch(
+            "mediate.validators.verify_apple_playback",
+            return_value=(False, "not playable"),
+        ):
+            health = _existing_mp4_health(Path("old-output.mp4"))
+        self.assertEqual(
+            health,
+            {"ok": False, "reason": "Apple playback: not playable"},
+        )
+
     def test_completed_retained_sources_do_not_run_again(self):
         from mediate.cli import _filter_completed_conversions
         from mediate.scanner import MediaJob

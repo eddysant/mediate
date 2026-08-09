@@ -48,6 +48,7 @@ from .transaction import ReplacementTransaction, TransactionError
 from .validators import (
     validate_output,
     verify_photo_metadata,
+    verify_apple_playback,
     verify_video_duration,
     verify_video_streams,
 )
@@ -72,6 +73,7 @@ class Options:
     convert_heic: bool = False
     allow_stream_removal: bool = False
     allow_video_downgrade: bool = False
+    validate_existing: bool = False
     dispose: Optional[Disposer] = None
     dispose_label: str = "delete original"
     transaction_root: Optional[Path] = None
@@ -531,11 +533,22 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
         status = mp4_status(src)
         if status == MP4_STANDARD:
             health = video_health(src)
-            if health.get("ok"):
+            apple_health = (
+                verify_apple_playback(src)
+                if opts.validate_existing and health.get("ok")
+                else (True, "ok")
+            )
+            if health.get("ok") and apple_health[0]:
                 return Outcome(
                     SKIPPED,
                     src,
                     "already standardized and healthy MP4 (h264/8-bit 4:2:0/aac)",
+                )
+            if health.get("ok") and not apple_health[0]:
+                log.warning(
+                    "       %s: Apple playback validation failed (%s); attempting repair",
+                    src.name,
+                    apple_health[1],
                 )
             repair = True
         if status == MP4_HEVC and not opts.reencode_hevc:

@@ -222,6 +222,26 @@ class FFmpegIntegrationTests(unittest.TestCase):
             "aac",
         )
 
+    def test_optional_apple_failure_on_existing_mp4_triggers_repair(self):
+        from unittest.mock import patch
+
+        source = self.root / "quicklook-rejected.mp4"
+        self.ffmpeg(
+            "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=12:duration=1",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", source,
+        )
+        with patch(
+            "mediate.converters.verify_apple_playback",
+            return_value=(False, "simulated Quick Look rejection"),
+        ):
+            outcome = process_job(
+                MediaJob(source, "mp4"),
+                Options(keep_originals=True, validate_existing=True),
+            )
+        repaired = self.root / "quicklook-rejected.repaired.mp4"
+        self.assertEqual(outcome.status, REPAIRED, outcome.detail)
+        self.assertTrue(repaired.exists())
+
     def test_side_surround_without_aac_layout_label_validates(self):
         self.require_encoders("ffv1", "flac", "aac")
         source = self.root / "side-surround.mkv"
