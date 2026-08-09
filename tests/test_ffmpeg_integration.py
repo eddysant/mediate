@@ -196,6 +196,32 @@ class FFmpegIntegrationTests(unittest.TestCase):
         self.assertIn("5.1", audio["channel_layout"])
         self.assertEqual(audio["sample_rate"], "48000")
 
+    def test_existing_mp4_with_mp3_audio_copies_video_and_converts_audio(self):
+        self.require_encoders("libmp3lame", "aac")
+        source = self.root / "h264-mp3.mp4"
+        self.ffmpeg(
+            "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=12:duration=1",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-c:a", "libmp3lame", source,
+        )
+        outcome = process_job(
+            MediaJob(source, "mp4"),
+            Options(keep_originals=True),
+        )
+        output = self.root / "h264-mp3.standardized.mp4"
+        self.assertEqual(outcome.status, CONVERTED, outcome.detail)
+        source_video = primary_video_streams(video_inventory(source))[0]
+        output_inventory = video_inventory(output)
+        output_video = primary_video_streams(output_inventory)[0]
+        self.assertEqual(source_video["codec_name"], output_video["codec_name"])
+        self.assertEqual(source_video["profile"], output_video["profile"])
+        self.assertEqual(source_video["pix_fmt"], output_video["pix_fmt"])
+        self.assertEqual(
+            inventory_streams(output_inventory, "audio")[0]["codec_name"],
+            "aac",
+        )
+
     def test_side_surround_without_aac_layout_label_validates(self):
         self.require_encoders("ffv1", "flac", "aac")
         source = self.root / "side-surround.mkv"

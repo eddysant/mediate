@@ -20,7 +20,7 @@ from mediate.probe import (
     stream_removal_risks,
 )
 from mediate.scanner import MediaJob
-from mediate.validators import validate_output, verify_video_streams
+from mediate.validators import validate_output, verify_apple_playback, verify_video_streams
 
 
 def _stream(
@@ -210,6 +210,22 @@ class StreamCommandTests(unittest.TestCase):
         self.assertIn("-color_primaries:v:0 bt709", joined)
         self.assertIn("-vf pad=ceil(iw/2)*2:ceil(ih/2)*2", joined)
         self.assertNotIn("0:s?", joined)
+
+    def test_audio_only_conversion_copies_h264_and_writes_apple_tags(self):
+        command = _build_command(
+            "video",
+            Path("in.mp4"),
+            Path("out.mp4"),
+            self.inventory,
+            copy_video=True,
+        )
+        joined = " ".join(command)
+        self.assertIn("-c:v:0 copy", joined)
+        self.assertIn("-c:a aac", joined)
+        self.assertNotIn("-vf", command)
+        self.assertIn("-tag:v:0 avc1", joined)
+        self.assertIn("-tag:a mp4a", joined)
+        self.assertIn("-brand mp42", joined)
 
     def test_repair_command_enables_tolerant_timestamp_and_packet_handling(self):
         command = _build_command(
@@ -575,10 +591,56 @@ class DecodeIntegrityTests(unittest.TestCase):
             with patch(
                 "mediate.validators.check_video_integrity",
                 return_value={"ok": True, "reason": "ok"},
-            ) as check:
+            ) as check, patch(
+                "mediate.validators.verify_apple_playback",
+                return_value=(True, "ok"),
+            ) as apple:
                 result = validate_output(0, "", output, is_video=True)
         self.assertEqual(result, (True, "ok"))
         check.assert_called_once_with(output, progress_path=None)
+        apple.assert_called_once_with(output)
+
+    def test_apple_playback_rejection_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output.mp4"
+            output.write_bytes(b"not-empty")
+            with patch(
+                "mediate.validators.check_video_integrity",
+                return_value={"ok": True, "reason": "ok"},
+            ), patch(
+                "mediate.validators.verify_apple_playback",
+                return_value=(False, "AVFoundation could not open the MP4"),
+            ):
+                result = validate_output(0, "", output, is_video=True)
+        self.assertEqual(
+            result,
+            (False, "Apple playback check failed: AVFoundation could not open the MP4"),
+        )
+
+
+class ApplePlaybackTests(unittest.TestCase):
+    def test_non_macos_does_not_require_apple_tooling(self):
+        with patch("mediate.validators.sys.platform", "linux"), patch(
+            "mediate.validators.subprocess.run"
+        ) as run:
+            self.assertEqual(
+                verify_apple_playback(Path("output.mp4")),
+                (True, "not running on macOS"),
+            )
+        run.assert_not_called()
+
+    def test_avfoundation_timeout_fails_closed(self):
+        import subprocess
+
+        with patch("mediate.validators.sys.platform", "darwin"), patch(
+            "mediate.validators.shutil.which", return_value="/usr/bin/swift"
+        ), patch(
+            "mediate.validators.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(["swift"], 30),
+        ):
+            ok, reason = verify_apple_playback(Path("output.mp4"))
+        self.assertFalse(ok)
+        self.assertIn("timed out", reason)
 
 
 if __name__ == "__main__":

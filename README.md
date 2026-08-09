@@ -189,11 +189,14 @@ An original is disposed of **only** after all of these pass:
 3. The output file is larger than 0 bytes.
 4. (Videos) `ffmpeg -v error -i out.mp4 -f null -` exits `0` **and** prints
    nothing to stderr (full-decode integrity check).
-5. Metadata survived: a photo whose source has an EXIF capture date must
+5. (macOS videos) AVFoundation—the playback stack behind Quick Look—must
+   report the finished MP4 as playable. An FFmpeg-readable file that Apple
+   rejects is discarded while the original remains untouched.
+6. Metadata survived: a photo whose source has an EXIF capture date must
    carry the same date in the WebP (exiftool when installed, structural
    EXIF-block check otherwise) — this is what catches e.g. cwebp silently
    dropping TIFF metadata.
-6. A video's duration matches within 1s/2%, and its full stream inventory is
+7. A video's duration matches within 1s/2%, and its full stream inventory is
    checked: every audio track retains duration, language, title/commentary,
    dispositions, channel count/layout, sample rate, profile, and A/V start
    offset; chapters, rotation, colour, aspect ratio, field order, frame rate,
@@ -222,6 +225,20 @@ using filesystem identity plus sampled content, and repairs detected damage.
 Repair is lossless-first (container/index/timestamp rebuild), then tolerant
 re-encoding. Every repaired file still passes the complete checklist above.
 Damaged HEVC remains opt-in through `--reencode-hevc`.
+
+Existing MP4 does not automatically mean compatible MP4: mediate explains
+whether video, pixel format, audio, or MP4 codec tags require standardization.
+HEVC/AAC MP4s are Apple-native and are excluded from the candidate count unless
+`--reencode-hevc` is requested. When H.264 video is already compatible but its
+audio is not AAC, mediate copies the video bit-for-bit and converts only the
+audio instead of spending hours on an unnecessary video re-encode. New MP4s
+write explicit `avc1`/`mp4a` tracks, an `mp42` brand, and a fast-start index.
+
+With `--keep-originals`, each validated source/output pair is recorded in the
+probe cache. Later runs skip the unchanged source while that exact output is
+still intact, preventing repeated conversions and GUID-suffixed duplicates.
+Changing either file invalidates the record and makes the source eligible
+again.
 
 Additional safeguards beyond the checklist:
 

@@ -77,9 +77,14 @@ def _filter_standardized_mp4(
 
         health_fn = video_health
 
+    accepted_statuses = (
+        set(standard_status)
+        if isinstance(standard_status, (set, frozenset, tuple, list))
+        else {standard_status}
+    )
     possible = [
         job for job in jobs
-        if job.kind == "mp4" and status_fn(job.path) == standard_status
+        if job.kind == "mp4" and status_fn(job.path) in accepted_statuses
     ]
     healthy = {job.path for job in possible} if not validate_health else set()
     if possible and validate_health:
@@ -107,6 +112,16 @@ def _filter_standardized_mp4(
             if interrupted:
                 LIVE_PROGRESS.clear()
     return [job for job in jobs if job.path not in healthy], len(healthy)
+
+
+def _filter_completed_conversions(jobs, completed_fn):
+    """Drop retained sources whose exact validated output is still intact."""
+    completed = {
+        job.path: output
+        for job in jobs
+        if (output := completed_fn(job.path)) is not None
+    }
+    return [job for job in jobs if job.path not in completed], completed
 
 
 def config_file_path() -> Path:
@@ -387,10 +402,20 @@ def main(argv=None) -> int:
     if args.rename_only:
         return run_rename_phase(root, args)
 
-    from .probe import MP4_STANDARD, load_probe_cache, mp4_status, save_probe_cache
+    from .probe import (
+        MP4_HEVC,
+        MP4_STANDARD,
+        completed_conversion_output,
+        load_probe_cache,
+        mp4_status,
+        save_probe_cache,
+    )
 
     load_probe_cache()
     recognized = list(iter_media(root))
+    recognized, previously_converted = _filter_completed_conversions(
+        recognized, completed_conversion_output
+    )
     capability_report = check_media_capabilities(
         require_video=any(job.kind in {"video", "mp4", "gif"} for job in recognized),
         require_photos=any(
@@ -415,7 +440,7 @@ def main(argv=None) -> int:
         jobs, standardized_count = _filter_standardized_mp4(
             recognized,
             mp4_status,
-            MP4_STANDARD,
+            {MP4_STANDARD} if args.reencode_hevc else {MP4_STANDARD, MP4_HEVC},
             workers=args.workers,
             validate_health=args.validate_existing,
         )
@@ -430,6 +455,11 @@ def main(argv=None) -> int:
     log.info("scanning %s%s: %d candidate file(s), log: %s", root, run_mode, len(jobs), log_path)
     if standardized_count:
         log.info("already standardized: %d MP4 file(s)", standardized_count)
+    if previously_converted:
+        log.info(
+            "already converted with originals retained: %d unchanged source file(s)",
+            len(previously_converted),
+        )
     if not args.keep_originals and not args.dry_run:
         log.info("originals: %s after validation", dispose_label)
     if not jobs:

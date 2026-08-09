@@ -4,7 +4,13 @@ original file may be deleted."""
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
 from pathlib import Path
 from fractions import Fraction
 from typing import Tuple
@@ -58,8 +64,93 @@ def validate_output(
         health = check_video_integrity(output_path, progress_path=progress_path)
         if not health["ok"]:
             return False, f"integrity check failed: {health['reason']}"
+        apple_ok, apple_reason = verify_apple_playback(output_path)
+        if not apple_ok:
+            return False, f"Apple playback check failed: {apple_reason}"
 
     return True, "ok"
+
+
+_AVFOUNDATION_CHECK = r'''import AVFoundation
+import Foundation
+let asset = AVURLAsset(url: URL(fileURLWithPath: CommandLine.arguments[1]))
+Task {
+    do {
+        let playable = try await asset.load(.isPlayable)
+        let protected = try await asset.load(.hasProtectedContent)
+        let tracks = try await asset.loadTracks(withMediaType: .video)
+        if playable && !protected && !tracks.isEmpty { exit(0) }
+        FileHandle.standardError.write(
+            Data("playable=\(playable), protected=\(protected), videoTracks=\(tracks.count)\n".utf8)
+        )
+        exit(1)
+    } catch {
+        FileHandle.standardError.write(Data("\(error)\n".utf8))
+        exit(2)
+    }
+}
+dispatchMain()
+'''
+_apple_check_lock = threading.Lock()
+
+
+def verify_apple_playback(path: Path) -> Tuple[bool, str]:
+    """Require macOS AVFoundation—the stack behind Quick Look—to open output.
+
+    FFmpeg accepting its own MP4 is necessary but not sufficient. On macOS,
+    Homebrew already depends on Apple's command-line tools, so use Swift to
+    ask AVFoundation whether the finished asset is actually playable.
+    """
+    if sys.platform != "darwin":
+        return True, "not running on macOS"
+    swift = shutil.which("swift")
+    if not swift:
+        return _verify_quicklook_playback(path)
+    cache = Path(tempfile.gettempdir()) / f"mediate-swift-cache-{os.getuid()}"
+    try:
+        with _apple_check_lock:
+            proc = subprocess.run(
+                [
+                    swift,
+                    "-module-cache-path", str(cache),
+                    "-e", _AVFOUNDATION_CHECK,
+                    str(path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+    except subprocess.TimeoutExpired:
+        return False, "AVFoundation timed out while opening the converted MP4"
+    except OSError as exc:
+        return False, f"AVFoundation checker could not start: {exc}"
+    if proc.returncode == 0:
+        return True, "ok"
+    details = [line.strip() for line in proc.stderr.splitlines() if line.strip()]
+    return False, details[-1] if details else "AVFoundation reported the MP4 is not playable"
+
+
+def _verify_quicklook_playback(path: Path) -> Tuple[bool, str]:
+    """Fallback for Macs without the Swift command-line frontend."""
+    quicklook = shutil.which("qlmanage")
+    if not quicklook:
+        return False, "neither AVFoundation nor Quick Look validation is available"
+    try:
+        with tempfile.TemporaryDirectory(prefix="mediate-quicklook-") as temp:
+            proc = subprocess.run(
+                [quicklook, "-t", "-s", "64", "-o", temp, str(path)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            made_preview = any(Path(temp).iterdir())
+    except subprocess.TimeoutExpired:
+        return False, "Quick Look timed out while opening the converted MP4"
+    except OSError as exc:
+        return False, f"Quick Look checker could not start: {exc}"
+    if proc.returncode == 0 and made_preview:
+        return True, "ok"
+    return False, "Quick Look could not render the converted MP4"
 
 
 _CAPTURE_DATE_TAGS = (

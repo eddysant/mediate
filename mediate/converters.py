@@ -18,6 +18,7 @@ from .macmeta import get_birthtime, set_birthtime
 from .probe import (
     MP4_HEVC,
     MP4_STANDARD,
+    STREAM_COPY_VIDEO,
     STREAM_HEVC,
     STREAM_STANDARD,
     COLOR_FIELDS,
@@ -28,6 +29,8 @@ from .probe import (
     is_commentary_stream,
     media_duration,
     mark_video_healthy,
+    mark_conversion_complete,
+    mp4_conversion_reason,
     mp4_status,
     preservation_summary,
     preservable_artwork_streams,
@@ -195,7 +198,8 @@ def _build_rotation_command(
         "-map_chapters", "0",
         "-c", "copy",
         *_video_metadata_args(inventory),
-        "-movflags", "faststart",
+        "-tag:v:0", "avc1", "-tag:a", "mp4a",
+        "-brand", "mp42", "-movflags", "+faststart",
         str(output_path),
     ]
 
@@ -206,6 +210,7 @@ def _build_command(
     output_path: Path,
     inventory: Optional[dict] = None,
     repair: bool = False,
+    copy_video: bool = False,
 ) -> List[str]:
     if kind == "photo":
         return [
@@ -224,23 +229,30 @@ def _build_command(
             *_video_mapping_args(inventory),
             "-map_metadata", "0", "-map_metadata:s:v:0", "0:s:v:0",
             "-map_chapters", "0",
-            "-c:v:0", "libx264", "-preset", "slow", "-crf", "18",
+            *(
+                ["-c:v:0", "copy"]
+                if copy_video
+                else ["-c:v:0", "libx264", "-preset", "slow", "-crf", "18"]
+            ),
             "-c:a", "aac", "-b:a", "256k",
             *_preserved_stream_codec_args(inventory),
-            "-pix_fmt", "yuv420p",
-            "-vf", (
-                "setpts=N/FRAME_RATE/TB,pad=ceil(iw/2)*2:ceil(ih/2)*2"
-                if repair else "pad=ceil(iw/2)*2:ceil(ih/2)*2"
-            ),
+            *([] if copy_video else [
+                "-pix_fmt", "yuv420p",
+                "-vf", (
+                    "setpts=N/FRAME_RATE/TB,pad=ceil(iw/2)*2:ceil(ih/2)*2"
+                    if repair else "pad=ceil(iw/2)*2:ceil(ih/2)*2"
+                ),
+            ]),
             *(["-fps_mode", "passthrough"] if repair else []),
             *_video_metadata_args(inventory),
-            "-movflags", "faststart",
+            "-tag:v:0", "avc1", "-tag:a", "mp4a",
+            "-brand", "mp42", "-movflags", "+faststart",
             str(output_path),
         ]
     if kind == "gif":
         return [
             "ffmpeg", "-nostdin", "-y", "-i", str(input_path),
-            "-movflags", "faststart",
+            "-tag:v:0", "avc1", "-brand", "mp42", "-movflags", "+faststart",
             "-pix_fmt", "yuv420p",
             "-c:v", "libx264", "-preset", "slow", "-crf", "18",
             "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
@@ -268,7 +280,8 @@ def _build_remux_command(
         "-c", "copy",
         *_preserved_stream_codec_args(inventory),
         *_video_metadata_args(inventory),
-        "-movflags", "faststart",
+        "-tag:v:0", "avc1", "-tag:a", "mp4a",
+        "-brand", "mp42", "-movflags", "+faststart",
         str(output_path),
     ]
 
@@ -440,6 +453,7 @@ def _convert(
     tmp: Path,
     inventory: Optional[dict] = None,
     repair: bool = False,
+    copy_video: bool = False,
 ) -> subprocess.CompletedProcess:
     """Run the conversion subprocess(es) for a job. HEIC goes through a
     two-step pipeline: sips (built into macOS, decodes HEVC-compressed
@@ -454,7 +468,9 @@ def _convert(
             rotation = primary_video_streams(inventory)[0].get("rotation")
             if rotation is not None:
                 encode_output = tmp.with_name(f".{tmp.name}.encoded.mp4")
-        cmd = _build_command(kind, src, encode_output, inventory, repair=repair)
+        cmd = _build_command(
+            kind, src, encode_output, inventory, repair=repair, copy_video=copy_video
+        )
         total = media_duration(src)
         log.debug("running: %s", " ".join(cmd))
         proc = run_ffmpeg_progress(cmd, src, total, "repairing" if repair else "encoding")
@@ -507,6 +523,7 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
         return Outcome(FAILED, src, f"filesystem safety check failed: {exc}")
     kind = job.kind
     remux = False  # set True when we can use -c copy instead of re-encoding
+    copy_video = False
     repair = False
     inventory = None
 
@@ -533,17 +550,23 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
                 SKIPPED, src,
                 "HEVC MP4 (smaller than h264 and Apple-native; --reencode-hevc to convert anyway)",
             )
+        if status not in (MP4_STANDARD, MP4_HEVC):
+            log.info("       %s: MP4 needs standardization because %s", src.name, mp4_conversion_reason(src))
         kind = "video"
 
     if kind == "video":
         inventory = video_inventory(src)
         if inventory is None or not primary_video_streams(inventory):
             return Outcome(SKIPPED, src, "stream preflight failed; original kept")
-        if job.kind != "mp4":
-            # Non-MP4 containers: probe streams to decide remux vs re-encode.
-            stream_st = video_stream_status(src)
+        # Probe streams independently of their container. Existing MP4s with
+        # compatible H.264 but a non-Apple tag can be remuxed, while files
+        # whose only incompatible part is audio keep the video bit-for-bit.
+        stream_st = video_stream_status(src)
+        if not repair:
             if stream_st == STREAM_STANDARD:
                 remux = True
+            elif stream_st == STREAM_COPY_VIDEO:
+                copy_video = True
             elif stream_st == STREAM_HEVC and not opts.reencode_hevc:
                 return Outcome(
                     SKIPPED, src,
@@ -558,7 +581,7 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
                 + " (--allow-stream-removal to permit)",
             )
         advanced = advanced_video_features(inventory)
-        if advanced and not remux and not opts.allow_video_downgrade:
+        if advanced and not (remux or copy_video) and not opts.allow_video_downgrade:
             return Outcome(
                 SKIPPED, src,
                 "advanced video safety warning: 8-bit h264 conversion would change "
@@ -590,7 +613,10 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
         log.info("       %s: %s exists; using %s", src.name, previous.name, final.name)
 
     if opts.dry_run:
-        verb = "repair" if repair else "remux" if remux else "convert"
+        verb = (
+            "repair" if repair else "remux" if remux
+            else "convert audio and copy video" if copy_video else "convert"
+        )
         action = verb if opts.keep_originals else f"{verb} and {opts.dispose_label}"
         detail = f"would {action} -> {final.name}"
         if inventory is not None:
@@ -637,12 +663,15 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
                 media_duration(src),
                 "repairing" if tolerant else "remuxing",
             )
+        convert_options = {"repair": stage == "repair-encode"}
+        if stage == "convert" and copy_video:
+            convert_options["copy_video"] = True
         return _convert(
             kind if stage == "convert" else "video",
             src,
             tmp,
             inventory,
-            repair=(stage == "repair-encode"),
+            **convert_options,
         )
 
     def validate_attempt(proc):
@@ -769,6 +798,8 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
             set_birthtime(final, src_birthtime)
     if new_ext == ".mp4":
         mark_video_healthy(final)
+    if opts.keep_originals:
+        mark_conversion_complete(src, final)
 
     outcome_status = REPAIRED if repair else REMUXED if remux else CONVERTED
     return Outcome(

@@ -151,13 +151,13 @@ class VideoStreamStatusTests(unittest.TestCase):
         ]}
         self.assertEqual(self._mock_status(data), STREAM_NEEDS_CONVERSION)
 
-    def test_h264_non_aac_audio_needs_conversion(self):
-        from mediate.probe import STREAM_NEEDS_CONVERSION
+    def test_h264_non_aac_audio_copies_video_and_converts_only_audio(self):
+        from mediate.probe import STREAM_COPY_VIDEO
         data = {"streams": [
             {"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p"},
             {"codec_type": "audio", "codec_name": "pcm_s16le"},
         ]}
-        self.assertEqual(self._mock_status(data), STREAM_NEEDS_CONVERSION)
+        self.assertEqual(self._mock_status(data), STREAM_COPY_VIDEO)
 
     def test_h264_wrong_pixfmt_needs_conversion(self):
         from mediate.probe import STREAM_NEEDS_CONVERSION
@@ -186,8 +186,85 @@ class VideoStreamStatusTests(unittest.TestCase):
         ]}
         self.assertEqual(self._mock_status(data), STREAM_STANDARD)
 
+    def test_mp4_classification_explains_non_aac_audio(self):
+        from unittest.mock import patch
+        from mediate.probe import MP4_NEEDS_CONVERSION, _mp4_classification_uncached
+
+        data = {"streams": [
+            {
+                "codec_type": "video",
+                "codec_name": "h264",
+                "codec_tag_string": "avc1",
+                "pix_fmt": "yuv420p",
+            },
+            {"codec_type": "audio", "codec_name": "ac3", "codec_tag_string": "ac-3"},
+        ]}
+        with patch("mediate.probe._ffprobe_json", return_value=data):
+            result = _mp4_classification_uncached(Path("movie.mp4"))
+        self.assertEqual(result["status"], MP4_NEEDS_CONVERSION)
+        self.assertEqual(result["reason"], "audio is ac3, not AAC")
+
+    def test_mp4_with_non_apple_h264_tag_needs_only_remux(self):
+        from unittest.mock import patch
+        from mediate.probe import MP4_NEEDS_CONVERSION, _mp4_classification_uncached
+
+        data = {"streams": [
+            {
+                "codec_type": "video",
+                "codec_name": "h264",
+                "codec_tag_string": "avc3",
+                "pix_fmt": "yuv420p",
+            },
+            {"codec_type": "audio", "codec_name": "aac", "codec_tag_string": "mp4a"},
+        ]}
+        with patch("mediate.probe._ffprobe_json", return_value=data):
+            result = _mp4_classification_uncached(Path("movie.mp4"))
+        self.assertEqual(result["status"], MP4_NEEDS_CONVERSION)
+        self.assertIn("remux", result["reason"])
+
 
 class ScanCompletionTests(unittest.TestCase):
+    def test_completed_retained_sources_do_not_run_again(self):
+        from mediate.cli import _filter_completed_conversions
+        from mediate.scanner import MediaJob
+
+        source = MediaJob(Path("legacy.webm"), "video")
+        output = MediaJob(Path("legacy.mp4"), "mp4")
+        remaining, completed = _filter_completed_conversions(
+            [source, output],
+            lambda path: Path("legacy.mp4") if path == source.path else None,
+        )
+        self.assertEqual(remaining, [output])
+        self.assertEqual(completed, {source.path: Path("legacy.mp4")})
+
+    def test_compatible_hevc_mp4s_can_be_filtered_before_candidate_count(self):
+        from mediate.cli import _filter_standardized_mp4
+        from mediate.scanner import MediaJob
+
+        hevc = MediaJob(Path("native-hevc.mp4"), "mp4")
+        candidates, count = _filter_standardized_mp4(
+            [hevc],
+            lambda _path: "hevc",
+            {"standard", "hevc"},
+        )
+        self.assertEqual(candidates, [])
+        self.assertEqual(count, 1)
+
+    def test_retained_source_is_complete_only_while_validated_output_is_intact(self):
+        from unittest.mock import patch
+        from mediate import probe
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(probe._cache, {}, clear=True):
+            source = Path(tmp) / "legacy.webm"
+            output = Path(tmp) / "legacy.mp4"
+            source.write_bytes(b"unchanged-source")
+            output.write_bytes(b"validated-output")
+            probe.mark_conversion_complete(source, output)
+            self.assertEqual(probe.completed_conversion_output(source), output.resolve())
+
+            output.write_bytes(b"changed-output")
+            self.assertIsNone(probe.completed_conversion_output(source))
+
     def test_completed_mp4s_do_not_return_as_candidates(self):
         from mediate.cli import _filter_standardized_mp4
         from mediate.scanner import MediaJob

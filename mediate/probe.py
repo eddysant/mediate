@@ -135,21 +135,32 @@ def mp4_status(path: Path) -> str:
     only makes it bigger), or needing conversion. An unreadable file reports
     needs-conversion; the attempt that follows is protected by the
     validation protocol."""
-    # Versioned key invalidates classifications made before full-range
-    # yuvj420p was recognised as 8-bit 4:2:0 compatible.
-    return _cached("mp4v2", path, lambda: _mp4_status_uncached(path))
+    return _cached("mp4v3", path, lambda: _mp4_classification_uncached(path))["status"]
+
+
+def mp4_conversion_reason(path: Path) -> str:
+    """Explain why an existing MP4 is not already Apple-compatible."""
+    return _cached("mp4v3", path, lambda: _mp4_classification_uncached(path))["reason"]
 
 
 def _mp4_status_uncached(path: Path) -> str:
+    return _mp4_classification_uncached(path)["status"]
+
+
+def _mp4_classification_uncached(path: Path) -> dict:
     data = _ffprobe_json(
         [
             "-show_entries",
-            "stream=codec_type,codec_name,pix_fmt:stream_disposition=attached_pic",
+            "stream=codec_type,codec_name,codec_tag_string,pix_fmt:"
+            "stream_disposition=attached_pic",
             str(path),
         ]
     )
     if data is None:
-        return MP4_NEEDS_CONVERSION
+        return {
+            "status": MP4_NEEDS_CONVERSION,
+            "reason": "FFmpeg could not read its stream inventory",
+        }
     streams = data.get("streams", [])
     video = [
         s for s in streams
@@ -158,22 +169,43 @@ def _mp4_status_uncached(path: Path) -> str:
     ]
     audio = [s for s in streams if s.get("codec_type") == "audio"]
     if not video:
-        return MP4_NEEDS_CONVERSION
+        return {"status": MP4_NEEDS_CONVERSION, "reason": "it has no playable video track"}
     if any(s.get("codec_name") != "aac" for s in audio):
-        return MP4_NEEDS_CONVERSION
+        codecs = ", ".join(sorted({str(s.get("codec_name") or "unknown") for s in audio}))
+        return {
+            "status": MP4_NEEDS_CONVERSION,
+            "reason": f"audio is {codecs}, not AAC",
+        }
     if all(
         s.get("codec_name") == "h264"
         and s.get("pix_fmt") in STANDARD_H264_PIXEL_FORMATS
+        and s.get("codec_tag_string") in (None, "avc1")
         for s in video
-    ):
-        return MP4_STANDARD
+    ) and all(s.get("codec_tag_string") in (None, "mp4a") for s in audio):
+        return {"status": MP4_STANDARD, "reason": "already Apple-compatible"}
     if all(s.get("codec_name") == "hevc" for s in video):
-        return MP4_HEVC
-    return MP4_NEEDS_CONVERSION
+        return {"status": MP4_HEVC, "reason": "HEVC is already Apple-native"}
+    descriptions = []
+    for stream in video:
+        descriptions.append(
+            "/".join(str(stream.get(name) or "unknown") for name in (
+                "codec_name", "pix_fmt", "codec_tag_string"
+            ))
+        )
+    if all(
+        stream.get("codec_name") == "h264"
+        and stream.get("pix_fmt") in STANDARD_H264_PIXEL_FORMATS
+        for stream in video
+    ):
+        reason = "H.264/AAC tracks need an Apple-compatible MP4 remux"
+    else:
+        reason = "video is " + ", ".join(descriptions) + ", not H.264 8-bit 4:2:0"
+    return {"status": MP4_NEEDS_CONVERSION, "reason": reason}
 
 
 # video_stream_status() results — usable for any container, not just .mp4
 STREAM_STANDARD = "standard"       # h264 8-bit 4:2:0, aac (or no) audio
+STREAM_COPY_VIDEO = "copy-video"   # compatible h264 video; transcode audio only
 STREAM_HEVC = "hevc"               # hevc video, aac (or no) audio
 STREAM_NEEDS_CONVERSION = "convert"
 
@@ -183,7 +215,8 @@ def video_stream_status(path: Path) -> str:
     STREAM_STANDARD when streams are already h264 8-bit 4:2:0 + AAC and can
     be remuxed into MP4 with ``-c copy``, STREAM_HEVC for HEVC + AAC, or
     STREAM_NEEDS_CONVERSION when re-encoding is required."""
-    return _cached("vstreamv2", path, lambda: _video_stream_status_uncached(path))
+    # v3 distinguishes audio-only conversion from a full video re-encode.
+    return _cached("vstreamv3", path, lambda: _video_stream_status_uncached(path))
 
 
 def _video_stream_status_uncached(path: Path) -> str:
@@ -206,17 +239,51 @@ def _video_stream_status_uncached(path: Path) -> str:
     if not video:
         return STREAM_NEEDS_CONVERSION
     # Audio must be AAC (or absent — some screen recordings have no audio)
-    if any(s.get("codec_name") != "aac" for s in audio):
-        return STREAM_NEEDS_CONVERSION
-    if all(
+    compatible_h264 = all(
         s.get("codec_name") == "h264"
         and s.get("pix_fmt") in STANDARD_H264_PIXEL_FORMATS
         for s in video
-    ):
+    )
+    if compatible_h264 and any(s.get("codec_name") != "aac" for s in audio):
+        return STREAM_COPY_VIDEO
+    if any(s.get("codec_name") != "aac" for s in audio):
+        return STREAM_NEEDS_CONVERSION
+    if compatible_h264:
         return STREAM_STANDARD
     if all(s.get("codec_name") == "hevc" for s in video):
         return STREAM_HEVC
     return STREAM_NEEDS_CONVERSION
+
+
+def mark_conversion_complete(source: Path, output: Path) -> None:
+    """Remember a validated keep-original conversion across later runs."""
+    source_identity = _file_identity(source, strong=True)
+    output_identity = _file_identity(output, strong=True)
+    if source_identity is None or output_identity is None:
+        return
+    global _cache_dirty
+    with _cache_lock:
+        _cache[f"complete:{source.resolve()}"] = {
+            "source": source_identity,
+            "output": str(output.resolve()),
+            "output_identity": output_identity,
+        }
+        _cache_dirty = True
+
+
+def completed_conversion_output(source: Path) -> Path | None:
+    """Return an intact validated output for an unchanged retained source."""
+    with _cache_lock:
+        record = _cache.get(f"complete:{source.resolve()}")
+    if not record:
+        return None
+    source_identity = _file_identity(source, strong=True)
+    if source_identity != record.get("source"):
+        return None
+    output = Path(str(record.get("output", "")))
+    if _file_identity(output, strong=True) != record.get("output_identity"):
+        return None
+    return output
 
 
 # Stream metadata that must survive a video conversion. Values omitted by
