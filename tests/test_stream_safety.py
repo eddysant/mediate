@@ -96,6 +96,16 @@ class StreamPreflightTests(unittest.TestCase):
             "2 audio tracks (1 commentary), 1 chapter(s), rotation 90 degrees, colour metadata",
         )
 
+    def test_original_audio_disposition_requires_explicit_removal(self):
+        inventory = _inventory(
+            _stream("video", "h264"),
+            _stream("audio", "aac", index=1, disposition={"original": 1}),
+        )
+        self.assertEqual(
+            stream_removal_risks(inventory),
+            ["1 audio track original-language disposition(s)"],
+        )
+
     def test_mov_chapter_carrier_is_not_treated_as_removable_data(self):
         carrier = _stream("data", "bin_data", index=3)
         carrier["codec_tag_string"] = "text"
@@ -291,11 +301,13 @@ class StreamValidationTests(unittest.TestCase):
         )
         self.chapter = {"start_time": "0.000", "end_time": "2.000", "title": "Opening"}
 
-    def _verify(self, source, output):
+    def _verify(self, source, output, **kwargs):
         with patch("mediate.validators.verify_video_duration", return_value=(True, "ok")), patch(
             "mediate.validators.video_inventory", return_value=output
         ):
-            return verify_video_streams(Path("source.mkv"), Path("output.mp4"), source)
+            return verify_video_streams(
+                Path("source.mkv"), Path("output.mp4"), source, **kwargs
+            )
 
     def test_accepts_preserved_tracks_and_metadata(self):
         inventory = _inventory(self.video, self.japanese, self.commentary, chapters=[self.chapter])
@@ -359,6 +371,35 @@ class StreamValidationTests(unittest.TestCase):
                 ok, reason = self._verify(source, _inventory(self.video, changed))
                 self.assertFalse(ok)
                 self.assertIn(message, reason)
+
+    def test_accepts_missing_aac_layout_label_when_channel_count_matches(self):
+        source_audio = dict(self.japanese)
+        source_audio.update({"channels": 6, "channel_layout": "5.1(side)"})
+        output_audio = dict(source_audio)
+        output_audio["channel_layout"] = None
+        self.assertEqual(
+            self._verify(
+                _inventory(self.video, source_audio),
+                _inventory(self.video, output_audio),
+            ),
+            (True, "ok"),
+        )
+
+    def test_original_disposition_loss_needs_stream_removal_opt_in(self):
+        source_audio = dict(self.japanese)
+        source_audio["disposition"] = {"default": 1, "original": 1}
+        output_audio = dict(self.japanese)
+        output_audio["disposition"] = {"default": 1}
+        source = _inventory(self.video, source_audio)
+        output = _inventory(self.video, output_audio)
+
+        ok, reason = self._verify(source, output)
+        self.assertFalse(ok)
+        self.assertIn("language/title/disposition metadata changed", reason)
+        self.assertEqual(
+            self._verify(source, output, allow_stream_removal=True),
+            (True, "ok"),
+        )
 
     def test_audio_sync_tolerance_is_frame_aware_but_still_rejects_drift(self):
         source_video = dict(self.video)

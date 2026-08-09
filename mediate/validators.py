@@ -179,7 +179,7 @@ def _normalised_color(field: str, value):
     return value
 
 
-def _stream_identity(stream: dict) -> dict:
+def _stream_identity(stream: dict, ignored_dispositions=()) -> dict:
     """Metadata whose loss can change the meaning or selection of a track."""
     tags = stream.get("tags", {})
     title = audio_stream_label(stream)
@@ -203,6 +203,7 @@ def _stream_identity(stream: dict) -> dict:
         "disposition": {
             name: stream.get("disposition", {}).get(name, 0)
             for name in meaningful_dispositions
+            if name not in ignored_dispositions
         },
     }
 
@@ -309,7 +310,10 @@ def verify_video_streams(
     for index, (before, after) in enumerate(zip(source_audio, target_audio), 1):
         if after.get("codec_name") != "aac":
             return False, f"audio track {index} output codec is not AAC"
-        if _stream_identity(before) != _stream_identity(after):
+        ignored_dispositions = ("original",) if allow_stream_removal else ()
+        if _stream_identity(before, ignored_dispositions) != _stream_identity(
+            after, ignored_dispositions
+        ):
             return False, f"audio track {index} language/title/disposition metadata changed"
         before_duration = before.get("duration")
         after_duration = after.get("duration")
@@ -334,7 +338,14 @@ def verify_video_streams(
                 )
         before_layout = _normalised_layout(before.get("channel_layout"))
         after_layout = _normalised_layout(after.get("channel_layout"))
-        if before_layout is not None and before_layout != after_layout:
+        # FFmpeg 8's AAC-in-MP4 probe can omit the textual layout even though
+        # the AAC channel configuration and verified channel count are intact.
+        # A reported, different layout still fails closed.
+        if (
+            before_layout is not None
+            and after_layout is not None
+            and before_layout != after_layout
+        ):
             return False, (
                 f"audio track {index} channel layout changed: "
                 f"source {before.get('channel_layout')} vs output {after.get('channel_layout')}"

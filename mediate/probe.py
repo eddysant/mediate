@@ -532,6 +532,14 @@ def stream_removal_risks(inventory: dict) -> List[str]:
     if others:
         kinds = ", ".join(sorted({s.get("codec_type", "unknown") for s in others}))
         risks.append(f"{len(others)} unsupported {kinds} stream(s)")
+    original_audio = [
+        stream for stream in inventory_streams(inventory, "audio")
+        if stream.get("disposition", {}).get("original")
+    ]
+    if original_audio:
+        risks.append(
+            f"{len(original_audio)} audio track original-language disposition(s)"
+        )
     return risks
 
 

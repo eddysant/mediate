@@ -196,6 +196,38 @@ class FFmpegIntegrationTests(unittest.TestCase):
         self.assertIn("5.1", audio["channel_layout"])
         self.assertEqual(audio["sample_rate"], "48000")
 
+    def test_side_surround_without_aac_layout_label_validates(self):
+        self.require_encoders("ffv1", "flac", "aac")
+        source = self.root / "side-surround.mkv"
+        self.ffmpeg(
+            "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=12:duration=1",
+            "-f", "lavfi", "-i",
+            "anullsrc=channel_layout=5.1(side):sample_rate=48000",
+            "-t", "1", "-c:v", "ffv1", "-c:a", "flac", source,
+        )
+        outcome = self.convert(source)
+        self.assertEqual(outcome.status, CONVERTED, outcome.detail)
+        audio = inventory_streams(video_inventory(source.with_suffix(".mp4")), "audio")[0]
+        self.assertEqual(audio["channels"], 6)
+        self.assertEqual(audio["sample_rate"], "48000")
+
+    def test_original_audio_disposition_is_blocked_before_remux(self):
+        self.require_encoders("aac")
+        source = self.root / "original-language.mkv"
+        self.ffmpeg(
+            "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=12:duration=1",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+            "-disposition:a:0", "default+original", source,
+        )
+
+        blocked = self.convert(source)
+        self.assertEqual(blocked.status, SKIPPED)
+        self.assertIn("original-language disposition", blocked.detail)
+
+        allowed = self.convert(source, allow_stream_removal=True)
+        self.assertEqual(allowed.status, REMUXED, allowed.detail)
+
     def test_compatible_subtitles_and_artwork_are_preserved(self):
         self.require_encoders("aac", "mjpeg")
         base = self.root / "base.mkv"
