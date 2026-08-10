@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
 
 from .exiftool import exiftool_available, run_exiftool
+from .probe import webp_animation_info
 
 log = logging.getLogger("mediate")
 
@@ -19,6 +20,7 @@ PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 HEIC_EXTS = {".heic", ".heif"}
 
 GIF_EXTS = {".gif"}
+WEBP_EXTS = {".webp"}
 
 # Video containers that are remuxed when already compatible, otherwise
 # re-encoded to standard MP4. Keep this to formats ffprobe can identify from
@@ -49,13 +51,14 @@ BUNDLE_EXTS = {
 @dataclass(frozen=True)
 class MediaJob:
     path: Path
-    kind: str  # "photo" | "heic" | "gif" | "video" | "mp4"
+    kind: str  # "photo" | "heic" | "gif" | "webp" | "video" | "mp4"
     output: Optional[Path] = None
 
 
 def iter_media(root: Path) -> Iterator[MediaJob]:
     """Yield media files under root, skipping hidden files/dirs, macOS bundle
-    packages, and already-standardized formats (.webp is never yielded)."""
+    packages, and already-standardized formats. Static WebPs are skipped;
+    animated WebPs are yielded for FFmpeg 9 conversion."""
     for dirpath, dirnames, filenames in os.walk(root):
         kept = []
         for d in sorted(dirnames):
@@ -80,6 +83,8 @@ def iter_media(root: Path) -> Iterator[MediaJob]:
                 yield MediaJob(path, "heic")
             elif ext in GIF_EXTS:
                 yield MediaJob(path, "gif")
+            elif ext in WEBP_EXTS and webp_animation_info(path)["animated"]:
+                yield MediaJob(path, "webp")
             elif ext in VIDEO_EXTS:
                 yield MediaJob(path, "video")
             elif ext in MP4_EXTS:

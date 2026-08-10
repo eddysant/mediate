@@ -159,6 +159,22 @@ class VideoStreamStatusTests(unittest.TestCase):
         ]}
         self.assertEqual(self._mock_status(data), STREAM_COPY_VIDEO)
 
+    def test_apple_compatible_hevc_non_aac_audio_copies_video(self):
+        from mediate.probe import STREAM_COPY_VIDEO
+        data = {"streams": [
+            {"codec_type": "video", "codec_name": "hevc", "pix_fmt": "yuv420p"},
+            {"codec_type": "audio", "codec_name": "ac3"},
+        ]}
+        self.assertEqual(self._mock_status(data), STREAM_COPY_VIDEO)
+
+    def test_non_apple_hevc_chroma_requires_video_conversion(self):
+        from mediate.probe import STREAM_NEEDS_CONVERSION
+        data = {"streams": [
+            {"codec_type": "video", "codec_name": "hevc", "pix_fmt": "yuv422p10le"},
+            {"codec_type": "audio", "codec_name": "ac3"},
+        ]}
+        self.assertEqual(self._mock_status(data), STREAM_NEEDS_CONVERSION)
+
     def test_h264_wrong_pixfmt_needs_conversion(self):
         from mediate.probe import STREAM_NEEDS_CONVERSION
         data = {"streams": [
@@ -221,6 +237,41 @@ class VideoStreamStatusTests(unittest.TestCase):
             result = _mp4_classification_uncached(Path("movie.mp4"))
         self.assertEqual(result["status"], MP4_NEEDS_CONVERSION)
         self.assertIn("remux", result["reason"])
+
+    def test_mp4_with_hev1_tag_is_remuxed_for_apple_preview(self):
+        from unittest.mock import patch
+        from mediate.probe import MP4_NEEDS_CONVERSION, _mp4_classification_uncached
+
+        data = {"streams": [
+            {
+                "codec_type": "video",
+                "codec_name": "hevc",
+                "codec_tag_string": "hev1",
+                "pix_fmt": "yuv420p",
+            },
+            {"codec_type": "audio", "codec_name": "aac", "codec_tag_string": "mp4a"},
+        ]}
+        with patch("mediate.probe._ffprobe_json", return_value=data):
+            result = _mp4_classification_uncached(Path("movie.mp4"))
+        self.assertEqual(result["status"], MP4_NEEDS_CONVERSION)
+        self.assertIn("hvc1 MP4 remux", result["reason"])
+
+    def test_mp4_with_hvc1_and_apple_hevc_chroma_is_native(self):
+        from unittest.mock import patch
+        from mediate.probe import MP4_HEVC, _mp4_classification_uncached
+
+        data = {"streams": [
+            {
+                "codec_type": "video",
+                "codec_name": "hevc",
+                "codec_tag_string": "hvc1",
+                "pix_fmt": "yuv420p10le",
+            },
+            {"codec_type": "audio", "codec_name": "aac", "codec_tag_string": "mp4a"},
+        ]}
+        with patch("mediate.probe._ffprobe_json", return_value=data):
+            result = _mp4_classification_uncached(Path("movie.mp4"))
+        self.assertEqual(result["status"], MP4_HEVC)
 
 
 class ScanCompletionTests(unittest.TestCase):

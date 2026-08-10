@@ -10,11 +10,11 @@ validation checklist (and even then, it goes to the Trash, not oblivion).
 | JPEG / PNG / TIFF | Lossless WebP (`-metadata all` preserves EXIF/ICC/dates) | `cwebp` |
 | HEIC / HEIF (opt-in, macOS) | Lossless WebP via a sips PNG intermediate, EXIF preserved | `sips` + `cwebp` |
 | MOV / MKV / AVI / WMV / WebM / ASF / VOB / legacy video | MP4 (h264 `-crf 18 -preset slow`, AAC 256k, `yuv420p`) | `ffmpeg` |
-| Animated GIF | MP4 (`faststart`, even-dimension scale filter) | `ffmpeg` |
+| Animated GIF / animated WebP | MP4 (`faststart`, even-dimension scale filter) | `ffmpeg` |
 
 Skipped automatically:
 
-- `.webp`, hidden files/directories (`.DS_Store` etc.), static GIFs.
+- Static `.webp`, hidden files/directories (`.DS_Store` etc.), static GIFs.
 - MP4s already h264/8-bit 4:2:0/AAC (including FFmpeg's full-range
   `yuvj420p` alias, checked with `ffprobe`).
 - **HEVC MP4s** — smaller than h264 and Apple-native; re-encoding them to
@@ -25,12 +25,17 @@ Skipped automatically:
   converting either breaks the pairing in Apple Photos;
   `--convert-live-photos` to force).
 - Videos whose MP4 conversion would discard styled/bitmap subtitles,
-  incompatible attachments, extra video angles, or arbitrary data streams.
+  incompatible attachments, extra video angles, arbitrary data streams, or
+  stream groups such as an LCEVC enhancement layer.
   Simple text subtitles become `mov_text` and JPEG/PNG cover streams are
   retained automatically; `--allow-stream-removal` opts into dropping the rest.
-- Video that would silently lose HDR/high-bit-depth, alpha, interlacing, or
+- Video that would silently lose HDR (including SMPTE 2094-50 metadata),
+  high-bit-depth, alpha, interlacing, or
   variable/unusual-frame-rate semantics during the standard 8-bit encode
   (`--allow-video-downgrade` is the explicit opt-in).
+- Animated WebPs with alpha or ICC/EXIF/XMP metadata unless the corresponding
+  `--allow-video-downgrade` / `--allow-stream-removal` opt-ins make the loss
+  deliberate.
 - **Application bundles** — `*.photoslibrary`, `*.app`, `*.fcpbundle`, etc.
   are never traversed. Converting files inside an Apple Photos library would
   corrupt it, so this cannot be overridden.
@@ -44,7 +49,9 @@ goes through ffprobe preflight and the same strict validation pipeline.
 ## Requirements
 
 - Python ≥ 3.9 (no Python dependencies)
-- `cwebp`, `ffmpeg`, `ffprobe` on PATH: `brew install webp ffmpeg`
+- `cwebp`, `ffmpeg`, `ffprobe` on PATH: `brew install webp ffmpeg`. FFmpeg 9+
+  is required only when animated WebPs are present; other formats retain the
+  FFmpeg 6 minimum.
 - `jpegtran` from jpeg-turbo is optional for direct installs and enables
   automatic lossless recovery of truncated JPEGs. The Homebrew mediate formula
   includes it: `brew install jpeg-turbo`.
@@ -212,11 +219,12 @@ retries the normal conversion and validation. The repair is performed on a
 temporary file; the source remains untouched until the validated replacement
 transaction commits.
 
-Video containers that end prematurely are different: mediate can preserve the
-decodable prefix, but it cannot reconstruct packets that are absent from the
-file. If the encoded duration is shorter than the declared source duration,
-the run reports the source as truncated and keeps it rather than presenting a
-partial video as a complete repair.
+Video containers that end prematurely are different: mediate cannot reconstruct
+packets that are absent from the file, but it can safely salvage the readable
+prefix. It compares every source video/audio packet timeline with the repaired
+output, keeps the damaged source automatically, and records the validated
+salvage so later runs do not retry it. The result clearly reports both the
+recoverable duration and the longer duration claimed by the damaged header.
 
 By default, already-standardized MP4s are classified by stream format and
 skipped without a full decode. `--validate-existing` enables the library-health
@@ -230,11 +238,12 @@ Damaged HEVC remains opt-in through `--reencode-hevc`.
 
 Existing MP4 does not automatically mean compatible MP4: mediate explains
 whether video, pixel format, audio, or MP4 codec tags require standardization.
-HEVC/AAC MP4s are Apple-native and are excluded from the candidate count unless
-`--reencode-hevc` is requested. When H.264 video is already compatible but its
-audio is not AAC, mediate copies the video bit-for-bit and converts only the
-audio instead of spending hours on an unnecessary video re-encode. New MP4s
-write explicit `avc1`/`mp4a` tracks, an `mp42` brand, and a fast-start index.
+HEVC/AAC MP4s with Apple-compatible 4:2:0 video and an `hvc1` tag are excluded
+from the candidate count unless `--reencode-hevc` is requested. Compatible
+H.264 or HEVC video is copied bit-for-bit when only its audio needs conversion;
+`hev1` HEVC is losslessly retagged/remuxed to `hvc1` for Apple playback instead
+of spending hours on an unnecessary video re-encode. New MP4s write explicit
+`avc1`/`hvc1` and `mp4a` tracks, an `mp42` brand, and a fast-start index.
 
 With `--keep-originals`, each validated source/output pair is recorded in the
 probe cache. Later runs skip the unchanged source while that exact output is

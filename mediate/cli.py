@@ -173,8 +173,9 @@ def parse_args(argv=None) -> argparse.Namespace:
         prog="mediate",
         description=(
             "Recursively standardize a media library: photos (JPEG/PNG/TIFF) to "
-            "lossless WebP via cwebp, videos and animated GIFs to h264/8-bit 4:2:0/AAC "
-            "MP4 via ffmpeg. Originals are moved to the Trash only after the "
+            "lossless WebP via cwebp, videos and GIF/WebP animations to "
+            "h264/8-bit 4:2:0/AAC MP4 via ffmpeg. Originals are moved to the "
+            "Trash only after the "
             "converted file passes a strict validation checklist."
         ),
     )
@@ -430,11 +431,14 @@ def main(argv=None) -> int:
         recognized, completed_conversion_output
     )
     capability_report = check_media_capabilities(
-        require_video=any(job.kind in {"video", "mp4", "gif"} for job in recognized),
+        require_video=any(
+            job.kind in {"video", "mp4", "gif", "webp"} for job in recognized
+        ),
         require_photos=any(
             job.kind == "photo" or (job.kind == "heic" and args.convert_heic)
             for job in recognized
         ),
+        require_animated_webp=any(job.kind == "webp" for job in recognized),
     )
     for name, version in capability_report.versions.items():
         log.debug("toolchain: %s: %s", name, version)

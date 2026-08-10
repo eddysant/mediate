@@ -70,7 +70,9 @@ def _check_cwebp(report: CapabilityReport) -> None:
     report.versions["cwebp"] = _first_line(proc)
 
 
-def _check_ffmpeg(report: CapabilityReport) -> None:
+def _check_ffmpeg(
+    report: CapabilityReport, *, require_animated_webp: bool = False
+) -> None:
     have_ffmpeg = _check_binary("ffmpeg", report)
     have_ffprobe = _check_binary("ffprobe", report)
     if not (have_ffmpeg and have_ffprobe):
@@ -99,6 +101,14 @@ def _check_ffmpeg(report: CapabilityReport) -> None:
     try:
         encoders = _run(["ffmpeg", "-hide_banner", "-encoders"])
         help_output = _run(["ffmpeg", "-hide_banner", "-h", "full"])
+        demuxers = (
+            _run(["ffmpeg", "-hide_banner", "-demuxers"])
+            if require_animated_webp else None
+        )
+        decoders = (
+            _run(["ffmpeg", "-hide_banner", "-decoders"])
+            if require_animated_webp else None
+        )
     except (OSError, subprocess.TimeoutExpired) as exc:
         report.errors.append(f"FFmpeg capability listing failed: {exc}")
         return
@@ -117,6 +127,20 @@ def _check_ffmpeg(report: CapabilityReport) -> None:
             "FFmpeg lacks -display_rotation; rotated re-encodes will fail safely. "
             "Upgrade FFmpeg to preserve rotation metadata"
         )
+    if require_animated_webp:
+        demuxer_output = demuxers.stdout + demuxers.stderr
+        decoder_output = decoders.stdout + decoders.stderr
+        has_demuxer = re.search(
+            r"^\s*D\s+webp_anim\s", demuxer_output, re.MULTILINE
+        )
+        has_decoder = re.search(
+            r"^\s*V\S*\s+webp_anim\s", decoder_output, re.MULTILINE
+        )
+        if not has_demuxer or not has_decoder:
+            report.errors.append(
+                "FFmpeg lacks native animated WebP decoding/demuxing; upgrade to "
+                "FFmpeg 9 or newer to convert animated .webp files"
+            )
     if report.errors:
         return
 
@@ -155,11 +179,11 @@ def _check_ffmpeg(report: CapabilityReport) -> None:
 
 
 def check_media_capabilities(
-    *, require_video: bool, require_photos: bool
+    *, require_video: bool, require_photos: bool, require_animated_webp: bool = False
 ) -> CapabilityReport:
     report = CapabilityReport()
-    if require_video:
-        _check_ffmpeg(report)
+    if require_video or require_animated_webp:
+        _check_ffmpeg(report, require_animated_webp=require_animated_webp)
     if require_photos:
         _check_cwebp(report)
     return report

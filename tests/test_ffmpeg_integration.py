@@ -6,6 +6,7 @@ so the stdlib-only test suite remains usable on development machines without
 media tools.
 """
 
+import re
 import shutil
 import subprocess
 import tempfile
@@ -30,7 +31,7 @@ from mediate.probe import (
     video_health,
     video_inventory,
 )
-from mediate.scanner import MediaJob
+from mediate.scanner import MediaJob, iter_media
 
 
 def _ffmpeg_has_encoder(name: str) -> bool:
@@ -42,6 +43,19 @@ def _ffmpeg_has_encoder(name: str) -> bool:
         text=True,
     )
     return proc.returncode == 0 and name in proc.stdout
+
+
+def _ffmpeg_has_demuxer(name: str) -> bool:
+    if not shutil.which("ffmpeg"):
+        return False
+    proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-demuxers"],
+        capture_output=True,
+        text=True,
+    )
+    return proc.returncode == 0 and re.search(
+        rf"^\s*D\s+{re.escape(name)}\s", proc.stdout, re.MULTILINE
+    ) is not None
 
 
 @unittest.skipUnless(
@@ -102,6 +116,72 @@ class FFmpegIntegrationTests(unittest.TestCase):
                 self.assertEqual(len(primary_video_streams(inventory)), 1)
                 self.assertEqual(len(inventory_streams(inventory, "audio")), 1)
 
+    def test_hevc_mp4_with_ac3_repairs_only_audio(self):
+        self.require_encoders("libx265", "ac3", "aac")
+        source = self.root / "hevc-ac3.mp4"
+        self.ffmpeg(
+            "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=12:duration=1",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+            "-c:v", "libx265", "-pix_fmt", "yuv420p",
+            "-c:a", "ac3", "-tag:v", "hvc1", source,
+        )
+        source_inventory = video_inventory(source)
+        outcome = process_job(MediaJob(source, "mp4"), Options(keep_originals=True))
+        output = self.root / "hevc-ac3.standardized.mp4"
+        self.assertEqual(outcome.status, CONVERTED, outcome.detail)
+        target_inventory = video_inventory(output)
+        source_video = primary_video_streams(source_inventory)[0]
+        target_video = primary_video_streams(target_inventory)[0]
+        self.assertEqual(target_video["codec_name"], "hevc")
+        self.assertEqual(target_video["pix_fmt"], source_video["pix_fmt"])
+        self.assertEqual(target_video["codec_tag_string"], "hvc1")
+        self.assertTrue(all(
+            stream["codec_name"] == "aac"
+            for stream in inventory_streams(target_inventory, "audio")
+        ))
+
+    def test_hev1_mp4_is_losslessly_remuxed_to_hvc1_for_apple(self):
+        self.require_encoders("libx265", "aac")
+        source = self.root / "hev1.mp4"
+        self.ffmpeg(
+            "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=12:duration=1",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+            "-c:v", "libx265", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-tag:v", "hev1", source,
+        )
+        outcome = process_job(MediaJob(source, "mp4"), Options(keep_originals=True))
+        output = self.root / "hev1.standardized.mp4"
+        self.assertEqual(outcome.status, REMUXED, outcome.detail)
+        self.assertEqual(
+            primary_video_streams(video_inventory(output))[0]["codec_tag_string"],
+            "hvc1",
+        )
+
+    def test_truncated_webm_salvages_readable_media_and_keeps_original(self):
+        self.require_encoders("libvpx", "libopus", "aac")
+        source = self.root / "truncated.webm"
+        self.ffmpeg(
+            "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=12:duration=8",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=8",
+            "-c:v", "libvpx", "-c:a", "libopus", source,
+        )
+        data = source.read_bytes()
+        source.write_bytes(data[: int(len(data) * 0.55)])
+        outcome = process_job(
+            MediaJob(source, "video"),
+            Options(
+                dispose=DisposalPolicy(HARD, self.root),
+                transaction_root=self.root,
+            ),
+        )
+        output = source.with_suffix(".mp4")
+        self.assertEqual(outcome.status, REPAIRED, outcome.detail)
+        self.assertIn("recovered all", outcome.detail)
+        self.assertIn("damaged original kept", outcome.detail)
+        self.assertTrue(source.exists())
+        self.assertTrue(output.exists())
+        self.assertEqual(check_video_integrity(output), {"ok": True, "reason": "ok"})
+
     def test_odd_width_webm_is_padded_and_validates_end_to_end(self):
         self.require_encoders("libvpx")
         source = self.root / "odd-width.webm"
@@ -120,6 +200,40 @@ class FFmpegIntegrationTests(unittest.TestCase):
         video = primary_video_streams(video_inventory(output))[0]
         self.assertEqual((video["width"], video["height"]), (954, 540))
         self.assertEqual(check_video_integrity(output), {"ok": True, "reason": "ok"})
+
+    def test_ffmpeg_9_animated_webp_converts_and_validates_end_to_end(self):
+        if not _ffmpeg_has_demuxer("webp_anim"):
+            self.skipTest("FFmpeg 9 native animated WebP demuxer unavailable")
+        img2webp = shutil.which("img2webp")
+        if not img2webp:
+            self.skipTest("img2webp is required to generate the fixture")
+        first = self.root / "first.png"
+        second = self.root / "second.png"
+        source = self.root / "animated.webp"
+        self.ffmpeg(
+            "-f", "lavfi", "-i", "color=red:size=64x64", "-frames:v", "1", first
+        )
+        self.ffmpeg(
+            "-f", "lavfi", "-i", "color=blue:size=64x64", "-frames:v", "1", second
+        )
+        made = subprocess.run(
+            [
+                img2webp, "-loop", "0", "-d", "100", first,
+                "-d", "200", second, "-o", source,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(made.returncode, 0, made.stderr)
+
+        job = next(job for job in iter_media(self.root) if job.path == source)
+        self.assertEqual(job.kind, "webp")
+        outcome = process_job(job, Options(keep_originals=True))
+        output = source.with_suffix(".mp4")
+        self.assertEqual(outcome.status, CONVERTED, outcome.detail)
+        self.assertTrue(source.exists())
+        self.assertTrue(output.exists())
+        self.assertEqual(len(primary_video_streams(video_inventory(output))), 1)
 
     def test_validated_conversion_uses_transactional_hard_delete(self):
         self.require_encoders("ffv1", "flac", "aac")

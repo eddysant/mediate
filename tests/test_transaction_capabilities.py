@@ -184,6 +184,45 @@ class CapabilityPreflightTests(unittest.TestCase):
         self.assertFalse(report.ok)
         self.assertTrue(any("brew install ffmpeg webp" in error for error in report.errors))
 
+    def test_animated_webp_requires_the_native_ffmpeg_9_demuxer(self):
+        def fake_run(args, timeout=20.0):
+            if "-version" in args:
+                return SimpleNamespace(returncode=0, stdout="ffmpeg version 8.1\n", stderr="")
+            if "-encoders" in args:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=" V..... libx264 H.264\n A..... aac AAC\n",
+                    stderr="",
+                )
+            if "-demuxers" in args:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=" D  image2 image sequence\n D  webp_pipe piped webp sequence\n",
+                    stderr="",
+                )
+            if "-decoders" in args:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=" VF...D webp_anim Animated WebP\n",
+                    stderr="",
+                )
+            return SimpleNamespace(
+                returncode=0,
+                stdout="-progress -display_rotation",
+                stderr="",
+            )
+
+        with patch("mediate.capabilities.shutil.which", return_value="/tool"), patch(
+            "mediate.capabilities._run", side_effect=fake_run
+        ):
+            report = check_media_capabilities(
+                require_video=True,
+                require_photos=False,
+                require_animated_webp=True,
+            )
+        self.assertFalse(report.ok)
+        self.assertTrue(any("FFmpeg 9" in error for error in report.errors))
+
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg unavailable")
     def test_installed_ffmpeg_passes_real_smoke_encode_and_probe(self):
         report = check_media_capabilities(require_video=True, require_photos=False)

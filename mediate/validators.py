@@ -18,6 +18,7 @@ from typing import Tuple
 from .exiftool import exiftool_available, run_exiftool
 from .probe import (
     COLOR_FIELDS,
+    DYNAMIC_RANGE_SIDE_DATA_MARKERS,
     STANDARD_H264_PIXEL_FORMATS,
     audio_stream_label,
     check_video_integrity,
@@ -25,6 +26,7 @@ from .probe import (
     inventory_streams,
     is_commentary_stream,
     media_duration,
+    packet_stream_durations,
     preservable_artwork_streams,
     preservable_subtitle_streams,
     primary_video_streams,
@@ -353,10 +355,13 @@ def verify_video_streams(
     source_inventory: "dict | None" = None,
     allow_stream_removal: bool = False,
     allow_video_downgrade: bool = False,
+    allow_truncated_source: bool = False,
+    preserve_video_codec: bool = False,
 ) -> Tuple[bool, str]:
     """Verify duration plus all stream/metadata promises made by conversion."""
     ok, reason = verify_video_duration(src, output)
-    if not ok:
+    duration_note = "ok"
+    if not ok and not allow_truncated_source:
         return ok, reason
 
     source = source_inventory if source_inventory is not None else video_inventory(src)
@@ -371,6 +376,29 @@ def verify_video_streams(
         return False, (
             f"primary video stream count changed: source {len(source_video)}, "
             f"output {len(target_video)}"
+        )
+
+    if not ok:
+        source_packets = packet_stream_durations(src)
+        target_packets = packet_stream_durations(output)
+        paired_streams = [
+            *zip(source_video, target_video),
+            *zip(inventory_streams(source, "audio"), inventory_streams(target, "audio")),
+        ]
+        recovered = []
+        for before, after in paired_streams:
+            before_duration = source_packets.get(str(before.get("index")))
+            after_duration = target_packets.get(str(after.get("index")))
+            if before_duration is None or after_duration is None:
+                return False, reason
+            if abs(before_duration - after_duration) > max(1.0, before_duration * 0.02):
+                return False, reason
+            recovered.append(before_duration)
+        if not recovered:
+            return False, reason
+        duration_note = (
+            f"recovered all {max(recovered):.1f}s of readable media; "
+            f"the damaged source header claimed {media_duration(src):.1f}s"
         )
 
     source_audio = inventory_streams(source, "audio")
@@ -541,7 +569,16 @@ def verify_video_streams(
 
     before_video = source_video[0]
     after_video = target_video[0]
-    if (
+    if preserve_video_codec and (
+        before_video.get("codec_name") != after_video.get("codec_name")
+        or before_video.get("pix_fmt") != after_video.get("pix_fmt")
+    ):
+        return False, (
+            "copied video format changed: source "
+            f"{before_video.get('codec_name')}/{before_video.get('pix_fmt')} vs output "
+            f"{after_video.get('codec_name')}/{after_video.get('pix_fmt')}"
+        )
+    if not preserve_video_codec and (
         after_video.get("codec_name") != "h264"
         or after_video.get("pix_fmt") not in STANDARD_H264_PIXEL_FORMATS
     ):
@@ -581,11 +618,11 @@ def verify_video_streams(
         after_side_data = set(after_video.get("side_data_types", []))
         important = {
             value for value in before_side_data
-            if any(marker in value.lower() for marker in (
-                "mastering display", "content light", "dolby vision", "dovi", "hdr10"
-            ))
+            if any(
+                marker in value.lower() for marker in DYNAMIC_RANGE_SIDE_DATA_MARKERS
+            )
         }
         if not important.issubset(after_side_data):
             return False, "video HDR/dynamic-range side data changed"
 
-    return True, "ok"
+    return True, duration_note

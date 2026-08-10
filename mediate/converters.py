@@ -40,6 +40,7 @@ from .probe import (
     video_inventory,
     video_health,
     video_stream_status,
+    webp_animation_info,
 )
 from .progress import ConversionCancelled, run_ffmpeg_progress
 from .scanner import MediaJob
@@ -182,6 +183,7 @@ def _build_rotation_command(
     input_path: Path,
     output_path: Path,
     inventory: dict,
+    copy_video: bool = False,
 ) -> List[str]:
     """Remux an encoded MP4 while writing an explicit display matrix.
 
@@ -200,7 +202,8 @@ def _build_rotation_command(
         "-map_chapters", "0",
         "-c", "copy",
         *_video_metadata_args(inventory),
-        "-tag:v:0", "avc1", "-tag:a", "mp4a",
+        "-tag:v:0", _apple_video_tag(inventory) if copy_video else "avc1",
+        "-tag:a", "mp4a",
         "-brand", "mp42", "-movflags", "+faststart",
         str(output_path),
     ]
@@ -247,11 +250,12 @@ def _build_command(
             ]),
             *(["-fps_mode", "passthrough"] if repair else []),
             *_video_metadata_args(inventory),
-            "-tag:v:0", "avc1", "-tag:a", "mp4a",
+            "-tag:v:0", _apple_video_tag(inventory) if copy_video else "avc1",
+            "-tag:a", "mp4a",
             "-brand", "mp42", "-movflags", "+faststart",
             str(output_path),
         ]
-    if kind == "gif":
+    if kind in ("gif", "webp"):
         return [
             "ffmpeg", "-nostdin", "-y", "-i", str(input_path),
             "-tag:v:0", "avc1", "-brand", "mp42", "-movflags", "+faststart",
@@ -282,10 +286,15 @@ def _build_remux_command(
         "-c", "copy",
         *_preserved_stream_codec_args(inventory),
         *_video_metadata_args(inventory),
-        "-tag:v:0", "avc1", "-tag:a", "mp4a",
+        "-tag:v:0", _apple_video_tag(inventory), "-tag:a", "mp4a",
         "-brand", "mp42", "-movflags", "+faststart",
         str(output_path),
     ]
+
+
+def _apple_video_tag(inventory: dict) -> str:
+    videos = primary_video_streams(inventory)
+    return "hvc1" if videos and videos[0].get("codec_name") == "hevc" else "avc1"
 
 
 def intended_output(job: MediaJob) -> Path:
@@ -413,16 +422,18 @@ def _convert_photo(src: Path, tmp: Path) -> subprocess.CompletedProcess:
         repaired.unlink(missing_ok=True)
 
 
-def _explain_source_truncation(reason: str, stderr: str) -> str:
-    """Replace an output symptom with the irrecoverable source diagnosis."""
+def _source_looks_truncated(stderr: str) -> bool:
     truncation_markers = (
         "File ended prematurely",
         "Input file is truncated",
         "input file is truncated",
     )
-    if "duration mismatch" in reason and any(
-        marker in stderr for marker in truncation_markers
-    ):
+    return any(marker in stderr for marker in truncation_markers)
+
+
+def _explain_source_truncation(reason: str, stderr: str) -> str:
+    """Replace an output symptom with the irrecoverable source diagnosis."""
+    if "duration mismatch" in reason and _source_looks_truncated(stderr):
         return (
             "source file is truncated; missing media cannot be reconstructed "
             f"({reason})"
@@ -482,7 +493,11 @@ def _convert(
             encode_output.unlink(missing_ok=True)
             return proc
         try:
-            rotated = _run(_build_rotation_command(encode_output, tmp, inventory))
+            rotated = _run(
+                _build_rotation_command(
+                    encode_output, tmp, inventory, copy_video=copy_video
+                )
+            )
             return subprocess.CompletedProcess(
                 rotated.args,
                 rotated.returncode,
@@ -581,10 +596,7 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
             elif stream_st == STREAM_COPY_VIDEO:
                 copy_video = True
             elif stream_st == STREAM_HEVC and not opts.reencode_hevc:
-                return Outcome(
-                    SKIPPED, src,
-                    "HEVC streams (smaller than h264 and Apple-native; --reencode-hevc to convert anyway)",
-                )
+                remux = True
         risks = stream_removal_risks(inventory)
         if risks and not opts.allow_stream_removal:
             return Outcome(
@@ -604,6 +616,28 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
 
     if kind == "gif" and not gif_is_animated(src):
         return Outcome(SKIPPED, src, "static GIF (only animated GIFs are converted)")
+
+    if kind == "webp":
+        webp_info = webp_animation_info(src)
+        if not webp_info["animated"]:
+            return Outcome(SKIPPED, src, "static WebP (already standardized)")
+        metadata = [name.upper() for name in ("icc", "exif", "xmp") if webp_info[name]]
+        if metadata and not opts.allow_stream_removal:
+            return Outcome(
+                SKIPPED,
+                src,
+                "stream safety warning: animated WebP carries "
+                + "/".join(metadata)
+                + " metadata that MP4 cannot preserve "
+                + "(--allow-stream-removal to permit)",
+            )
+        if webp_info["alpha"] and not opts.allow_video_downgrade:
+            return Outcome(
+                SKIPPED,
+                src,
+                "advanced video safety warning: 8-bit h264 conversion would change "
+                "WebP alpha transparency (--allow-video-downgrade to permit)",
+            )
 
     if kind == "heic":
         if not opts.convert_heic:
@@ -687,7 +721,11 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
             **convert_options,
         )
 
-    def validate_attempt(proc):
+    salvaged_source = False
+    salvage_detail = ""
+
+    def validate_attempt(proc, stage: str):
+        nonlocal salvaged_source, salvage_detail
         valid, why = validate_output(
             proc.returncode,
             proc.stderr,
@@ -704,7 +742,7 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
             if _repair_photo_metadata(src, tmp):
                 return verify_photo_metadata(src, tmp)
             return metadata_result
-        if kind == "gif":
+        if kind in ("gif", "webp"):
             return verify_video_duration(src, tmp)
         result = verify_video_streams(
             src,
@@ -712,9 +750,17 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
             inventory,
             allow_stream_removal=opts.allow_stream_removal,
             allow_video_downgrade=opts.allow_video_downgrade,
+            allow_truncated_source=_source_looks_truncated(proc.stderr),
+            preserve_video_codec=(
+                stage in ("remux", "repair-remux")
+                or (stage == "convert" and copy_video)
+            ),
         )
         if not result[0]:
             return False, _explain_source_truncation(result[1], proc.stderr)
+        if result[1] != "ok":
+            salvaged_source = True
+            salvage_detail = result[1]
         return result
 
     first_stage = (
@@ -751,7 +797,7 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
         except FileNotFoundError as exc:
             return Outcome(FAILED, src, f"converter not found: {exc}")
         attempted.append(stage)
-        ok, reason = validate_attempt(proc)
+        ok, reason = validate_attempt(proc, stage)
         if ok:
             remux = stage == "remux"
             repair = stage.startswith("repair-")
@@ -781,7 +827,8 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
         )
 
     disposed = ""
-    if not opts.keep_originals and opts.dispose is not None:
+    keep_source = opts.keep_originals or salvaged_source
+    if not keep_source and opts.dispose is not None:
         try:
             transaction = ReplacementTransaction.prepare(
                 opts.transaction_root or src.parent,
@@ -811,13 +858,15 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
             set_birthtime(final, src_birthtime)
     if new_ext == ".mp4":
         mark_video_healthy(final)
-    if opts.keep_originals:
+    if keep_source:
         mark_conversion_complete(src, final)
 
-    outcome_status = REPAIRED if repair else REMUXED if remux else CONVERTED
+    outcome_status = REPAIRED if repair or salvaged_source else REMUXED if remux else CONVERTED
+    recovery = f", {salvage_detail}; damaged original kept" if salvaged_source else ""
     return Outcome(
         outcome_status,
         src,
-        f"-> {final.name} ({_fmt_size(src_stat.st_size)} -> {_fmt_size(new_size)}){disposed}",
+        f"-> {final.name} ({_fmt_size(src_stat.st_size)} -> {_fmt_size(new_size)})"
+        f"{disposed}{recovery}",
         bytes_saved=src_stat.st_size - new_size,
     )

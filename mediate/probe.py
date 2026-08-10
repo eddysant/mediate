@@ -24,6 +24,7 @@ log = logging.getLogger("mediate")
 # mp4_status() results. yuvj420p is FFmpeg's deprecated name for full-range
 # 8-bit yuv420p; both have the same widely supported 4:2:0 sample layout.
 STANDARD_H264_PIXEL_FORMATS = frozenset({"yuv420p", "yuvj420p"})
+APPLE_HEVC_PIXEL_FORMATS = frozenset({"yuv420p", "yuv420p10le"})
 
 MP4_STANDARD = "standard"          # h264 8-bit 4:2:0 video, aac audio
 MP4_HEVC = "hevc"                  # hevc video, aac audio — Apple-native
@@ -135,12 +136,12 @@ def mp4_status(path: Path) -> str:
     only makes it bigger), or needing conversion. An unreadable file reports
     needs-conversion; the attempt that follows is protected by the
     validation protocol."""
-    return _cached("mp4v3", path, lambda: _mp4_classification_uncached(path))["status"]
+    return _cached("mp4v4", path, lambda: _mp4_classification_uncached(path))["status"]
 
 
 def mp4_conversion_reason(path: Path) -> str:
     """Explain why an existing MP4 is not already Apple-compatible."""
-    return _cached("mp4v3", path, lambda: _mp4_classification_uncached(path))["reason"]
+    return _cached("mp4v4", path, lambda: _mp4_classification_uncached(path))["reason"]
 
 
 def _mp4_status_uncached(path: Path) -> str:
@@ -183,7 +184,12 @@ def _mp4_classification_uncached(path: Path) -> dict:
         for s in video
     ) and all(s.get("codec_tag_string") in (None, "mp4a") for s in audio):
         return {"status": MP4_STANDARD, "reason": "already Apple-compatible"}
-    if all(s.get("codec_name") == "hevc" for s in video):
+    if all(
+        s.get("codec_name") == "hevc"
+        and s.get("pix_fmt") in APPLE_HEVC_PIXEL_FORMATS
+        and s.get("codec_tag_string") in (None, "hvc1")
+        for s in video
+    ):
         return {"status": MP4_HEVC, "reason": "HEVC is already Apple-native"}
     descriptions = []
     for stream in video:
@@ -198,6 +204,12 @@ def _mp4_classification_uncached(path: Path) -> dict:
         for stream in video
     ):
         reason = "H.264/AAC tracks need an Apple-compatible MP4 remux"
+    elif all(
+        stream.get("codec_name") == "hevc"
+        and stream.get("pix_fmt") in APPLE_HEVC_PIXEL_FORMATS
+        for stream in video
+    ):
+        reason = "HEVC/AAC tracks need an Apple-compatible hvc1 MP4 remux"
     else:
         reason = "video is " + ", ".join(descriptions) + ", not H.264 8-bit 4:2:0"
     return {"status": MP4_NEEDS_CONVERSION, "reason": reason}
@@ -205,7 +217,7 @@ def _mp4_classification_uncached(path: Path) -> dict:
 
 # video_stream_status() results — usable for any container, not just .mp4
 STREAM_STANDARD = "standard"       # h264 8-bit 4:2:0, aac (or no) audio
-STREAM_COPY_VIDEO = "copy-video"   # compatible h264 video; transcode audio only
+STREAM_COPY_VIDEO = "copy-video"   # compatible h264/hevc video; transcode audio only
 STREAM_HEVC = "hevc"               # hevc video, aac (or no) audio
 STREAM_NEEDS_CONVERSION = "convert"
 
@@ -216,7 +228,7 @@ def video_stream_status(path: Path) -> str:
     be remuxed into MP4 with ``-c copy``, STREAM_HEVC for HEVC + AAC, or
     STREAM_NEEDS_CONVERSION when re-encoding is required."""
     # v3 distinguishes audio-only conversion from a full video re-encode.
-    return _cached("vstreamv3", path, lambda: _video_stream_status_uncached(path))
+    return _cached("vstreamv4", path, lambda: _video_stream_status_uncached(path))
 
 
 def _video_stream_status_uncached(path: Path) -> str:
@@ -244,13 +256,20 @@ def _video_stream_status_uncached(path: Path) -> str:
         and s.get("pix_fmt") in STANDARD_H264_PIXEL_FORMATS
         for s in video
     )
-    if compatible_h264 and any(s.get("codec_name") != "aac" for s in audio):
+    compatible_hevc = all(
+        s.get("codec_name") == "hevc"
+        and s.get("pix_fmt") in APPLE_HEVC_PIXEL_FORMATS
+        for s in video
+    )
+    if (compatible_h264 or compatible_hevc) and any(
+        s.get("codec_name") != "aac" for s in audio
+    ):
         return STREAM_COPY_VIDEO
     if any(s.get("codec_name") != "aac" for s in audio):
         return STREAM_NEEDS_CONVERSION
     if compatible_h264:
         return STREAM_STANDARD
-    if all(s.get("codec_name") == "hevc" for s in video):
+    if compatible_hevc:
         return STREAM_HEVC
     return STREAM_NEEDS_CONVERSION
 
@@ -294,6 +313,15 @@ COLOR_FIELDS = (
     "color_transfer",
     "color_primaries",
     "chroma_location",
+)
+DYNAMIC_RANGE_SIDE_DATA_MARKERS = (
+    "mastering display",
+    "content light",
+    "dolby vision",
+    "dovi",
+    "hdr10",
+    "smpte 2094-50",
+    "hdr vivid",
 )
 SIMPLE_SUBTITLE_CODECS = {"mov_text", "subrip", "srt", "text", "webvtt"}
 MP4_ARTWORK_CODECS = {"mjpeg", "png"}
@@ -405,17 +433,59 @@ def video_inventory(path: Path) -> Optional[dict]:
     stream selection from losing content) and after conversion (to verify the
     streams and metadata that were meant to survive).
     """
-    return _cached("vinv2", path, lambda: _video_inventory_uncached(path))
+    # v3 adds stream groups. These carry relationships such as an LCEVC
+    # enhancement layer which cannot be reconstructed from the flat stream
+    # list and must not silently disappear during explicit stream mapping.
+    return _cached("vinv3", path, lambda: _video_inventory_uncached(path))
+
+
+_stream_group_support: Optional[bool] = None
+_stream_group_support_lock = threading.Lock()
+
+
+def _ffprobe_supports_stream_groups() -> bool:
+    """Capability-check ``-show_stream_groups`` once for FFmpeg 6 support."""
+    global _stream_group_support
+    with _stream_group_support_lock:
+        if _stream_group_support is not None:
+            return _stream_group_support
+        try:
+            proc = subprocess.run(
+                ["ffprobe", "-hide_banner", "-h", "full"],
+                capture_output=True,
+                text=True,
+            )
+            output = proc.stdout + proc.stderr
+            _stream_group_support = (
+                proc.returncode == 0 and "-show_stream_groups" in output
+            )
+        except OSError:
+            _stream_group_support = False
+        return _stream_group_support
+
+
+def _normalise_stream_group(group: dict) -> dict:
+    return {
+        "index": group.get("index"),
+        "id": group.get("id"),
+        "type": group.get("type") or group.get("group_type") or "unknown",
+    }
 
 
 def _video_inventory_uncached(path: Path) -> Optional[dict]:
-    data = _ffprobe_json(["-show_streams", "-show_chapters", str(path)])
+    args = ["-show_streams", "-show_chapters"]
+    if _ffprobe_supports_stream_groups():
+        args.append("-show_stream_groups")
+    data = _ffprobe_json([*args, str(path)])
     if data is None:
         return None
     streams = [_normalise_stream(stream) for stream in data.get("streams", [])]
     return {
         "streams": streams,
         "chapters": [_normalise_chapter(chapter) for chapter in data.get("chapters", [])],
+        "stream_groups": [
+            _normalise_stream_group(group) for group in data.get("stream_groups", [])
+        ],
     }
 
 
@@ -502,10 +572,14 @@ def advanced_video_features(inventory: dict) -> List[str]:
     transfer = str(stream.get("color", {}).get("color_transfer") or "").lower()
     side_data = " ".join(stream.get("side_data_types", [])).lower()
     if transfer in {"smpte2084", "arib-std-b67"} or any(
-        marker in side_data
-        for marker in ("mastering display", "content light", "dolby vision", "dovi", "hdr10")
+        marker in side_data for marker in DYNAMIC_RANGE_SIDE_DATA_MARKERS
     ):
         features.append("HDR/dynamic-range metadata")
+    group_types = " ".join(
+        str(group.get("type", "")) for group in inventory.get("stream_groups", [])
+    ).lower()
+    if "lcevc" in side_data or "lcevc" in group_types:
+        features.append("LCEVC enhancement layer")
     pix_fmt = str(stream.get("pix_fmt") or "").lower()
     if pix_fmt.startswith(("rgba", "argb", "bgra", "abgr", "yuva", "gbrap")):
         features.append("alpha channel")
@@ -607,6 +681,12 @@ def stream_removal_risks(inventory: dict) -> List[str]:
         risks.append(
             f"{len(original_audio)} audio track original-language disposition(s)"
         )
+    groups = inventory.get("stream_groups", [])
+    if groups:
+        kinds = ", ".join(sorted({
+            str(group.get("type") or "unknown") for group in groups
+        }))
+        risks.append(f"{len(groups)} unsupported stream group(s) ({kinds})")
     return risks
 
 
@@ -654,6 +734,62 @@ def decoded_stream_starts(path: Path) -> dict[str, float]:
     validation after transcoding to a codec with different priming.
     """
     return _cached("decoded-starts", path, lambda: _decoded_stream_starts(path))
+
+
+def packet_stream_durations(path: Path) -> dict[str, float]:
+    """Return the readable packet span for every stream, without decoding.
+
+    Matroska/WebM duration headers can outlive the media when a download is
+    cut short.  Scanning packet timestamps tells validation how much media is
+    actually recoverable while using constant memory even for long videos.
+    """
+    return _cached(
+        "packet-durations1", path, lambda: _packet_stream_durations(path), strong=True
+    )
+
+
+def _packet_stream_durations(path: Path) -> dict[str, float]:
+    command = [
+        "ffprobe", "-v", "error", "-show_packets",
+        "-show_entries", "packet=stream_index,pts_time,dts_time,duration_time",
+        "-of", "compact=p=0:nk=0", str(path),
+    ]
+    try:
+        proc = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except FileNotFoundError:
+        return {}
+    bounds: dict[str, list[float]] = {}
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        values = {}
+        for field in line.strip().split("|"):
+            name, separator, value = field.partition("=")
+            if separator:
+                values[name] = value
+        stream_index = values.get("stream_index")
+        timestamp = values.get("pts_time") or values.get("dts_time")
+        if stream_index is None or timestamp in (None, "N/A"):
+            continue
+        try:
+            start = float(timestamp)
+            duration = float(values.get("duration_time", "0") or 0)
+        except ValueError:
+            continue
+        end = start + max(0.0, duration)
+        current = bounds.setdefault(stream_index, [start, end])
+        current[0] = min(current[0], start)
+        current[1] = max(current[1], end)
+    proc.stdout.close()
+    proc.wait()
+    return {
+        stream_index: max(0.0, end - start)
+        for stream_index, (start, end) in bounds.items()
+    }
 
 
 def _decoded_stream_starts(path: Path) -> dict[str, float]:
@@ -754,3 +890,45 @@ def _gif_is_animated_uncached(path: Path) -> bool:
         return int(streams[0].get("nb_read_packets", 2)) > 1
     except (TypeError, ValueError):
         return True
+
+
+def webp_animation_info(path: Path) -> dict:
+    """Read the lossless VP8X feature byte without decoding the image.
+
+    Static WebPs remain an already-standardized photo format. Animated WebPs
+    are candidates for FFmpeg 9's native WebP demuxer, while the other flags
+    let the conversion pipeline require explicit permission before discarding
+    alpha or container metadata that MP4 cannot represent equivalently.
+    """
+    return _cached("webpinfo1", path, lambda: _webp_animation_info_uncached(path))
+
+
+def _webp_animation_info_uncached(path: Path) -> dict:
+    info = {
+        "animated": False,
+        "alpha": False,
+        "icc": False,
+        "exif": False,
+        "xmp": False,
+    }
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(21)
+    except OSError:
+        return info
+    if (
+        len(header) < 21
+        or header[:4] != b"RIFF"
+        or header[8:12] != b"WEBP"
+        or header[12:16] != b"VP8X"
+    ):
+        return info
+    flags = header[20]
+    info.update({
+        "animated": bool(flags & 0x02),
+        "alpha": bool(flags & 0x10),
+        "icc": bool(flags & 0x20),
+        "exif": bool(flags & 0x08),
+        "xmp": bool(flags & 0x04),
+    })
+    return info

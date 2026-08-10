@@ -1,8 +1,9 @@
 # mediate — Architecture Notes
 
 Stdlib-only Python (≥3.9) CLI by Misty Vale, built with AI assistance. Recursively
-standardizes a media library: photos → lossless WebP (`cwebp`), videos/animated
-GIFs → h264/yuv420p/AAC MP4 (`ffmpeg`). Originals are disposed of (Trash by
+standardizes a media library: photos → lossless WebP (`cwebp`), videos and
+GIF/WebP animations → h264/yuv420p/AAC MP4 (`ffmpeg`). Originals are disposed
+of (Trash by
 default) **only** after a strict validation checklist. No Python dependencies —
 everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS).
 
@@ -11,15 +12,15 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 | Module | Role |
 |---|---|
 | `cli.py` | argparse, dual logging (console + `conversion.log`), planning-time skips, ThreadPoolExecutor, summary/exit codes |
-| `scanner.py` | `os.walk` traversal → `MediaJob(path, kind)`; kind ∈ photo/heic/gif/video/mp4; Live Photo pairing helper |
-| `probe.py` | cached `ffprobe -of json` helpers: codec/remux classification plus a normalized inventory of all streams, chapters, track identity, rotation, colour, and artwork |
+| `scanner.py` | `os.walk` traversal → `MediaJob(path, kind)`; kind ∈ photo/heic/gif/webp/video/mp4; Live Photo pairing helper |
+| `probe.py` | cached `ffprobe -of json` helpers: codec/remux classification plus a normalized inventory of all streams, stream groups, chapters, track identity, rotation, colour, and artwork |
 | `converters.py` | command construction, stream-safety policy, temp-file protocol, `process_job()`; includes `-c copy` remuxing for compatible containers and a rotation display-matrix finalizer |
 | `validators.py` | exit/existence/size/full-decode checks plus photo metadata and video duration/stream/track/chapter/rotation/colour verification |
 | `progress.py` | concurrent FFmpeg progress plus cooperative cancellation and child termination |
 | `safety.py` | source snapshots, link/readability policy, output writability and aggregate per-filesystem free-space reservations |
 | `journal.py` | atomic `.mediate-run.json` state and interrupted-job prioritization |
 | `transaction.py` | durable two-phase validated-output replacement plus startup rollback/completion recovery |
-| `capabilities.py` | FFmpeg/cwebp version, encoder, progress, rotation, smoke-encode, and ffprobe JSON preflight |
+| `capabilities.py` | FFmpeg/cwebp version, encoder/demuxer, progress, rotation, smoke-encode, and ffprobe JSON preflight |
 | `disposal.py` | serializable Trash (macOS per-volume `.Trashes`, freedesktop elsewhere) / graveyard / hard-delete policy |
 | `macmeta.py` | ctypes `setattrlist(2)` to copy the original's birthtime (Finder "date created") onto outputs; no-op off macOS |
 | `exiftool.py` | persistent `exiftool -stay_open` daemon behind `run_exiftool(args)` (thread-safe, atexit-stopped, one-shot fallback); all exiftool queries go through it |
@@ -30,11 +31,12 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 `process_job` in `converters.py`:
 
 1. Probe-based skips (standard/HEVC mp4, static gif, HEIC without `--convert-heic`).
-1a. Before altering a video, inventory every stream and chapter. All audio
+1a. Before altering a video, inventory every stream, stream group, and chapter. All audio
     tracks (including commentary) are mapped; chapters, rotation, and colour
     are preserved. Compatible text subtitles and cover streams are mapped;
     incompatible streams cause a safety skip unless `--allow-stream-removal`.
-    HDR/high-bit-depth, alpha, interlaced, and unusual/VFR video is blocked
+    HDR/high-bit-depth (including SMPTE 2094-50), LCEVC, alpha, interlaced,
+    and unusual/VFR video is blocked
     before an 8-bit encode unless `--allow-video-downgrade`.
 1b. For non-MP4 video containers (MOV/MKV/etc): probe streams via
     `video_stream_status()`. If streams are already h264/yuv420p + AAC, set
@@ -90,6 +92,10 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   unsafe to alter without knowing what it contains. Narrow codec/GIF probes
   still fail open into conversion/validation where no destructive stream
   selection can occur before the full video preflight.
+- **Animated WebP is FFmpeg 9 capability-gated**: the scanner reads only the
+  VP8X feature byte, so static WebPs remain ignored. Animation conversion is
+  attempted only when FFmpeg exposes the native `webp_anim` demuxer; alpha and
+  ICC/EXIF/XMP loss require the existing explicit downgrade/removal flags.
 - **Completed MP4s are filtered before the candidate count** (`cli.py`) and
   their probe cache is saved even when that leaves no work. A single worker
   exception becomes one FAILED outcome instead of aborting result collection;
@@ -148,7 +154,7 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 - **Probe results are cached** (`probe.py`: path+mtime_ns+ctime_ns+size+device+
   inode keyed JSON; health adds a sampled BLAKE2 fingerprint) in the user cache
   dir, loaded/saved by cli — a 50k-file re-run would otherwise
-  spawn ffprobe per MP4/GIF. `load_probe_cache()` must run before the pool.
+  spawn ffprobe per MP4/GIF/WebP animation. `load_probe_cache()` must run before the pool.
   `media_duration()` lives here too (shared by validation and progress).
 - **Concurrent FFmpeg progress** (`progress.py`): all encodes, remuxes, and
   integrity decodes use `-progress pipe:1 -nostats`. Interactive terminals get

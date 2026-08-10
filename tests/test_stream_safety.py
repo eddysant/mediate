@@ -13,6 +13,7 @@ from mediate.converters import (
     process_job,
 )
 from mediate.probe import (
+    _video_inventory_uncached,
     advanced_video_features,
     preservable_artwork_streams,
     preservable_subtitle_streams,
@@ -49,11 +50,35 @@ def _stream(
     }
 
 
-def _inventory(*streams, chapters=None):
-    return {"streams": list(streams), "chapters": chapters or []}
+def _inventory(*streams, chapters=None, stream_groups=None):
+    return {
+        "streams": list(streams),
+        "chapters": chapters or [],
+        "stream_groups": stream_groups or [],
+    }
 
 
 class StreamPreflightTests(unittest.TestCase):
+    def test_inventory_reads_and_normalises_stream_groups_when_supported(self):
+        data = {
+            "streams": [{"index": 0, "codec_type": "video", "codec_name": "h264"}],
+            "stream_groups": [{"index": 2, "id": "0x10", "type": "LCEVC"}],
+        }
+        with patch("mediate.probe._ffprobe_supports_stream_groups", return_value=True), patch(
+            "mediate.probe._ffprobe_json", return_value=data
+        ) as probe:
+            inventory = _video_inventory_uncached(Path("enhanced.mp4"))
+        probe.assert_called_once_with([
+            "-show_streams",
+            "-show_chapters",
+            "-show_stream_groups",
+            "enhanced.mp4",
+        ])
+        self.assertEqual(
+            inventory["stream_groups"],
+            [{"index": 2, "id": "0x10", "type": "LCEVC"}],
+        )
+
     def test_detects_every_stream_that_requires_removal_opt_in(self):
         inventory = _inventory(
             _stream("video", "h264"),
@@ -129,6 +154,17 @@ class StreamPreflightTests(unittest.TestCase):
             ["1 attached artwork stream(s)"],
         )
 
+    def test_stream_groups_fail_closed_including_lcevc(self):
+        inventory = _inventory(
+            _stream("video", "h264"),
+            stream_groups=[{"index": 0, "type": "LCEVC"}],
+        )
+        self.assertEqual(
+            stream_removal_risks(inventory),
+            ["1 unsupported stream group(s) (LCEVC)"],
+        )
+        self.assertIn("LCEVC enhancement layer", advanced_video_features(inventory))
+
     def test_process_job_warns_and_skips_without_opt_in(self):
         inventory = _inventory(
             _stream("video", "vp9"),
@@ -173,6 +209,31 @@ class StreamPreflightTests(unittest.TestCase):
         self.assertEqual(blocked.status, SKIPPED)
         self.assertIn("10-bit video", blocked.detail)
         self.assertIn("--allow-video-downgrade", blocked.detail)
+        self.assertEqual(allowed.status, "planned")
+
+    def test_animated_webp_requires_explicit_metadata_and_alpha_downgrades(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "animated.webp"
+            chunk = b"VP8X" + (10).to_bytes(4, "little") + b"\x3e" + b"\0" * 9
+            data = b"WEBP" + chunk
+            path.write_bytes(b"RIFF" + len(data).to_bytes(4, "little") + data)
+            metadata_blocked = process_job(MediaJob(path, "webp"), Options(dry_run=True))
+            alpha_blocked = process_job(
+                MediaJob(path, "webp"),
+                Options(dry_run=True, allow_stream_removal=True),
+            )
+            allowed = process_job(
+                MediaJob(path, "webp"),
+                Options(
+                    dry_run=True,
+                    allow_stream_removal=True,
+                    allow_video_downgrade=True,
+                ),
+            )
+        self.assertEqual(metadata_blocked.status, SKIPPED)
+        self.assertIn("ICC/EXIF/XMP", metadata_blocked.detail)
+        self.assertEqual(alpha_blocked.status, SKIPPED)
+        self.assertIn("alpha transparency", alpha_blocked.detail)
         self.assertEqual(allowed.status, "planned")
 
 
@@ -226,6 +287,27 @@ class StreamCommandTests(unittest.TestCase):
         self.assertIn("-tag:v:0 avc1", joined)
         self.assertIn("-tag:a mp4a", joined)
         self.assertIn("-brand mp42", joined)
+
+    def test_audio_only_conversion_keeps_hevc_and_writes_hvc1_tag(self):
+        inventory = _inventory(
+            _stream("video", "hevc"),
+            _stream("audio", "ac3", index=1),
+        )
+        command = _build_command(
+            "video", Path("in.mp4"), Path("out.mp4"), inventory,
+            copy_video=True,
+        )
+        joined = " ".join(command)
+        self.assertIn("-c:v:0 copy", joined)
+        self.assertIn("-c:a aac", joined)
+        self.assertIn("-tag:v:0 hvc1", joined)
+
+    def test_animated_webp_uses_the_timing_safe_animation_command(self):
+        command = _build_command("webp", Path("in.webp"), Path("out.mp4"))
+        joined = " ".join(command)
+        self.assertIn("-i in.webp", joined)
+        self.assertIn("-c:v libx264", joined)
+        self.assertIn("scale=trunc(iw/2)*2:trunc(ih/2)*2", joined)
 
     def test_repair_command_enables_tolerant_timestamp_and_packet_handling(self):
         command = _build_command(
@@ -476,6 +558,14 @@ class StreamValidationTests(unittest.TestCase):
         self.assertIn("interlaced video (tt)", features)
         self.assertIn("variable frame rate", features)
 
+    def test_detects_smpte_2094_50_dynamic_range_metadata(self):
+        video = _stream("video", "hevc")
+        video["side_data_types"] = ["SMPTE 2094-50 metadata"]
+        self.assertIn(
+            "HDR/dynamic-range metadata",
+            advanced_video_features(_inventory(video)),
+        )
+
     def test_rejects_changed_commentary_identity(self):
         source = _inventory(self.video, self.japanese, self.commentary)
         changed = dict(self.commentary)
@@ -562,6 +652,55 @@ class StreamValidationTests(unittest.TestCase):
                 "duration mismatch: source 10.0s vs output 5.0s", ""
             ),
             "duration mismatch: source 10.0s vs output 5.0s",
+        )
+
+    def test_accepts_a_complete_salvage_of_every_readable_packet(self):
+        source = _inventory(self.video, self.japanese)
+        output = _inventory(self.video, self.japanese)
+        with patch(
+            "mediate.validators.verify_video_duration",
+            return_value=(False, "duration mismatch: source 34.7s vs output 21.5s"),
+        ), patch(
+            "mediate.validators.video_inventory", return_value=output
+        ), patch(
+            "mediate.validators.packet_stream_durations",
+            side_effect=[{"0": 21.46, "1": 21.48}, {"0": 21.47, "1": 21.49}],
+        ), patch("mediate.validators.media_duration", return_value=34.688):
+            ok, reason = verify_video_streams(
+                Path("source.webm"), Path("output.mp4"), source,
+                allow_truncated_source=True,
+            )
+        self.assertTrue(ok, reason)
+        self.assertIn("recovered all 21.5s", reason)
+
+    def test_rejects_salvage_when_a_readable_stream_was_cut_short(self):
+        source = _inventory(self.video, self.japanese)
+        output = _inventory(self.video, self.japanese)
+        mismatch = "duration mismatch: source 34.7s vs output 15.0s"
+        with patch(
+            "mediate.validators.verify_video_duration", return_value=(False, mismatch)
+        ), patch(
+            "mediate.validators.video_inventory", return_value=output
+        ), patch(
+            "mediate.validators.packet_stream_durations",
+            side_effect=[{"0": 21.46, "1": 21.48}, {"0": 15.0, "1": 15.0}],
+        ):
+            self.assertEqual(
+                verify_video_streams(
+                    Path("source.webm"), Path("output.mp4"), source,
+                    allow_truncated_source=True,
+                ),
+                (False, mismatch),
+            )
+
+    def test_copy_validation_accepts_preserved_hevc_video(self):
+        before_video = dict(self.video)
+        before_video.update({"codec_name": "hevc", "pix_fmt": "yuv420p"})
+        source = _inventory(before_video, self.japanese)
+        output = _inventory(dict(before_video), self.japanese)
+        self.assertEqual(
+            self._verify(source, output, preserve_video_codec=True),
+            (True, "ok"),
         )
 
     def test_allows_explicit_removal_of_an_extra_video_track(self):

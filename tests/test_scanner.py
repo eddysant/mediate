@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from mediate.probe import webp_animation_info
 from mediate.scanner import find_live_photo_companions, iter_media
 
 
@@ -18,6 +19,13 @@ class ScannerTests(unittest.TestCase):
         path.write_bytes(b"x")
         return path
 
+    def webp(self, rel: str, flags: int) -> Path:
+        path = self.root / rel
+        chunk = b"VP8X" + (10).to_bytes(4, "little") + bytes([flags]) + b"\0" * 9
+        data = b"WEBP" + chunk
+        path.write_bytes(b"RIFF" + len(data).to_bytes(4, "little") + data)
+        return path
+
     def scan(self):
         return {job.path.relative_to(self.root).as_posix(): job.kind for job in iter_media(self.root)}
 
@@ -28,11 +36,13 @@ class ScannerTests(unittest.TestCase):
         self.touch("d.mov")
         self.touch("e.mp4")
         self.touch("f.heic")
+        self.webp("g.webp", 0x02)
         self.assertEqual(
             self.scan(),
             {
                 "a.jpg": "photo", "b.PNG": "photo", "c.gif": "gif",
                 "d.mov": "video", "e.mp4": "mp4", "f.heic": "heic",
+                "g.webp": "webp",
             },
         )
 
@@ -58,9 +68,23 @@ class ScannerTests(unittest.TestCase):
         self.touch(".hidden.jpg")
         self.touch(".secret/inside.jpg")
         self.touch("already.webp")
+        self.webp("static.webp", 0x00)
         self.touch("notes.txt")
         self.touch("conversion.log")
         self.assertEqual(self.scan(), {})
+
+    def test_reads_animated_webp_safety_flags(self):
+        path = self.webp("rich.webp", 0x3E)
+        self.assertEqual(
+            webp_animation_info(path),
+            {
+                "animated": True,
+                "alpha": True,
+                "icc": True,
+                "exif": True,
+                "xmp": True,
+            },
+        )
 
     def test_never_enters_application_bundles(self):
         self.touch("Photos Library.photoslibrary/originals/img.jpg")
