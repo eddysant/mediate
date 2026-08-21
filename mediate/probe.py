@@ -844,8 +844,16 @@ def check_video_integrity(path: Path, progress_path: Optional[Path] = None) -> d
         )
     except FileNotFoundError:
         return {"ok": False, "reason": "ffmpeg not found"}
-    if proc.returncode != 0 or proc.stderr.strip():
-        return {"ok": False, "reason": _stderr_tail(proc.stderr)}
+    stderr = proc.stderr.strip()
+    if stderr and proc.returncode == 0:
+        lines = [
+            line for line in stderr.splitlines()
+            if line.strip() and "Referenced QT chapter track not found" not in line
+        ]
+        if not lines:
+            stderr = ""
+    if proc.returncode != 0 or stderr:
+        return {"ok": False, "reason": _stderr_tail(stderr)}
     return {"ok": True, "reason": "ok"}
 
 

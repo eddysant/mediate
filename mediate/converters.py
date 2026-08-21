@@ -8,7 +8,7 @@ import shutil
 import subprocess
 import sys
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import List, Optional
 
@@ -452,6 +452,7 @@ def _repair_photo_metadata(src: Path, output: Path) -> bool:
         "-EXIF:All",
         "-XMP:All",
         "-ICC_Profile",
+        "-xmp:DateCreated<IPTC:DateCreated",
         str(output),
     ])
     updated = bool(result and "image files updated" in result.lower())
@@ -615,7 +616,8 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
             )
 
     if kind == "gif" and not gif_is_animated(src):
-        return Outcome(SKIPPED, src, "static GIF (only animated GIFs are converted)")
+        kind = "photo"
+        job = replace(job, kind="photo")
 
     if kind == "webp":
         webp_info = webp_animation_info(src)

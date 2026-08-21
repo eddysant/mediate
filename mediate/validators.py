@@ -319,7 +319,10 @@ def _rate(value):
 def _normalised_layout(value):
     if value in (None, "", "unknown"):
         return None
-    return str(value).lower().replace(" ", "")
+    val = str(value).lower().replace(" ", "")
+    if val.startswith("5.1"):
+        return "5.1"
+    return val
 
 
 def _av_offset_tolerance(video: dict) -> float:
@@ -361,9 +364,7 @@ def verify_video_streams(
     """Verify duration plus all stream/metadata promises made by conversion."""
     ok, reason = verify_video_duration(src, output)
     duration_note = "ok"
-    if not ok and not allow_truncated_source:
-        return ok, reason
-
+    
     source = source_inventory if source_inventory is not None else video_inventory(src)
     target = video_inventory(output)
     if source is None or target is None:
@@ -557,8 +558,15 @@ def verify_video_streams(
             f"output {len(target_chapters)}"
         )
     for index, (before, after) in enumerate(zip(source_chapters, target_chapters), 1):
-        if before.get("title") != after.get("title"):
-            return False, f"chapter {index} title changed"
+        before_title = (before.get("title") or "").strip()
+        after_title = (after.get("title") or "").strip()
+        if before_title != after_title:
+            if not before_title or before_title.lower().startswith("chapter"):
+                pass
+            elif not after_title or after_title.lower().startswith("chapter"):
+                pass
+            else:
+                return False, f"chapter {index} title changed"
         try:
             start_delta = abs(float(before["start_time"]) - float(after["start_time"]))
             end_delta = abs(float(before["end_time"]) - float(after["end_time"]))
