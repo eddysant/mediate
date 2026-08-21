@@ -370,9 +370,27 @@ def _convert_photo(src: Path, tmp: Path) -> subprocess.CompletedProcess:
     )
     if (
         direct.returncode == 0
-        or src.suffix.lower() not in (".jpg", ".jpeg")
-        or not decode_failure
+        or (src.suffix.lower() not in (".jpg", ".jpeg", ".gif") and not decode_failure)
     ):
+        return direct
+
+    if src.suffix.lower() == ".gif" and decode_failure:
+        png = tmp.with_suffix(".png")
+        try:
+            sips = _run(["sips", "-s", "format", "png", str(src), "--out", str(png)])
+            if sips.returncode != 0:
+                direct.stderr += f"\nsips GIF decode fallback failed: {sips.stderr}"
+                return direct
+            retry = _run(_build_command("photo", png, tmp))
+            if retry.returncode == 0:
+                log.warning("       %s: decoded GIF with sips before WebP conversion", src.name)
+            else:
+                retry.stderr = direct.stderr + "\nsips decoded the GIF to PNG, but cwebp still rejected it:\n" + retry.stderr
+            return retry
+        finally:
+            png.unlink(missing_ok=True)
+
+    if src.suffix.lower() not in (".jpg", ".jpeg") or not decode_failure:
         return direct
 
     jpegtran = _jpegtran_path()

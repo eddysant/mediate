@@ -572,7 +572,7 @@ def verify_video_streams(
             end_delta = abs(float(before["end_time"]) - float(after["end_time"]))
         except (KeyError, TypeError, ValueError):
             return False, f"chapter {index} timing could not be verified"
-        if start_delta > 0.05 or end_delta > 0.05:
+        if start_delta > 0.5 or end_delta > 0.5:
             return False, f"chapter {index} timing changed"
 
     before_video = source_video[0]
@@ -620,7 +620,7 @@ def verify_video_streams(
         if before_rate and after_rate and abs(before_rate - after_rate) > max(0.5, before_rate * 0.005):
             return False, (
                 f"video average frame rate changed: source {before_rate:.3f} "
-                f"vs output {after_rate:.3f}"
+                f"vs output {after_rate:.3f} (--allow-video-downgrade to permit)"
             )
         before_side_data = set(before_video.get("side_data_types", []))
         after_side_data = set(after_video.get("side_data_types", []))

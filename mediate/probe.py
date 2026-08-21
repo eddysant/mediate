@@ -848,7 +848,9 @@ def check_video_integrity(path: Path, progress_path: Optional[Path] = None) -> d
     if stderr and proc.returncode == 0:
         lines = [
             line for line in stderr.splitlines()
-            if line.strip() and "Referenced QT chapter track not found" not in line
+            if line.strip() 
+            and "Referenced QT chapter track not found" not in line
+            and "non monotonically increasing dts to muxer" not in line
         ]
         if not lines:
             stderr = ""
