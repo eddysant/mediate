@@ -375,6 +375,10 @@ def apply_renames(plans: List[Rename], root: Path, dry_run: bool) -> Tuple[int, 
         deferred: List[Rename] = []
         progress = False
         for p in pending:
+            if any(s != p.src and s.is_relative_to(p.src) for s in sources):
+                deferred.append(p)
+                continue
+            
             occupied = p.dst.exists()
             if occupied:
                 try:
