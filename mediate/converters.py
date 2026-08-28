@@ -75,6 +75,7 @@ class Options:
     allow_stream_removal: bool = False
     allow_video_downgrade: bool = False
     validate_existing: bool = False
+    output_format: str = "webp"  # "webp" | "avif"
     dispose: Optional[Disposer] = None
     dispose_label: str = "delete original"
     transaction_root: Optional[Path] = None
@@ -216,8 +217,14 @@ def _build_command(
     inventory: Optional[dict] = None,
     repair: bool = False,
     copy_video: bool = False,
+    output_format: str = "webp",
 ) -> List[str]:
     if kind == "photo":
+        if output_format == "avif":
+            return [
+                "avifenc", "--lossless", "--jobs", "all",
+                str(input_path), str(output_path),
+            ]
         return [
             "cwebp", "-lossless", "-metadata", "all", "-preset", "photo",
             str(input_path), "-o", str(output_path),
@@ -297,12 +304,16 @@ def _apple_video_tag(inventory: dict) -> str:
     return "hvc1" if videos and videos[0].get("codec_name") == "hevc" else "avc1"
 
 
-def intended_output(job: MediaJob) -> Path:
+def intended_output(job: MediaJob, output_format: str = "webp") -> Path:
     """The final path a job will produce, used to detect two inputs that
     map to the same output name before any conversion starts."""
-    return job.output or job.path.with_suffix(
-        ".webp" if job.kind in ("photo", "heic") else ".mp4"
-    )
+    if job.output:
+        return job.output
+    if job.kind in ("photo", "heic"):
+        ext = ".avif" if output_format == "avif" else ".webp"
+    else:
+        ext = ".mp4"
+    return job.path.with_suffix(ext)
 
 
 def unique_output_path(preferred: Path, unavailable=()) -> Path:
@@ -357,9 +368,12 @@ def _jpegtran_path() -> Optional[str]:
     return None
 
 
-def _convert_photo(src: Path, tmp: Path) -> subprocess.CompletedProcess:
+def _convert_photo(src: Path, tmp: Path, output_format: str = "webp") -> subprocess.CompletedProcess:
     """Convert a still, losslessly normalising a damaged JPEG if needed."""
-    direct = _run(_build_command("photo", src, tmp))
+    direct = _run(_build_command("photo", src, tmp, output_format=output_format))
+    # avifenc error messages differ from cwebp; only trigger repair for cwebp failures
+    if output_format == "avif":
+        return direct
     decode_failure = any(
         marker in direct.stderr
         for marker in (
@@ -381,7 +395,7 @@ def _convert_photo(src: Path, tmp: Path) -> subprocess.CompletedProcess:
             if sips.returncode != 0:
                 direct.stderr += f"\nsips GIF decode fallback failed: {sips.stderr}"
                 return direct
-            retry = _run(_build_command("photo", png, tmp))
+            retry = _run(_build_command("photo", png, tmp, output_format=output_format))
             if retry.returncode == 0:
                 log.warning("       %s: decoded GIF with sips before WebP conversion", src.name)
             else:
@@ -419,7 +433,7 @@ def _convert_photo(src: Path, tmp: Path) -> subprocess.CompletedProcess:
                 direct.stderr + f"\nLossless jpegtran repair failed: {detail}",
             )
         tmp.unlink(missing_ok=True)
-        retry = _run(_build_command("photo", repaired, tmp))
+        retry = _run(_build_command("photo", repaired, tmp, output_format=output_format))
         if retry.returncode == 0:
             log.warning(
                 "       %s: repaired truncated JPEG losslessly with jpegtran before conversion",
@@ -460,7 +474,7 @@ def _explain_source_truncation(reason: str, stderr: str) -> str:
 
 
 def _repair_photo_metadata(src: Path, output: Path) -> bool:
-    """Ask ExifTool to restore WebP-compatible metadata cwebp omitted."""
+    """Ask ExifTool to restore WebP/AVIF-compatible metadata the encoder omitted."""
     if not exiftool_available():
         return False
     result = run_exiftool([
@@ -486,11 +500,12 @@ def _convert(
     inventory: Optional[dict] = None,
     repair: bool = False,
     copy_video: bool = False,
+    output_format: str = "webp",
 ) -> subprocess.CompletedProcess:
     """Run the conversion subprocess(es) for a job. HEIC goes through a
     two-step pipeline: sips (built into macOS, decodes HEVC-compressed
     stills that cwebp cannot read) to a temporary PNG, then the normal
-    lossless cwebp encode. PNG specifically: sips copies the EXIF block
+    lossless cwebp/avifenc encode. PNG specifically: sips copies the EXIF block
     into it and cwebp extracts EXIF from PNG — with a TIFF intermediate
     cwebp drops the metadata ("EXIF extraction from TIFF is unsupported")."""
     if kind in ("video", "gif"):
@@ -526,7 +541,7 @@ def _convert(
         finally:
             encode_output.unlink(missing_ok=True)
     if kind == "photo":
-        return _convert_photo(src, tmp)
+        return _convert_photo(src, tmp, output_format=output_format)
     if kind != "heic":
         return _run(_build_command(kind, src, tmp))
 
@@ -535,7 +550,7 @@ def _convert(
         sips = _run(["sips", "-s", "format", "png", str(src), "--out", str(png)])
         if sips.returncode != 0:
             return sips
-        return _run(_build_command("photo", png, tmp))
+        return _run(_build_command("photo", png, tmp, output_format=output_format))
     finally:
         png.unlink(missing_ok=True)
 
@@ -665,8 +680,10 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
         if sys.platform != "darwin":
             return Outcome(SKIPPED, src, "HEIC conversion requires macOS (sips)")
 
-    new_ext = ".webp" if kind in ("photo", "heic") else ".mp4"
-    final = intended_output(job)
+    new_ext = (
+        f".{opts.output_format}" if kind in ("photo", "heic") else ".mp4"
+    )
+    final = intended_output(job, output_format=opts.output_format)
 
     # Re-encoding a non-standard .mp4 targets its own name; that only works
     # if the original is removed first, so pick a new name when keeping it.
@@ -733,6 +750,8 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
         convert_options = {"repair": stage == "repair-encode"}
         if stage == "convert" and copy_video:
             convert_options["copy_video"] = True
+        if opts.output_format != "webp":
+            convert_options["output_format"] = opts.output_format
         return _convert(
             kind if stage == "convert" else "video",
             src,
@@ -755,7 +774,7 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
         )
         if not valid:
             return valid, why
-        if new_ext == ".webp":
+        if new_ext in (".webp", ".avif"):
             metadata_result = verify_photo_metadata(src, tmp)
             if metadata_result[0]:
                 return metadata_result

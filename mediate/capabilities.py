@@ -178,12 +178,29 @@ def _check_ffmpeg(
         report.errors.append(f"FFmpeg smoke test could not complete: {exc}; {_install_hint()}")
 
 
+def _check_avifenc(report: CapabilityReport) -> None:
+    if not _check_binary("avifenc", report):
+        return
+    try:
+        proc = _run(["avifenc", "--version"])
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        report.errors.append(f"avifenc could not start: {exc}; install with `brew install libavif`")
+        return
+    if proc.returncode not in (0, 1):  # avifenc --version exits 1 on some builds
+        report.errors.append("avifenc self-check failed; install with `brew install libavif`")
+        return
+    report.versions["avifenc"] = _first_line(proc)
+
+
 def check_media_capabilities(
-    *, require_video: bool, require_photos: bool, require_animated_webp: bool = False
+    *, require_video: bool, require_photos: bool, require_animated_webp: bool = False,
+    require_avif: bool = False,
 ) -> CapabilityReport:
     report = CapabilityReport()
     if require_video or require_animated_webp:
         _check_ffmpeg(report, require_animated_webp=require_animated_webp)
     if require_photos:
         _check_cwebp(report)
+    if require_avif:
+        _check_avifenc(report)
     return report

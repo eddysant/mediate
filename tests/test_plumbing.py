@@ -415,5 +415,56 @@ class ProbeCacheIdentityTests(unittest.TestCase):
             self.assertEqual(probe._cached(kind, path, compute, strong=True), 2)
 
 
+class WorkerResolutionTests(unittest.TestCase):
+    def test_explicit_integer_workers(self):
+        from mediate.cli import _resolve_workers
+
+        self.assertEqual(_resolve_workers("4", has_video=True), 4)
+        self.assertEqual(_resolve_workers("1", has_video=False), 1)
+        self.assertEqual(_resolve_workers("invalid", has_video=True), 2)
+        self.assertEqual(_resolve_workers("0", has_video=True), 2)
+        self.assertEqual(_resolve_workers("-5", has_video=True), 2)
+
+    def test_auto_workers(self):
+        from unittest.mock import patch
+        from mediate.cli import _resolve_workers
+
+        with patch("os.cpu_count", return_value=16):
+            self.assertEqual(_resolve_workers("auto", has_video=True), 8)
+            self.assertEqual(_resolve_workers("auto", has_video=False), 16)
+        with patch("os.cpu_count", return_value=4):
+            self.assertEqual(_resolve_workers("auto", has_video=True), 4)
+            self.assertEqual(_resolve_workers("auto", has_video=False), 4)
+        with patch("os.cpu_count", return_value=None):
+            self.assertEqual(_resolve_workers("auto", has_video=True), 2)
+            self.assertEqual(_resolve_workers("auto", has_video=False), 2)
+
+
+class AvifConverterTests(unittest.TestCase):
+    def test_intended_output_respects_format(self):
+        from mediate.converters import intended_output
+        from mediate.scanner import MediaJob
+
+        photo_job = MediaJob(Path("photo.jpg"), "photo")
+        heic_job = MediaJob(Path("image.heic"), "heic")
+        video_job = MediaJob(Path("video.mov"), "video")
+
+        self.assertEqual(intended_output(photo_job, output_format="webp"), Path("photo.webp"))
+        self.assertEqual(intended_output(photo_job, output_format="avif"), Path("photo.avif"))
+        self.assertEqual(intended_output(heic_job, output_format="avif"), Path("image.avif"))
+        self.assertEqual(intended_output(video_job, output_format="avif"), Path("video.mp4"))
+
+    def test_build_command_photo_avif(self):
+        from mediate.converters import _build_command
+
+        webp_cmd = _build_command("photo", Path("in.jpg"), Path("out.webp"), output_format="webp")
+        avif_cmd = _build_command("photo", Path("in.jpg"), Path("out.avif"), output_format="avif")
+
+        self.assertEqual(webp_cmd[0], "cwebp")
+        self.assertEqual(avif_cmd[0], "avifenc")
+        self.assertIn("--lossless", avif_cmd)
+
+
 if __name__ == "__main__":
     unittest.main()
+

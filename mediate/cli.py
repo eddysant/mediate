@@ -300,12 +300,21 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="permanently delete originals instead of moving them to the Trash",
     )
     parser.add_argument(
+        "--output-format",
+        choices=["webp", "avif"],
+        default="webp",
+        metavar="FORMAT",
+        help="photo output format: webp (default, lossless via cwebp) or avif "
+        "(lossless via avifenc — install with `brew install libavif`; "
+        "note: lossless AVIF is often larger than lossless WebP for photos)",
+    )
+    parser.add_argument(
         "--workers",
-        type=int,
-        default=2,
+        type=str,
+        default="auto",
         metavar="N",
-        help="concurrent conversions (default: 2; ffmpeg is multithreaded on its own, "
-        "so high values mostly help photo-heavy libraries)",
+        help="concurrent conversions: an integer, or 'auto' to use the CPU count "
+        "(default: auto — caps at 8 for video-heavy runs, uncapped for photos)",
     )
     parser.add_argument(
         "--log-file",
@@ -317,6 +326,22 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--verbose", action="store_true", help="show debug output on the console")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser.parse_args(argv)
+
+
+def _resolve_workers(workers_arg: str, has_video: bool) -> int:
+    """Resolve --workers value to a concrete integer."""
+    if str(workers_arg).lower() != "auto":
+        try:
+            n = int(workers_arg)
+            if n < 1:
+                raise ValueError
+            return n
+        except ValueError:
+            return 2  # safe fallback for unexpected values
+    cpus = os.cpu_count() or 2
+    # ffmpeg is already multithreaded; high worker counts mostly help photo-heavy
+    # libraries. Cap video-heavy runs to avoid thrashing on concurrent encodes.
+    return min(cpus, 8) if has_video else cpus
 
 
 def setup_logging(log_path: Path, verbose: bool) -> None:
@@ -408,6 +433,7 @@ def main(argv=None) -> int:
         allow_stream_removal=args.allow_stream_removal,
         allow_video_downgrade=args.allow_video_downgrade,
         validate_existing=args.validate_existing,
+        output_format=args.output_format,
         dispose=dispose,
         dispose_label=dispose_label,
         transaction_root=root,
@@ -430,15 +456,17 @@ def main(argv=None) -> int:
     recognized, previously_converted = _filter_completed_conversions(
         recognized, completed_conversion_output
     )
+    has_video = any(job.kind in {"video", "mp4", "gif", "webp"} for job in recognized)
+    has_photos = any(
+        job.kind == "photo" or (job.kind == "heic" and args.convert_heic)
+        for job in recognized
+    )
+    workers = _resolve_workers(args.workers, has_video=has_video)
     capability_report = check_media_capabilities(
-        require_video=any(
-            job.kind in {"video", "mp4", "gif", "webp"} for job in recognized
-        ),
-        require_photos=any(
-            job.kind == "photo" or (job.kind == "heic" and args.convert_heic)
-            for job in recognized
-        ),
+        require_video=has_video,
+        require_photos=has_photos,
         require_animated_webp=any(job.kind == "webp" for job in recognized),
+        require_avif=has_photos and args.output_format == "avif",
     )
     for name, version in capability_report.versions.items():
         log.debug("toolchain: %s: %s", name, version)
@@ -459,7 +487,7 @@ def main(argv=None) -> int:
             mp4_status,
             {MP4_STANDARD} if args.reencode_hevc else {MP4_STANDARD, MP4_HEVC},
             health_fn=_existing_mp4_health,
-            workers=args.workers,
+            workers=workers,
             validate_health=args.validate_existing,
         )
     except KeyboardInterrupt:
@@ -550,7 +578,7 @@ def main(argv=None) -> int:
     for outcome in planned_skips:
         tally[outcome.status] += 1
         log.info("%-6s %s %s", STATUS_MARKS[outcome.status], outcome.path.relative_to(root), outcome.detail)
-    pool = ThreadPoolExecutor(max_workers=max(1, args.workers))
+    pool = ThreadPoolExecutor(max_workers=max(1, workers))
     futures = {pool.submit(process_journaled, job): job for job in runnable}
     interrupted = False
     try:

@@ -7,14 +7,14 @@ validation checklist (and even then, it goes to the Trash, not oblivion).
 
 | Input | Output | Tool |
 |---|---|---|
-| JPEG / PNG / TIFF | Lossless WebP (`-metadata all` preserves EXIF/ICC/dates) | `cwebp` |
-| HEIC / HEIF (opt-in, macOS) | Lossless WebP via a sips PNG intermediate, EXIF preserved | `sips` + `cwebp` |
+| JPEG / PNG / TIFF | Lossless WebP (default, `cwebp`) or lossless AVIF (`--output-format avif`, `avifenc`) | `cwebp` / `avifenc` |
+| HEIC / HEIF (opt-in, macOS) | Lossless WebP / AVIF via a sips PNG intermediate, EXIF preserved | `sips` + `cwebp` / `avifenc` |
 | MOV / MKV / AVI / WMV / WebM / ASF / VOB / legacy video | MP4 (h264 `-crf 18 -preset slow`, AAC 256k, `yuv420p`) | `ffmpeg` |
 | Animated GIF / animated WebP | MP4 (`faststart`, even-dimension scale filter) | `ffmpeg` |
 
 Skipped automatically:
 
-- Static `.webp`, hidden files/directories (`.DS_Store` etc.), static GIFs.
+- Static `.webp`, static `.avif`, hidden files/directories (`.DS_Store` etc.), static GIFs.
 - MP4s already h264/8-bit 4:2:0/AAC (including FFmpeg's full-range
   `yuvj420p` alias, checked with `ffprobe`).
 - **HEVC MP4s** — smaller than h264 and Apple-native; re-encoding them to
@@ -52,6 +52,8 @@ goes through ffprobe preflight and the same strict validation pipeline.
 - `cwebp`, `ffmpeg`, `ffprobe` on PATH: `brew install webp ffmpeg`. FFmpeg 9+
   is required only when animated WebPs are present; other formats retain the
   FFmpeg 6 minimum.
+- `avifenc` from `libavif` is optional and used when `--output-format avif` is
+  selected: `brew install libavif`.
 - `jpegtran` from jpeg-turbo is optional for direct installs and enables
   automatic lossless recovery of truncated JPEGs. The Homebrew mediate formula
   includes it: `brew install jpeg-turbo`.
@@ -163,8 +165,10 @@ Options:
 - `--plan-file PATH` / `--apply-plan PATH` — write the proposed renames as
   editable JSON instead of applying, then apply the (possibly hand-edited)
   plan later. Applied plans are recorded for `--undo-renames` like any batch.
-- `--workers N` — concurrent conversions (default 2; ffmpeg is already
-  multithreaded, so higher values mainly help photo-heavy libraries).
+- `--output-format {webp,avif}` — photo output format: `webp` (default, lossless
+  via `cwebp`) or `avif` (lossless via `avifenc` — install with `brew install libavif`).
+- `--workers N` — concurrent conversions: an integer, or `auto` to use the CPU count
+  (default: `auto` — caps at 8 for video-heavy runs, uncapped for photos).
 - `--log-file PATH` — detailed log location (default: `conversion.log` inside
   the target directory; console shows one line per file, the log adds
   timestamps and full converter stderr on failures).

@@ -17,14 +17,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Ensure FFmpeg integration dependencies
+      - name: Install media tools (Linux)
         if: runner.os == 'Linux'
         run: |
           if ! command -v ffmpeg >/dev/null; then
             sudo apt-get update
-            sudo apt-get install -y ffmpeg
+            sudo apt-get install -y ffmpeg webp
           fi
           ffmpeg -hide_banner -encoders 2>&1 | grep -q libx264
+      - name: Install media tools (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install ffmpeg webp libavif
       - name: Run unit tests
         env:
           MEDIATE_CONFIG: /nonexistent
@@ -36,12 +40,19 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha256: ${{ steps.zipapp.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Resolve version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
       - name: Build zipapp
+        id: zipapp
         run: |
           mkdir -p build/zipapp dist
           cp -R mediate build/zipapp/mediate
@@ -49,10 +60,36 @@ jobs:
           python -m zipapp build/zipapp -o dist/mediate.pyz -p "/usr/bin/env python3" -c
           chmod +x dist/mediate.pyz
           ./dist/mediate.pyz --version
+          echo "sha256=$(sha256sum dist/mediate.pyz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" dist/mediate.pyz \
-            --title "mediate ${GITHUB_REF_NAME#v}" \
+            --title "mediate ${{ steps.version.outputs.version }}" \
             --generate-notes
+
+  tap-update:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: eddysant/homebrew-tap
+          token: ${{ secrets.TAP_TOKEN }}
+      - name: Update formula
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          SHA=$(curl -sL "https://github.com/eddysant/mediate/archive/refs/tags/${TAG}.tar.gz" | sha256sum | cut -d' ' -f1)
+          sed -i "s|refs/tags/v[0-9.]*.tar.gz|refs/tags/${TAG}.tar.gz|" Formula/mediate.rb
+          sed -i "s|sha256 \"[a-f0-9]*\"|sha256 \"${SHA}\"|" Formula/mediate.rb
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/mediate.rb
+          git diff --cached --quiet || git commit -m "mediate ${VERSION}"
+          git push
+

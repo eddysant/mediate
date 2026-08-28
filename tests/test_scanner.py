@@ -68,6 +68,7 @@ class ScannerTests(unittest.TestCase):
         self.touch(".hidden.jpg")
         self.touch(".secret/inside.jpg")
         self.touch("already.webp")
+        self.touch("already.avif")
         self.webp("static.webp", 0x00)
         self.touch("notes.txt")
         self.touch("conversion.log")

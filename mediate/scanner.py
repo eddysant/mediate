@@ -85,6 +85,8 @@ def iter_media(root: Path) -> Iterator[MediaJob]:
                 yield MediaJob(path, "gif")
             elif ext in WEBP_EXTS and webp_animation_info(path)["animated"]:
                 yield MediaJob(path, "webp")
+            elif ext == ".avif":
+                pass  # already a standardized photo output; skip
             elif ext in VIDEO_EXTS:
                 yield MediaJob(path, "video")
             elif ext in MP4_EXTS:
