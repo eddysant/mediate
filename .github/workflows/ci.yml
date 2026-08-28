@@ -70,7 +70,7 @@ jobs:
             --generate-notes
 
   tap-update:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') && secrets.TAP_TOKEN != ''
     needs: release
     runs-on: ubuntu-latest
     steps:
