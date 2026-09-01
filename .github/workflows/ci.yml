@@ -27,6 +27,9 @@ jobs:
           ffmpeg -hide_banner -encoders 2>&1 | grep -q libx264
       - name: Install media tools (macOS)
         if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_REQUIRE_TAP_TRUST: 1
+          HOMEBREW_NO_ENV_HINTS: 1
         run: |
           brew install ffmpeg webp libavif
       - name: Run unit tests
@@ -70,7 +73,7 @@ jobs:
             --generate-notes
 
   tap-update:
-    if: startsWith(github.ref, 'refs/tags/v') && secrets.TAP_TOKEN != ''
+    if: startsWith(github.ref, 'refs/tags/v') && secrets.TAP_TOKEN
     needs: release
     runs-on: ubuntu-latest
     steps:

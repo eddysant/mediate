@@ -58,8 +58,9 @@ def save_probe_cache() -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         # Unbounded growth guard: a fresh start is cheaper than an LRU.
-        data = _cache if len(_cache) <= 200_000 else {}
-        path.write_text(json.dumps(data), encoding="utf-8")
+        if len(_cache) > 200_000:
+            _cache.clear()
+        path.write_text(json.dumps(_cache), encoding="utf-8")
     except OSError as exc:
         log.debug("could not write probe cache: %s", exc)
 

@@ -271,7 +271,6 @@ def plan_renames(root: Path, date_prefix: bool = False) -> List[Rename]:
     groups: Dict[Tuple, List[_Member]] = {}
     movs: List[_Member] = []
     sidecars: List[Path] = []
-    prefixed: List[Rename] = []
 
     def finalize(path: Path, new_stem: str, ext: str) -> str:
         if date_prefix and not DATE_START_RE.match(new_stem):

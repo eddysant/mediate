@@ -236,7 +236,8 @@ def verify_photo_metadata(src: Path, output: Path) -> Tuple[bool, str]:
         if (ext in (".jpg", ".jpeg") and b"Exif\x00\x00" in head) or (
             ext == ".png" and b"eXIf" in head
         ):
-            if b"EXIF" not in output.read_bytes():
+            out_head = output.open("rb").read(256 * 1024)
+            if b"EXIF" not in out_head and b"Exif" not in out_head:
                 return False, "source EXIF block missing from output WebP"
     except OSError as exc:
         return False, f"metadata check failed to read files: {exc}"

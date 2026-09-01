@@ -82,11 +82,7 @@ def _matches(path: Path, expected: dict, *, output: bool = False) -> bool:
 
 
 def _inside(path: Path, root: Path) -> bool:
-    try:
-        path.resolve().relative_to(root.resolve())
-        return True
-    except ValueError:
-        return False
+    return path.resolve().is_relative_to(root.resolve())
 
 
 @dataclass
