@@ -92,6 +92,15 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   natively. `--reencode-hevc` opts into the size hit for non-Apple targets.
 - **Validation requires empty stderr, not just exit 0**, on the video integrity
   pass — ffmpeg reports many corruptions on stderr while still exiting 0.
+- **Container signalling is exempt from removal risks** (`probe.py`):
+  `dvd_nav_packet` (every ripped DVD VOB), `epg`, and `scte_35` are data
+  streams describing seek points/menus or broadcast splicing. They exist only
+  inside their source container, have no MP4 representation, and carry no
+  content — so, like the MOV chapter carrier, they are not counted as
+  removable. Counting them made *every* VOB need `--allow-stream-removal`,
+  which would then also have permitted discarding real subtitles. DVD bitmap
+  subtitles (`dvd_subtitle`) still block: MP4 cannot carry VOBSUB, so that
+  loss is real and stays opt-in.
 - **Stream-inventory failures fail closed**: a video is skipped because it is
   unsafe to alter without knowing what it contains. Narrow codec/GIF probes
   still fail open into conversion/validation where no destructive stream

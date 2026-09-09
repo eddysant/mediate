@@ -647,6 +647,28 @@ def _is_chapter_carrier(stream: dict, inventory: dict) -> bool:
     )
 
 
+# Container plumbing, not content. A DVD program stream (VOB) carries a
+# navigation packet stream describing seek points, angles, and menu buttons;
+# broadcast captures (.ts/.m2ts) carry programme-guide and ad-splice
+# signalling. All three are meaningful only inside their original container,
+# are regenerated rather than transported, and have no MP4 representation —
+# so there is nothing for a conversion to lose. Counting them as removable
+# content made every ripped DVD unconvertible without --allow-stream-removal,
+# a flag that would then have permitted discarding real subtitles too.
+CONTAINER_SIGNALLING_CODECS = frozenset({
+    "dvd_nav_packet",  # DVD navigation packets (VOB)
+    "epg",             # Electronic Programme Guide (MPEG-TS)
+    "scte_35",         # SCTE-35 splice messages (MPEG-TS)
+})
+
+
+def _is_container_signalling(stream: dict) -> bool:
+    return (
+        stream.get("codec_type") == "data"
+        and stream.get("codec_name") in CONTAINER_SIGNALLING_CODECS
+    )
+
+
 def stream_removal_risks(inventory: dict) -> List[str]:
     """Describe streams the MP4 standardisation command cannot preserve.
 
@@ -677,6 +699,7 @@ def stream_removal_risks(inventory: dict) -> List[str]:
         stream for stream in inventory.get("streams", [])
         if stream.get("codec_type") not in ("video", "audio", "subtitle")
         and not _is_chapter_carrier(stream, inventory)
+        and not _is_container_signalling(stream)
         and stream not in artwork
         and stream not in preservable_artwork
     ]

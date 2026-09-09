@@ -141,6 +141,51 @@ class StreamPreflightTests(unittest.TestCase):
         )
         self.assertEqual(stream_removal_risks(inventory), [])
 
+    def test_dvd_navigation_packets_are_not_removable_content(self):
+        # A ripped DVD VOB always carries a navigation packet stream. It is
+        # container plumbing with no MP4 representation, so counting it as a
+        # removable stream made every such file unconvertible without
+        # --allow-stream-removal.
+        inventory = _inventory(
+            _stream("video", "mpeg2video"),
+            _stream("audio", "ac3", index=1, tags={"language": "eng"}),
+            _stream("audio", "ac3", index=2, tags={"language": "fra"}),
+            _stream("data", "dvd_nav_packet", index=3),
+        )
+        self.assertEqual(stream_removal_risks(inventory), [])
+
+    def test_broadcast_signalling_streams_are_not_removable_content(self):
+        for codec in ("epg", "scte_35"):
+            with self.subTest(codec=codec):
+                inventory = _inventory(
+                    _stream("video", "h264"),
+                    _stream("audio", "aac", index=1),
+                    _stream("data", codec, index=2),
+                )
+                self.assertEqual(stream_removal_risks(inventory), [])
+
+    def test_dvd_bitmap_subtitles_are_still_blocked(self):
+        # MP4 genuinely cannot carry VOBSUB, so this must keep warning even
+        # though the navigation stream beside it is now exempt.
+        inventory = _inventory(
+            _stream("video", "mpeg2video"),
+            _stream("audio", "ac3", index=1),
+            _stream("subtitle", "dvd_subtitle", index=2, tags={"language": "eng"}),
+            _stream("subtitle", "dvd_subtitle", index=3, tags={"language": "fra"}),
+            _stream("data", "dvd_nav_packet", index=4),
+        )
+        risks = stream_removal_risks(inventory)
+        self.assertEqual(len(risks), 1, risks)
+        self.assertIn("2 subtitle track(s) (dvd_subtitle)", risks[0])
+
+    def test_an_unrecognized_data_stream_still_fails_closed(self):
+        inventory = _inventory(
+            _stream("video", "mpeg2video"),
+            _stream("audio", "ac3", index=1),
+            _stream("data", "klv", index=2),
+        )
+        self.assertEqual(stream_removal_risks(inventory), ["1 unsupported data stream(s)"])
+
     def test_matroska_image_attachment_is_reported_as_artwork(self):
         artwork = _stream(
             "attachment",
