@@ -60,7 +60,16 @@ def save_probe_cache() -> None:
         # Unbounded growth guard: a fresh start is cheaper than an LRU.
         if len(_cache) > 200_000:
             _cache.clear()
-        path.write_text(json.dumps(_cache), encoding="utf-8")
+        # Written atomically like the journal and transaction manifests: a
+        # crash or a second concurrent run must not leave a truncated cache
+        # that silently discards expensive --validate-existing decode results.
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        try:
+            tmp.write_text(json.dumps(_cache), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            tmp.unlink(missing_ok=True)
+            raise
     except OSError as exc:
         log.debug("could not write probe cache: %s", exc)
 

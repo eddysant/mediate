@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 MINIMUM_FFMPEG = (6, 0)
 
@@ -49,10 +50,13 @@ def _install_hint() -> str:
     return "install/upgrade with `brew install ffmpeg webp` (or your system package manager)"
 
 
-def _check_binary(name: str, report: CapabilityReport) -> bool:
+AVIF_INSTALL_HINT = "install with `brew install libavif` (or your system package manager)"
+
+
+def _check_binary(name: str, report: CapabilityReport, hint: Optional[str] = None) -> bool:
     if shutil.which(name) is not None:
         return True
-    report.errors.append(f"{name} is not on PATH; {_install_hint()}")
+    report.errors.append(f"{name} is not on PATH; {hint or _install_hint()}")
     return False
 
 
@@ -179,15 +183,15 @@ def _check_ffmpeg(
 
 
 def _check_avifenc(report: CapabilityReport) -> None:
-    if not _check_binary("avifenc", report):
+    if not _check_binary("avifenc", report, AVIF_INSTALL_HINT):
         return
     try:
         proc = _run(["avifenc", "--version"])
     except (OSError, subprocess.TimeoutExpired) as exc:
-        report.errors.append(f"avifenc could not start: {exc}; install with `brew install libavif`")
+        report.errors.append(f"avifenc could not start: {exc}; {AVIF_INSTALL_HINT}")
         return
     if proc.returncode not in (0, 1):  # avifenc --version exits 1 on some builds
-        report.errors.append("avifenc self-check failed; install with `brew install libavif`")
+        report.errors.append(f"avifenc self-check failed; {AVIF_INSTALL_HINT}")
         return
     report.versions["avifenc"] = _first_line(proc)
 

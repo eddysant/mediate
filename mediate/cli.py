@@ -310,7 +310,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--workers",
-        type=str,
+        type=_workers_arg,
         default="auto",
         metavar="N",
         help="concurrent conversions: an integer, or 'auto' to use the CPU count "
@@ -328,8 +328,27 @@ def parse_args(argv=None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _workers_arg(value: str) -> str:
+    """Validate --workers at parse time.
+
+    A silent fallback here would hand the user a pool size they did not ask
+    for, so argparse rejects anything that is neither 'auto' nor a positive
+    integer.
+    """
+    if str(value).lower() == "auto":
+        return "auto"
+    try:
+        if int(value) < 1:
+            raise ValueError
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected a positive integer or 'auto', got {value!r}"
+        ) from None
+    return str(value)
+
+
 def _resolve_workers(workers_arg: str, has_video: bool) -> int:
-    """Resolve --workers value to a concrete integer."""
+    """Resolve a validated --workers value to a concrete integer."""
     if str(workers_arg).lower() != "auto":
         try:
             n = int(workers_arg)
@@ -337,7 +356,7 @@ def _resolve_workers(workers_arg: str, has_video: bool) -> int:
                 raise ValueError
             return n
         except ValueError:
-            return 2  # safe fallback for unexpected values
+            return 2  # defensive: direct callers bypass argparse validation
     cpus = os.cpu_count() or 2
     # ffmpeg is already multithreaded; high worker counts mostly help photo-heavy
     # libraries. Cap video-heavy runs to avoid thrashing on concurrent encodes.
@@ -345,6 +364,15 @@ def _resolve_workers(workers_arg: str, has_video: bool) -> int:
 
 
 def setup_logging(log_path: Path, verbose: bool) -> None:
+    """Attach the console and file handlers for one run.
+
+    Handlers installed by a previous run in the same process are closed and
+    removed first: otherwise a second main() call duplicates every line and
+    keeps the earlier run's conversion.log open.
+    """
+    for handler in list(log.handlers):
+        log.removeHandler(handler)
+        handler.close()
     log.setLevel(logging.DEBUG)
 
     LIVE_PROGRESS.configure(sys.stdout, enabled=True)
@@ -531,7 +559,11 @@ def main(argv=None) -> int:
         if job.path in protected:
             planned_skips.append(Outcome(SKIPPED, job.path, protected[job.path]))
             continue
-        out = intended_output(job)
+        # The output format must match what process_job will actually produce:
+        # a claimed name is stored on the job and used verbatim as the final
+        # path, so computing it with the wrong extension would write (say)
+        # AVIF bytes into a .webp name and stop real collisions being claimed.
+        out = intended_output(job, output_format=args.output_format)
         if out != job.path and (out in claimed or out.exists()):
             out = unique_output_path(out, claimed)
             job = replace(job, output=out)

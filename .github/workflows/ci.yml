@@ -9,14 +9,18 @@ on:
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        # 3.9 is the floor declared in pyproject.toml; test it so the floor
+        # stays honest, and the current stable release alongside it.
+        python-version: ["3.9", "3.12"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
       - name: Install media tools (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -54,6 +58,17 @@ jobs:
       - name: Resolve version
         id: version
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Check the tag matches the packaged version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          PKG=$(python -c 'import mediate; print(mediate.__version__)')
+          PROJ=$(python -c 'import tomllib,pathlib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')
+          echo "tag=$VERSION mediate.__version__=$PKG pyproject=$PROJ"
+          if [ "$PKG" != "$VERSION" ] || [ "$PROJ" != "$VERSION" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match __init__.py ($PKG) and/or pyproject.toml ($PROJ); bump both before tagging"
+            exit 1
+          fi
       - name: Build zipapp
         id: zipapp
         run: |
@@ -62,7 +77,8 @@ jobs:
           printf 'import sys\n\nfrom mediate.cli import main\n\nsys.exit(main())\n' > build/zipapp/__main__.py
           python -m zipapp build/zipapp -o dist/mediate.pyz -p "/usr/bin/env python3" -c
           chmod +x dist/mediate.pyz
-          ./dist/mediate.pyz --version
+          # The built artifact must report the version it is released under.
+          test "$(./dist/mediate.pyz --version)" = "mediate ${{ steps.version.outputs.version }}"
           echo "sha256=$(sha256sum dist/mediate.pyz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - name: Create release
         env:
@@ -73,21 +89,34 @@ jobs:
             --generate-notes
 
   tap-update:
-    if: startsWith(github.ref, 'refs/tags/v') && secrets.TAP_TOKEN
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: release
     runs-on: ubuntu-latest
     steps:
+      - name: Check for tap token
+        id: tap_token
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          if [ -n "$TAP_TOKEN" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "TAP_TOKEN is not set; skipping tap update." >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Checkout homebrew-tap
+        if: steps.tap_token.outputs.present == 'true'
         uses: actions/checkout@v4
         with:
           repository: eddysant/homebrew-tap
           token: ${{ secrets.TAP_TOKEN }}
       - name: Update formula
+        if: steps.tap_token.outputs.present == 'true'
         env:
           VERSION: ${{ needs.release.outputs.version }}
           TAG: ${{ github.ref_name }}
         run: |
-          SHA=$(curl -sL "https://github.com/eddysant/mediate/archive/refs/tags/${TAG}.tar.gz" | sha256sum | cut -d' ' -f1)
+          SHA=$(curl -fsSL --retry 3 "https://github.com/eddysant/mediate/archive/refs/tags/${TAG}.tar.gz" | sha256sum | cut -d' ' -f1)
           sed -i "s|refs/tags/v[0-9.]*.tar.gz|refs/tags/${TAG}.tar.gz|" Formula/mediate.rb
           sed -i "s|sha256 \"[a-f0-9]*\"|sha256 \"${SHA}\"|" Formula/mediate.rb
           git config user.name "github-actions[bot]"

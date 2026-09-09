@@ -2,12 +2,15 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import unittest
 from concurrent.futures import Future
 from pathlib import Path
+from unittest.mock import patch
 
+from mediate.capabilities import CapabilityReport, _check_avifenc
 from mediate.cli import load_config_args
-from mediate.exiftool import exiftool_available, run_exiftool
+from mediate.exiftool import _argfile_safe, exiftool_available, run_exiftool
 from mediate.renamer import Rename, apply_renames, load_plan, plan_renames, write_plan
 
 
@@ -98,6 +101,89 @@ class ExifToolDaemonTests(unittest.TestCase):
     @unittest.skipIf(shutil.which("exiftool"), "exiftool installed")
     def test_returns_none_without_exiftool(self):
         self.assertIsNone(run_exiftool(["-ver"]))
+
+    @unittest.skipUnless(shutil.which("exiftool"), "exiftool not installed")
+    def test_concurrent_queries_do_not_interleave(self):
+        # Each thread gets its own daemon from the pool; a shared daemon must
+        # still answer one query at a time, never splicing two responses.
+        results = []
+        errors = []
+
+        def query():
+            try:
+                results.append(run_exiftool(["-ver"]))
+            except Exception as exc:  # pragma: no cover - failure detail only
+                errors.append(exc)
+
+        threads = [threading.Thread(target=query) for _ in range(12)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(len(set(results)), 1, results)
+        self.assertTrue(results[0].strip())
+
+
+class ExifToolArgumentSafetyTests(unittest.TestCase):
+    """`-@ -` is one argument per line, so a newline would split an argument."""
+
+    def test_newline_arguments_bypass_the_daemon(self):
+        args = ["-s3", "-ContentIdentifier", "/tmp/evil\n-delete_original.jpg"]
+        self.assertFalse(_argfile_safe(args))
+
+    def test_ordinary_arguments_use_the_daemon(self):
+        self.assertTrue(_argfile_safe(["-s3", "-ContentIdentifier", "/tmp/a b.jpg"]))
+        self.assertTrue(_argfile_safe(["-s3", "/tmp/naïve — file.jpg"]))
+
+    def test_a_newline_path_is_sent_as_a_single_argv_entry(self):
+        with patch("mediate.exiftool.exiftool_available", return_value=True), \
+                patch("mediate.exiftool._one_shot") as one_shot, \
+                patch("mediate.exiftool._get_pool") as pool:
+            one_shot.return_value = ""
+            run_exiftool(["-ver", "/tmp/a\nb.jpg"])
+        pool.assert_not_called()
+        one_shot.assert_called_once_with(["-ver", "/tmp/a\nb.jpg"])
+
+
+class AvifInstallHintTests(unittest.TestCase):
+    def test_a_missing_avifenc_names_libavif(self):
+        report = CapabilityReport()
+        with patch("mediate.capabilities.shutil.which", return_value=None):
+            _check_avifenc(report)
+        self.assertEqual(len(report.errors), 1)
+        self.assertIn("libavif", report.errors[0])
+        self.assertNotIn("brew install ffmpeg webp", report.errors[0])
+
+
+class ProbeCacheDurabilityTests(unittest.TestCase):
+    def test_the_cache_is_replaced_atomically(self):
+        from mediate import probe
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "sub" / "probe-cache.json"
+            cache.parent.mkdir()
+            cache.write_text(json.dumps({"previous": 1}), encoding="utf-8")
+            with patch.object(probe, "_cache", {"fresh": {"v": "ok"}}), \
+                    patch.object(probe, "_cache_dirty", True), \
+                    patch.object(probe, "_cache_file", return_value=cache):
+                probe.save_probe_cache()
+            self.assertEqual(json.loads(cache.read_text()), {"fresh": {"v": "ok"}})
+            self.assertEqual(list(cache.parent.iterdir()), [cache], "temp file left behind")
+
+    def test_a_failed_write_leaves_the_previous_cache_intact(self):
+        from mediate import probe
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "probe-cache.json"
+            cache.write_text(json.dumps({"previous": 1}), encoding="utf-8")
+            with patch.object(probe, "_cache", {"fresh": 1}), \
+                    patch.object(probe, "_cache_dirty", True), \
+                    patch.object(probe, "_cache_file", return_value=cache), \
+                    patch("mediate.probe.os.replace", side_effect=OSError("boom")):
+                probe.save_probe_cache()  # must not raise
+            self.assertEqual(json.loads(cache.read_text()), {"previous": 1})
+            self.assertEqual(list(cache.parent.iterdir()), [cache], "temp file left behind")
 
 
 class VideoStreamStatusTests(unittest.TestCase):

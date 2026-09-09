@@ -566,12 +566,27 @@ def _sidecars_of(src: Path):
                 yield candidate
 
 
-def process_job(job: MediaJob, opts: Options) -> Outcome:
+@dataclass
+class Plan:
+    """What classify_job decided a job needs, before anything is written."""
+
+    job: MediaJob
+    kind: str
+    remux: bool = False       # -c copy into MP4 instead of re-encoding
+    copy_video: bool = False  # re-encode audio only, keep the picture bit-for-bit
+    repair: bool = False
+    inventory: Optional[dict] = None
+
+
+def classify_job(job: MediaJob, opts: Options):
+    """Decide how (or whether) to convert a job.
+
+    Every probe-based skip lives here, ahead of any temp file, encode, or
+    disposal, so the safety gates can be exercised without touching the
+    filesystem beyond reading the source. Returns an Outcome when the job is
+    skipped outright, otherwise a Plan describing the work.
+    """
     src = job.path
-    try:
-        source_snapshot = SourceSnapshot.capture(src)
-    except SafetyError as exc:
-        return Outcome(FAILED, src, f"filesystem safety check failed: {exc}")
     kind = job.kind
     remux = False  # set True when we can use -c copy instead of re-encoding
     copy_video = False
@@ -679,6 +694,33 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
             return Outcome(SKIPPED, src, "HEIC (already space-efficient; --convert-heic to convert)")
         if sys.platform != "darwin":
             return Outcome(SKIPPED, src, "HEIC conversion requires macOS (sips)")
+
+    return Plan(
+        job=job,
+        kind=kind,
+        remux=remux,
+        copy_video=copy_video,
+        repair=repair,
+        inventory=inventory,
+    )
+
+
+def process_job(job: MediaJob, opts: Options) -> Outcome:
+    src = job.path
+    try:
+        source_snapshot = SourceSnapshot.capture(src)
+    except SafetyError as exc:
+        return Outcome(FAILED, src, f"filesystem safety check failed: {exc}")
+
+    decision = classify_job(job, opts)
+    if isinstance(decision, Outcome):
+        return decision
+    job = decision.job
+    kind = decision.kind
+    remux = decision.remux
+    copy_video = decision.copy_video
+    repair = decision.repair
+    inventory = decision.inventory
 
     new_ext = (
         f".{opts.output_format}" if kind in ("photo", "heic") else ".mp4"
