@@ -210,9 +210,17 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 - **Homebrew tap** (`eddysant/homebrew-tap`, sibling checkout at
   `~/Code/homebrew-tap`): `Formula/mediate.rb` wraps the release source
   tarball (libexec + PYTHONPATH bin shim on brewed python; ffmpeg/webp as
-  deps, exiftool in caveats). After each release, bump the formula's `url`
-  tag and `sha256` (`curl -sL <tarball> | shasum -a 256`) and push the tap —
-  this is a manual step; CI can't push cross-repo without a PAT.
+  deps, exiftool in caveats). **The bump is automatic and lives in the tap**,
+  not here: `.github/workflows/update-mediate-formula.yml` there reads this
+  repo's latest release on a daily schedule and commits the new `url`/`sha256`
+  to its own repository with the built-in `github.token`. Nothing needs to be
+  done after tagging; `gh workflow run "Update mediate Formula" --repo
+  eddysant/homebrew-tap` forces it immediately.
+  This replaced a `tap-update` job here that pushed cross-repo with a
+  `TAP_TOKEN` PAT. That failed every `v*` build with a 403 — and the failure
+  hid for a while because the tap is public, so the *checkout* succeeded with
+  a token that had no write access. Pulling from the tap side needs no PAT at
+  all, which is why the job is gone rather than repaired.
 
 ## Testing
 

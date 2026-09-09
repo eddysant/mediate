@@ -47,9 +47,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-      sha256: ${{ steps.zipapp.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -87,41 +84,3 @@ jobs:
           gh release create "$GITHUB_REF_NAME" dist/mediate.pyz \
             --title "mediate ${{ steps.version.outputs.version }}" \
             --generate-notes
-
-  tap-update:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: release
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check for tap token
-        id: tap_token
-        env:
-          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
-        run: |
-          if [ -n "$TAP_TOKEN" ]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "TAP_TOKEN is not set; skipping tap update." >> "$GITHUB_STEP_SUMMARY"
-          fi
-      - name: Checkout homebrew-tap
-        if: steps.tap_token.outputs.present == 'true'
-        uses: actions/checkout@v4
-        with:
-          repository: eddysant/homebrew-tap
-          token: ${{ secrets.TAP_TOKEN }}
-      - name: Update formula
-        if: steps.tap_token.outputs.present == 'true'
-        env:
-          VERSION: ${{ needs.release.outputs.version }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          SHA=$(curl -fsSL --retry 3 "https://github.com/eddysant/mediate/archive/refs/tags/${TAG}.tar.gz" | sha256sum | cut -d' ' -f1)
-          sed -i "s|refs/tags/v[0-9.]*.tar.gz|refs/tags/${TAG}.tar.gz|" Formula/mediate.rb
-          sed -i "s|sha256 \"[a-f0-9]*\"|sha256 \"${SHA}\"|" Formula/mediate.rb
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/mediate.rb
-          git diff --cached --quiet || git commit -m "mediate ${VERSION}"
-          git push
-
