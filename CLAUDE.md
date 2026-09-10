@@ -137,6 +137,20 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   intact. The daemon also *checks* its pipes instead of asserting them:
   `python -O` strips `assert`, and the resulting `AttributeError` is not what
   callers catch.
+- **Unnumbered same-base files join the series** (`_assign`): "a b", "a_b"
+  and "a-b" all clean to "A B" and would target one path, where the
+  never-overwrite loop skips all but one — indistinguishable from the tool
+  doing nothing. Extras are numbered instead. The member already carrying the
+  final name keeps it, so an already-standardized library does not churn.
+- **The ancestor check in `apply_renames` must stay a set lookup**: the
+  condition is "p.src is a strict ancestor of a pending source", so the
+  ancestors are collected once per round. Scanning every source per plan is
+  quadratic — measured at 12s for 1,600 renames, extrapolating past three
+  hours for a 50k library before a single file moves.
+- **The rename manifest is written atomically** (`_write_manifest`): it is
+  the only record that makes renames reversible. `undo_last_batch` also
+  survives a single unrestorable entry, and keeps the batch recorded when
+  any entry failed so the remainder can be retried.
 - **Renamer gap-closing needs the deferred-apply loop** (`apply_renames`):
   `[2]→[1], [3]→[2]` — the second rename's target is occupied until the first
   happens. Renames whose target is another pending rename's source wait a

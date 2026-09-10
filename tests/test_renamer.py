@@ -1,8 +1,12 @@
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from mediate.renamer import (
+    Rename,
     apply_renames,
     clean_base,
     looks_random,
@@ -205,9 +209,34 @@ class PlanRenamesTests(unittest.TestCase):
         self.assertEqual(plan["Nova-Quinn-Example.com-7.jpg"], "Nova Quinn [Example.com 2].jpg")
         self.assertEqual(plan["Nova-Quinn-2.jpg"], "Nova Quinn [1].jpg")
 
+    def test_nested_copy_markers_are_all_stripped(self):
+        for stem, expected in (
+            ("Copy of a", "a"),
+            ("Copy of Copy of a", "a"),
+            ("Copy of Copy of Copy of a", "a"),
+        ):
+            with self.subTest(stem=stem):
+                parsed = parse_stem(stem)
+                self.assertEqual(parsed.base, expected)
+                self.assertTrue(parsed.is_dup)
+
     def test_random_token_takes_folder_name(self):
         self.touch("Nova/ue73up.jpg")
         self.assertEqual(self.plan(), {"ue73up.jpg": "Nova [ue73up].jpg"})
+
+    def test_guid_folder_name_is_cleaned_like_any_other_base(self):
+        # Otherwise --rename-folders tidies the directory to "My Holiday
+        # Photos" while the files inside still read "my_holiday_photos".
+        self.touch("my_holiday_photos/550E8400-E29B-41D4-A716-446655440000.jpg")
+        self.touch("my_holiday_photos/ue73up.jpg")
+        self.assertEqual(
+            self.plan(),
+            {
+                "550E8400-E29B-41D4-A716-446655440000.jpg":
+                "My Holiday Photos [550e8400-e29b-41d4-a716-446655440000].jpg",
+                "ue73up.jpg": "My Holiday Photos [ue73up].jpg",
+            },
+        )
 
     def test_standardized_names_are_idempotent(self):
         self.touch("Misty Vale [1].jpg")
@@ -245,6 +274,70 @@ class FolderRenameTests(unittest.TestCase):
         )
 
 
+class ManifestDurabilityTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def touch(self, rel: str, content: bytes = b"x") -> Path:
+        path = self.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        return path
+
+    def test_the_manifest_is_replaced_atomically(self):
+        self.touch("a.jpg")
+        record_batch(self.root, [Rename(self.root / "a.jpg", self.root / "A.jpg")])
+        manifest = self.root / ".mediate-renames.json"
+        self.assertTrue(manifest.exists())
+        leftovers = [p.name for p in self.root.iterdir() if p.name.endswith(".tmp")]
+        self.assertEqual(leftovers, [], "temp manifest left behind")
+
+    def test_a_failed_manifest_write_keeps_the_previous_history(self):
+        self.touch("a.jpg")
+        record_batch(self.root, [Rename(self.root / "a.jpg", self.root / "A.jpg")])
+        manifest = self.root / ".mediate-renames.json"
+        before = manifest.read_text()
+        with patch("mediate.renamer.os.replace", side_effect=OSError("boom")):
+            with self.assertRaises(OSError):
+                record_batch(self.root, [Rename(self.root / "b.jpg", self.root / "B.jpg")])
+        self.assertEqual(manifest.read_text(), before)
+        leftovers = [p.name for p in self.root.iterdir() if p.name.endswith(".tmp")]
+        self.assertEqual(leftovers, [], "temp manifest left behind")
+
+    def test_undo_survives_one_unrestorable_entry(self):
+        # A single failing rename must not abort the batch with a traceback.
+        self.touch("A.jpg", b"one")
+        self.touch("B.jpg", b"two")
+        record_batch(self.root, [
+            Rename(self.root / "a.jpg", self.root / "A.jpg"),
+            Rename(self.root / "b.jpg", self.root / "B.jpg"),
+        ])
+        real_rename = os.rename
+
+        def flaky(src, dst):
+            if Path(src).name == "B.jpg":
+                raise OSError("simulated failure")
+            return real_rename(src, dst)
+
+        with patch("mediate.renamer.os.rename", side_effect=flaky):
+            restored = undo_last_batch(self.root, dry_run=False)
+        self.assertEqual(restored, 1)
+        self.assertTrue((self.root / "a.jpg").exists())   # the one that worked
+        self.assertTrue((self.root / "B.jpg").exists())   # the one that failed
+        # The batch stays recorded so the remainder can be retried.
+        data = json.loads((self.root / ".mediate-renames.json").read_text())
+        self.assertEqual(len(data["batches"]), 1)
+
+    def test_a_fully_successful_undo_pops_the_batch(self):
+        self.touch("A.jpg", b"one")
+        record_batch(self.root, [Rename(self.root / "a.jpg", self.root / "A.jpg")])
+        self.assertEqual(undo_last_batch(self.root, dry_run=False), 1)
+        data = json.loads((self.root / ".mediate-renames.json").read_text())
+        self.assertEqual(data["batches"], [])
+
+
 class ApplyRenamesTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -257,15 +350,63 @@ class ApplyRenamesTests(unittest.TestCase):
         path.write_bytes(content)
         return path
 
-    def test_never_overwrites_on_collision(self):
+    def test_same_base_files_are_numbered_rather_than_colliding(self):
+        # Both clean to "Misty Vale". Unnumbered they would target one path
+        # and apply_renames would skip the loser, which reads as the tool
+        # doing nothing; they are numbered into one series instead.
         self.touch("misty_vale.jpg", b"underscore")
         self.touch("misty.vale.jpg", b"dots")
         plans = plan_renames(self.root)
         renamed, skipped, _ = apply_renames(plans, self.root, dry_run=False)
-        self.assertEqual((renamed, skipped), (1, 1))
+        self.assertEqual((renamed, skipped), (2, 0))
         names = sorted(p.name for p in self.root.iterdir())
-        self.assertIn("Misty Vale.jpg", names)
-        self.assertEqual(len(names), 2)  # loser kept its old name, nothing lost
+        self.assertEqual(names, ["Misty Vale [1].jpg", "Misty Vale.jpg"])
+        self.assertEqual(
+            sorted(p.read_bytes() for p in self.root.iterdir()),
+            [b"dots", b"underscore"],  # nothing overwritten
+        )
+
+    def test_a_member_already_named_correctly_is_left_alone(self):
+        self.touch("Misty Vale.jpg", b"keep")
+        self.touch("misty-vale.jpg", b"extra")
+        plans = plan_renames(self.root)
+        self.assertEqual([(p.src.name, p.dst.name) for p in plans],
+                         [("misty-vale.jpg", "Misty Vale [1].jpg")])
+
+    def test_never_overwrites_an_unrelated_existing_file(self):
+        # The never-overwrite guarantee still holds when the occupied target
+        # is not part of any series being renumbered.
+        self.touch("misty vale.jpg", b"media")
+        self.touch("Misty Vale.txt", b"unrelated")
+        plans = [Rename(self.root / "misty vale.jpg", self.root / "Misty Vale.txt")]
+        renamed, skipped, applied = apply_renames(plans, self.root, dry_run=False)
+        self.assertEqual((renamed, skipped, applied), (0, 1, []))
+        self.assertEqual((self.root / "Misty Vale.txt").read_bytes(), b"unrelated")
+        self.assertTrue((self.root / "misty vale.jpg").exists())
+
+    def test_a_parent_directory_waits_for_its_children(self):
+        # A directory rename listed before the files inside it must be
+        # deferred, or those files' source paths stop existing mid-batch.
+        self.touch("old_dir/a.jpg", b"inner")
+        plans = [
+            Rename(self.root / "old_dir", self.root / "New Dir"),
+            Rename(self.root / "old_dir/a.jpg", self.root / "old_dir/A.jpg"),
+        ]
+        renamed, skipped, applied = apply_renames(plans, self.root, dry_run=False)
+        self.assertEqual((renamed, skipped), (2, 0))
+        # The child must be recorded first so an undo replays it last.
+        self.assertEqual([r.src.name for r in applied], ["a.jpg", "old_dir"])
+        self.assertEqual((self.root / "New Dir/A.jpg").read_bytes(), b"inner")
+
+    def test_a_deep_descendant_also_defers_its_ancestor(self):
+        self.touch("top/mid/deep/a.jpg", b"inner")
+        plans = [
+            Rename(self.root / "top", self.root / "Renamed Top"),
+            Rename(self.root / "top/mid/deep/a.jpg", self.root / "top/mid/deep/A.jpg"),
+        ]
+        renamed, skipped, _ = apply_renames(plans, self.root, dry_run=False)
+        self.assertEqual((renamed, skipped), (2, 0))
+        self.assertEqual((self.root / "Renamed Top/mid/deep/A.jpg").read_bytes(), b"inner")
 
     def test_gap_close_waits_for_occupied_slot(self):
         # [2] -> [1] and [3] -> [2]: the second rename targets a slot that

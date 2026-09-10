@@ -16,6 +16,9 @@ Rules, in order of application per file:
 - Survivors are renumbered per (directory, base, site, extension) series:
   always compacted to start at 1, gaps closed, zero-padded to two digits
   once the series reaches double digits, re-emitted as " [N]"/" [site N]".
+  When two or more *unnumbered* files clean to the same base they would all
+  target one path, so all but one are pulled into the same series; whichever
+  already carries the final name keeps it, so re-runs do not churn.
 - The base gets cleaned: NFC-normalized, underscores/dots to spaces, dashes
   to spaces when a letter is adjacent (digit-dash-digit survives: dates),
   whitespace collapsed, lowercase words title-cased (small words like
@@ -124,8 +127,12 @@ def looks_random(stem: str) -> bool:
 
 def parse_stem(stem: str) -> ParsedName:
     dup = False
-    m = COPY_OF_RE.match(stem)
-    if m:
+    # Finder produces "Copy of Copy of X" for a copy of a copy, so strip
+    # every leading marker rather than only the outermost one.
+    while True:
+        m = COPY_OF_RE.match(stem)
+        if not m:
+            break
         stem = m.group("base")
         dup = True
     number: Optional[int] = None
@@ -249,8 +256,28 @@ def _assign(groups: Dict[Tuple, List[_Member]]) -> Iterator[Tuple[_Member, str]]
             (m for m in members if m.parsed.is_dup),
             key=lambda m: (m.parsed.number or 0, m.path.name),
         )
-        assigned: List[Tuple[_Member, Optional[int]]] = [(m, None) for m in plain]
+        assigned: List[Tuple[_Member, Optional[int]]] = []
         seq = 1
+        if len(plain) > 1:
+            # Several distinct files clean to one name ("a b", "a_b", "a-b").
+            # Left unnumbered they would all target the same path and
+            # apply_renames — which never overwrites — would skip all but one,
+            # reading as "it did nothing". Number the extras instead. The
+            # member that already carries the final name keeps it, so a
+            # library standardized on an earlier run does not churn.
+            plain = sorted(plain, key=lambda m: m.path.name)
+            keeper = next(
+                (m for m in plain
+                 if m.stem == m.cleaned + _tag(m.parsed.site, None, 1)),
+                plain[0],
+            )
+            assigned.append((keeper, None))
+            for m in plain:
+                if m is not keeper:
+                    assigned.append((m, seq))
+                    seq += 1
+        else:
+            assigned.extend((m, None) for m in plain)
         for m in numbered:
             assigned.append((m, seq))
             seq += 1
@@ -287,7 +314,12 @@ def plan_renames(root: Path, date_prefix: bool = False) -> List[Rename]:
             continue
         stem = path.name[: -len(path.suffix)] if path.suffix else path.name
         if GUID_RE.match(stem) or looks_random(stem):
-            folder = path.parent.name or "media"
+            # The folder name goes through the same cleanup the file would
+            # have had; otherwise --rename-folders tidies the directory to
+            # "My Holiday Photos" while the files inside still read
+            # "my_holiday_photos [<guid>]".
+            raw_folder = path.parent.name
+            folder = clean_base(raw_folder) or raw_folder or "media"
             finalize(path, f"{folder} [{stem.lower() if GUID_RE.match(stem) else stem}]", ext)
             continue
         parsed = parse_stem(stem)
@@ -373,8 +405,17 @@ def apply_renames(plans: List[Rename], root: Path, dry_run: bool) -> Tuple[int, 
     while pending:
         deferred: List[Rename] = []
         progress = False
+        # "Some other pending source lies inside p.src" is exactly "p.src is a
+        # strict ancestor of a pending source", so the ancestors are collected
+        # once per round and tested by lookup. Scanning every source for every
+        # plan instead is quadratic: measured at ~12s for 1,600 renames and
+        # extrapolating to over three hours for a 50k-file library, before a
+        # single file is moved.
+        source_ancestors = {
+            ancestor for source in sources for ancestor in source.parents
+        }
         for p in pending:
-            if any(s != p.src and s.is_relative_to(p.src) for s in sources):
+            if p.src in source_ancestors:
                 deferred.append(p)
                 continue
             
@@ -450,6 +491,22 @@ def _manifest_path(root: Path) -> Path:
     return root / MANIFEST_NAME
 
 
+def _write_manifest(path: Path, data: dict) -> None:
+    """Replace the manifest atomically.
+
+    This file is what makes renames reversible, so a crash or a full disk
+    mid-write must not be able to truncate it — same temp-file + os.replace
+    protocol the journal, transactions, and the probe cache use.
+    """
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def record_batch(root: Path, applied: List[Rename]) -> None:
     if not applied:
         return
@@ -467,7 +524,7 @@ def record_batch(root: Path, applied: List[Rename]) -> None:
             for p in applied
         ],
     })
-    path.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    _write_manifest(path, data)
 
 
 def undo_last_batch(root: Path, dry_run: bool) -> int:
@@ -488,6 +545,7 @@ def undo_last_batch(root: Path, dry_run: bool) -> int:
     batch = batches[-1]
     log.info("undoing rename batch from %s (%d rename(s))", batch.get("time"), len(batch["renames"]))
     restored = 0
+    failed = 0
     for entry in reversed(batch["renames"]):
         original = root / entry["from"]
         current = root / entry["to"]
@@ -508,10 +566,26 @@ def undo_last_batch(root: Path, dry_run: bool) -> int:
         if occupied:
             log.info("[skip] cannot restore %s: %s already exists", entry["to"], original.name)
             continue
-        os.rename(current, original)
+        try:
+            os.rename(current, original)
+        except OSError as exc:
+            # One unrestorable entry must not abort the rest of the batch
+            # with a traceback and leave it half reversed.
+            log.error("[FAIL] cannot restore %s: %s", entry["to"], exc)
+            failed += 1
+            continue
         log.info("[ren]  %s -> %s (restored)", entry["to"], original.name)
         restored += 1
     if not dry_run:
-        batches.pop()
-        path.write_text(json.dumps(data, indent=1), encoding="utf-8")
+        if failed:
+            # Keep the batch recorded so the remainder can be retried once
+            # the cause is cleared; dropping it would strand those files.
+            log.error(
+                "%d entr(y/ies) could not be restored; keeping the batch in %s "
+                "so --undo-renames can be retried",
+                failed, path.name,
+            )
+        else:
+            batches.pop()
+            _write_manifest(path, data)
     return restored
