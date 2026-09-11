@@ -248,6 +248,17 @@ class PlanRenamesTests(unittest.TestCase):
         self.touch("Nova Quinn [Example.com 1].jpg")
         self.assertEqual(self.plan(), {})
 
+    def test_symlinked_directories_are_not_renamed(self):
+        # Same reasoning as symlinked files: renaming one moves a pointer
+        # whose target may live outside the library.
+        (self.root / "real_folder").mkdir()
+        self.touch("real_folder/a.jpg")
+        os.symlink(self.root / "real_folder", self.root / "linked_folder")
+        self.assertEqual(
+            [(p.src.name, p.dst.name) for p in plan_folder_renames(self.root)],
+            [("real_folder", "Real Folder")],
+        )
+
     def test_symlinks_are_not_renamed(self):
         # The converter refuses symlinked media; the renamer now agrees.
         self.touch("real photo.jpg")

@@ -173,9 +173,17 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   the only record that makes renames reversible. `undo_last_batch` also
   survives a single unrestorable entry, and keeps the batch recorded when
   any entry failed so the remainder can be retried.
-- **The renamer skips symlinks** (`_walk_files`), matching the converter's
-  refusal of symlinked media. Renaming a link would move a pointer whose
-  target may live anywhere, and a broken link would be quietly tidied.
+- **The renamer skips symlinks** — both files (`_walk_files`) and
+  directories (`plan_folder_renames`, which walks separately and needs its
+  own check), matching the converter's refusal of symlinked media. Renaming
+  a link moves a pointer whose target may live anywhere, and a broken link
+  would be quietly tidied.
+- **Every `sips` call needs a platform guard**: it is macOS-only, and `_run`
+  raises `FileNotFoundError` elsewhere, which `process_job` reports as
+  "converter not found: sips" — blaming a tool the user never asked for and
+  discarding the real cwebp diagnostic. Both call sites (the GIF decode
+  fallback in `_convert_photo` and `_decode_heic`) check
+  `sys.platform == "darwin" and shutil.which("sips")`.
 - **Names are trimmed to 255 bytes** (`fit_within_name_max`): the filesystem
   limit is bytes, not characters, so trimming happens on the encoded form
   without splitting a character. The trailing `[N]` tag and any

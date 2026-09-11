@@ -442,9 +442,14 @@ def plan_folder_renames(root: Path) -> List[Rename]:
     each rename's path is unaffected by its ancestors' pending renames."""
     dirs: List[Path] = []
     for dirpath, dirnames, _ in os.walk(root):
+        # Symlinked directories are excluded for the same reason symlinked
+        # files are: renaming one moves a pointer whose target may live
+        # anywhere, including outside the library.
         dirnames[:] = [
             d for d in sorted(dirnames)
-            if not d.startswith(".") and Path(d).suffix.lower() not in BUNDLE_EXTS
+            if not d.startswith(".")
+            and Path(d).suffix.lower() not in BUNDLE_EXTS
+            and not (Path(dirpath) / d).is_symlink()
         ]
         dirs.extend(Path(dirpath) / d for d in dirnames)
     plans = []

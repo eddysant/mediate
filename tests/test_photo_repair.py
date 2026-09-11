@@ -207,6 +207,60 @@ def _png_bytes(width: int, height: int) -> bytes:
     return b"\x89PNG\r\n\x1a\n" + chunk
 
 
+class GifFallbackPlatformTests(unittest.TestCase):
+    """The GIF decode fallback is macOS-only and must say so."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.src = self.root / "broken.gif"
+        self.src.write_bytes(b"GIF89a not really")
+
+    @staticmethod
+    def _cwebp_rejects(cmd):
+        if cmd[0] == "sips":
+            raise FileNotFoundError(2, "No such file or directory", "sips")
+        return subprocess.CompletedProcess(cmd, 1, "", "Cannot read input picture file")
+
+    def test_off_macos_keeps_the_real_cwebp_error(self):
+        # Calling sips blind reported "converter not found: sips", blaming a
+        # tool the user never asked for and discarding the actual reason.
+        with patch.object(sys, "platform", "linux"), \
+                patch("mediate.converters._run", side_effect=self._cwebp_rejects):
+            result = _convert_photo(self.src, self.root / "out.webp")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Cannot read input picture file", result.stderr)
+        self.assertIn("macOS sips", result.stderr)
+
+    def test_macos_without_sips_installed_also_falls_back_cleanly(self):
+        with patch.object(sys, "platform", "darwin"), \
+                patch("mediate.converters.shutil.which", return_value=None), \
+                patch("mediate.converters._run", side_effect=self._cwebp_rejects):
+            result = _convert_photo(self.src, self.root / "out.webp")
+        self.assertIn("Cannot read input picture file", result.stderr)
+
+    def test_macos_with_sips_still_retries_through_it(self):
+        calls = []
+
+        def runner(cmd):
+            calls.append(cmd[0])
+            if cmd[0] == "sips":
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            if len(calls) == 1:
+                return subprocess.CompletedProcess(
+                    cmd, 1, "", "Cannot read input picture file"
+                )
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with patch.object(sys, "platform", "darwin"), \
+                patch("mediate.converters.shutil.which", return_value="/usr/bin/sips"), \
+                patch("mediate.converters._run", side_effect=runner):
+            result = _convert_photo(self.src, self.root / "out.webp")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("sips", calls)
+
+
 class HeicDecodeTests(unittest.TestCase):
     """HEIC is ISOBMFF, so FFmpeg sees every auxiliary image as a stream."""
 

@@ -389,6 +389,15 @@ def _convert_photo(src: Path, tmp: Path, output_format: str = "webp") -> subproc
         return direct
 
     if src.suffix.lower() == ".gif" and decode_failure:
+        # sips is macOS-only. Calling it blind turned a readable cwebp
+        # diagnostic into "converter not found: sips" on every other
+        # platform, blaming a tool the user never asked for.
+        if not (sys.platform == "darwin" and shutil.which("sips")):
+            direct.stderr += (
+                "\nThe GIF decode fallback needs macOS sips, which is not "
+                "available here; the original cwebp failure stands."
+            )
+            return direct
         png = tmp.with_suffix(".png")
         try:
             sips = _run(["sips", "-s", "format", "png", str(src), "--out", str(png)])
