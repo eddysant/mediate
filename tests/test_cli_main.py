@@ -212,12 +212,21 @@ class ClassifyJobTests(MainTestCase):
         self.assertNotIsInstance(decision, Outcome)
         self.assertEqual(decision.kind, "heic")
 
-    def test_opted_in_heic_is_skipped_off_macos(self):
+    def test_opted_in_heic_uses_ffmpeg_off_macos(self):
         path = self.touch("a.heic")
-        with patch.object(sys, "platform", "linux"):
+        with patch.object(sys, "platform", "linux"), \
+                patch("mediate.converters.ffmpeg_can_decode_heic", return_value=True):
+            decision = classify_job(self.job(path, "heic"), Options(convert_heic=True))
+        self.assertNotIsInstance(decision, Outcome)
+        self.assertEqual(decision.kind, "heic")
+
+    def test_opted_in_heic_is_skipped_without_any_decoder(self):
+        path = self.touch("a.heic")
+        with patch.object(sys, "platform", "linux"), \
+                patch("mediate.converters.ffmpeg_can_decode_heic", return_value=False):
             decision = classify_job(self.job(path, "heic"), Options(convert_heic=True))
         self.assertIsInstance(decision, Outcome)
-        self.assertIn("macOS", decision.detail)
+        self.assertIn("HEIC", decision.detail)
 
     def test_a_static_gif_is_reclassified_as_a_photo(self):
         path = self.touch("a.gif")
@@ -264,6 +273,98 @@ class ClassifyJobTests(MainTestCase):
             decision = classify_job(self.job(path, "video"), Options())
         self.assertIsInstance(decision, Outcome)
         self.assertIn("preflight failed", decision.detail)
+
+
+class ExtractedSeamTests(MainTestCase):
+    """The pieces main() delegates to, exercised without running a whole scan."""
+
+    def test_summarize_run_is_stable(self):
+        from mediate.cli import summarize_run
+        from mediate.converters import (
+            CONVERTED, FAILED, PLANNED, REMUXED, REPAIRED, SKIPPED,
+        )
+
+        def tally(**kw):
+            base = {
+                CONVERTED: 0, REMUXED: 0, REPAIRED: 0,
+                SKIPPED: 0, FAILED: 0, PLANNED: 0,
+            }
+            base.update(kw)
+            return base
+
+        self.assertEqual(
+            summarize_run(tally(**{CONVERTED: 2, FAILED: 1}), 7_235_000, False),
+            "done: 2 converted, 0 skipped, 1 failed, 6.9 MB saved",
+        )
+        self.assertEqual(
+            summarize_run(tally(**{PLANNED: 2}), 0, True),
+            "dry run complete: 2 would be converted, 0 skipped",
+        )
+        # Zero-count stages stay out of the line; skipped/failed always show.
+        self.assertNotIn("remuxed", summarize_run(tally(**{CONVERTED: 1}), 0, False))
+
+    def test_plan_jobs_claims_one_name_per_output(self):
+        from mediate.cli import plan_jobs
+        from mediate.scanner import MediaJob
+
+        jobs = [
+            MediaJob(self.touch("a.jpg"), "photo"),
+            MediaJob(self.touch("a.png"), "photo"),
+        ]
+        runnable, skips = plan_jobs(jobs, output_format="webp", convert_live_photos=False)
+        self.assertEqual(skips, [])
+        outputs = {
+            (job.output or job.path.with_suffix(".webp")) for job in runnable
+        }
+        self.assertEqual(len(outputs), 2)
+
+    def test_plan_jobs_protects_both_live_photo_halves(self):
+        from mediate.cli import plan_jobs
+        from mediate.scanner import MediaJob
+
+        still = self.touch("IMG_1.heic")
+        mov = self.touch("IMG_1.mov")
+        jobs = [MediaJob(still, "heic"), MediaJob(mov, "video")]
+        with patch("mediate.cli.find_live_photo_companions", return_value={mov: still}):
+            runnable, skips = plan_jobs(
+                jobs, output_format="webp", convert_live_photos=False
+            )
+        self.assertEqual(runnable, [])
+        self.assertEqual({o.path for o in skips}, {still, mov})
+        for outcome in skips:
+            self.assertIn("Live Photo", outcome.detail)
+
+    def test_plan_jobs_honours_the_live_photo_opt_in(self):
+        from mediate.cli import plan_jobs
+        from mediate.scanner import MediaJob
+
+        jobs = [
+            MediaJob(self.touch("IMG_1.heic"), "heic"),
+            MediaJob(self.touch("IMG_1.mov"), "video"),
+        ]
+        runnable, skips = plan_jobs(jobs, output_format="webp", convert_live_photos=True)
+        self.assertEqual(len(runnable), 2)
+        self.assertEqual(skips, [])
+
+    def test_build_options_carries_the_flags_through(self):
+        from mediate.cli import build_options
+
+        args = cli.parse_args([
+            str(self.root), "--only-if-smaller", "--reencode-hevc",
+            "--output-format", "avif",
+        ])
+        opts, label = build_options(self.root, args)
+        self.assertTrue(opts.only_if_smaller)
+        self.assertTrue(opts.reencode_hevc)
+        self.assertEqual(opts.output_format, "avif")
+        self.assertEqual(opts.transaction_root, self.root)
+        self.assertTrue(label)
+
+    def test_rename_shortcuts_return_none_when_not_requested(self):
+        from mediate.cli import run_rename_shortcuts
+
+        args = cli.parse_args([str(self.root)])
+        self.assertIsNone(run_rename_shortcuts(self.root, args))
 
 
 class PythonFloorTests(unittest.TestCase):

@@ -1,6 +1,9 @@
+import struct
 import subprocess
+import sys
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -10,6 +13,9 @@ from mediate.converters import (
     Options,
     _convert,
     _convert_photo,
+    _decode_heic,
+    _heic_primary_stream,
+    _png_dimensions,
     _repair_photo_metadata,
     process_job,
     unique_output_path,
@@ -190,6 +196,88 @@ class OutputCollisionTests(unittest.TestCase):
         self.assertEqual(
             (self.root / "photo.01234567.webp").read_bytes(), b"new-output"
         )
+
+
+
+def _png_bytes(width: int, height: int) -> bytes:
+    """Minimal PNG header — enough for the IHDR dimension read."""
+    ihdr = struct.pack(">II", width, height) + bytes([8, 2, 0, 0, 0])
+    chunk = struct.pack(">I", len(ihdr)) + b"IHDR" + ihdr
+    chunk += struct.pack(">I", zlib.crc32(b"IHDR" + ihdr) & 0xFFFFFFFF)
+    return b"\x89PNG\r\n\x1a\n" + chunk
+
+
+class HeicDecodeTests(unittest.TestCase):
+    """HEIC is ISOBMFF, so FFmpeg sees every auxiliary image as a stream."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_the_largest_image_is_chosen_over_a_thumbnail(self):
+        src = self.root / "a.heic"
+        src.write_bytes(b"x")
+        streams = [
+            {"index": 0, "codec_name": "hevc", "width": 160, "height": 120},
+            {"index": 1, "codec_name": "hevc", "width": 4032, "height": 3024},
+        ]
+        with patch("mediate.probe.heic_image_streams", return_value=streams):
+            self.assertEqual(_heic_primary_stream(src)["index"], 1)
+
+    def test_no_decodable_image_is_an_error_not_a_crash(self):
+        src = self.root / "a.heic"
+        src.write_bytes(b"x")
+        with patch("mediate.probe.heic_image_streams", return_value=[]), \
+                patch.object(sys, "platform", "linux"):
+            result = _decode_heic(src, self.root / "out.png")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no decodable still image", result.stderr)
+
+    def test_a_decode_that_yields_the_wrong_size_is_rejected(self):
+        # Converting the thumbnail instead of the photo would be silent data
+        # loss: nothing downstream compares photo dimensions.
+        src = self.root / "a.heic"
+        src.write_bytes(b"x")
+        png = self.root / "out.png"
+        streams = [{"index": 0, "codec_name": "hevc", "width": 4032, "height": 3024}]
+
+        def fake_run(cmd):
+            png.write_bytes(_png_bytes(160, 120))  # a thumbnail slipped through
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with patch("mediate.probe.heic_image_streams", return_value=streams), \
+                patch.object(sys, "platform", "linux"), \
+                patch("mediate.converters._run", side_effect=fake_run):
+            result = _decode_heic(src, png)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("auxiliary image", result.stderr)
+
+    def test_a_correctly_sized_decode_is_accepted(self):
+        src = self.root / "a.heic"
+        src.write_bytes(b"x")
+        png = self.root / "out.png"
+        streams = [{"index": 0, "codec_name": "hevc", "width": 320, "height": 240}]
+
+        def fake_run(cmd):
+            png.write_bytes(_png_bytes(320, 240))
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with patch("mediate.probe.heic_image_streams", return_value=streams), \
+                patch.object(sys, "platform", "linux"), \
+                patch("mediate.converters._run", side_effect=fake_run):
+            result = _decode_heic(src, png)
+        self.assertEqual(result.returncode, 0)
+
+    def test_png_dimensions_reads_the_ihdr(self):
+        png = self.root / "a.png"
+        png.write_bytes(_png_bytes(1920, 1080))
+        self.assertEqual(_png_dimensions(png), (1920, 1080))
+
+    def test_png_dimensions_rejects_a_non_png(self):
+        other = self.root / "a.bin"
+        other.write_bytes(b"not a png at all, really quite definitely not")
+        self.assertIsNone(_png_dimensions(other))
 
 
 if __name__ == "__main__":

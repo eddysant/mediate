@@ -21,7 +21,12 @@ from mediate.probe import (
     stream_removal_risks,
 )
 from mediate.scanner import MediaJob
-from mediate.validators import validate_output, verify_apple_playback, verify_video_streams
+from mediate.validators import (
+    validate_output,
+    verify_apple_playback,
+    verify_video_duration,
+    verify_video_streams,
+)
 
 
 def _stream(
@@ -765,6 +770,49 @@ class StreamValidationTests(unittest.TestCase):
                 allow_stream_removal=True,
             )
         self.assertEqual(result, (True, "ok"))
+
+
+class DurationFallbackTests(unittest.TestCase):
+    """A container may understate its own length; truncation must still fail."""
+
+    def _verify(self, declared_src, out_dur, decoded):
+        src, out = Path("/src.vob"), Path("/out.mp4")
+        with patch(
+            "mediate.validators.media_duration",
+            side_effect=lambda p: declared_src if p == src else out_dur,
+        ), patch("mediate.validators.decoded_duration", return_value=decoded):
+            return verify_video_duration(src, out)
+
+    def test_understated_source_is_rescued_by_decoding(self):
+        # Concatenated VOB parts restart their timestamps, so the container
+        # reports only the final segment. The conversion was correct.
+        ok, reason = self._verify(4.0, 10.0, 10.0)
+        self.assertTrue(ok, reason)
+
+    def test_a_truncated_output_still_fails(self):
+        ok, reason = self._verify(10.0, 4.0, 10.0)
+        self.assertFalse(ok)
+        self.assertIn("duration mismatch", reason)
+
+    def test_a_longer_output_the_decode_does_not_corroborate_fails(self):
+        ok, reason = self._verify(4.0, 10.0, 4.0)
+        self.assertFalse(ok)
+
+    def test_an_unavailable_decode_fails_closed(self):
+        ok, reason = self._verify(4.0, 10.0, None)
+        self.assertFalse(ok)
+
+    def test_durations_within_tolerance_never_decode(self):
+        with patch("mediate.validators.decoded_duration") as decode:
+            ok, _ = self._verify(10.0, 10.4, None)
+        self.assertTrue(ok)
+        decode.assert_not_called()
+
+    def test_a_truncated_output_never_pays_for_a_decode(self):
+        with patch("mediate.validators.decoded_duration") as decode:
+            ok, _ = self._verify(10.0, 4.0, None)
+        self.assertFalse(ok)
+        decode.assert_not_called()
 
 
 class DecodeIntegrityTests(unittest.TestCase):

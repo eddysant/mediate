@@ -4,6 +4,7 @@ original file may be deleted."""
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -13,7 +14,7 @@ import tempfile
 import threading
 from pathlib import Path
 from fractions import Fraction
-from typing import Tuple
+from typing import List, Optional, Tuple
 
 from .exiftool import exiftool_available, run_exiftool
 from .probe import (
@@ -22,6 +23,7 @@ from .probe import (
     STANDARD_H264_PIXEL_FORMATS,
     audio_stream_label,
     check_video_integrity,
+    decoded_duration,
     decoded_stream_starts,
     inventory_streams,
     is_commentary_stream,
@@ -33,6 +35,8 @@ from .probe import (
     video_inventory,
 )
 
+
+log = logging.getLogger("mediate")
 
 def _tail(stderr: str, lines: int = 6) -> str:
     kept = [ln for ln in stderr.strip().splitlines() if ln.strip()]
@@ -244,15 +248,39 @@ def verify_photo_metadata(src: Path, output: Path) -> Tuple[bool, str]:
     return True, "ok"
 
 
+def _durations_agree(src_dur: float, out_dur: float) -> bool:
+    return abs(src_dur - out_dur) <= max(1.0, src_dur * 0.02)
+
+
 def verify_video_duration(src: Path, output: Path) -> Tuple[bool, str]:
     """A structurally valid MP4 can still be truncated. If both durations are
-    readable they must agree within 1s (or 2% for long videos)."""
+    readable they must agree within 1s (or 2% for long videos).
+
+    When the output is *longer* than the source claims, the source's declared
+    duration is the suspect value: a conversion cannot invent content, but a
+    container can understate its own length. Concatenated MPEG program
+    streams do exactly that — joined VOB parts restart their timestamps, so
+    ffprobe reports only the final segment. Re-measure the source by decoding
+    before rejecting a conversion that may well be correct. The expensive
+    decode runs only on this failing path, and only in that one direction, so
+    a genuinely truncated output is still caught by the cheap comparison.
+    """
     src_dur = media_duration(src)
     out_dur = media_duration(output)
-    if src_dur is not None and out_dur is not None:
-        if abs(src_dur - out_dur) > max(1.0, src_dur * 0.02):
-            return False, f"duration mismatch: source {src_dur:.1f}s vs output {out_dur:.1f}s"
-    return True, "ok"
+    if src_dur is None or out_dur is None:
+        return True, "ok"
+    if _durations_agree(src_dur, out_dur):
+        return True, "ok"
+    if out_dur > src_dur:
+        measured = decoded_duration(src)
+        if measured is not None and _durations_agree(measured, out_dur):
+            log.warning(
+                "       %s: container declares %.1fs but decodes to %.1fs; "
+                "trusting the decoded length",
+                src.name, src_dur, measured,
+            )
+            return True, "ok"
+    return False, f"duration mismatch: source {src_dur:.1f}s vs output {out_dur:.1f}s"
 
 
 def _normalised_rotation(value):
@@ -428,6 +456,17 @@ def verify_video_streams(
             f"output {target_defaults}"
         )
     decoded_starts = None
+    # A container that understates its own length understates its per-track
+    # durations too, so the same decoded measurement settles both. Resolved
+    # at most once, and only when a track would otherwise fail.
+    measured_source: List[Optional[float]] = []
+
+    def source_understates(output_seconds: float) -> bool:
+        if not measured_source:
+            measured_source.append(decoded_duration(src))
+        measured = measured_source[0]
+        return measured is not None and _durations_agree(measured, output_seconds)
+
     for index, (before, after) in enumerate(zip(source_audio, target_audio), 1):
         if after.get("codec_name") != "aac":
             return False, f"audio track {index} output codec is not AAC"
@@ -445,10 +484,14 @@ def verify_video_streams(
             except (TypeError, ValueError):
                 return False, f"audio track {index} duration could not be verified"
             if abs(before_seconds - after_seconds) > max(0.25, before_seconds * 0.02):
-                return False, (
-                    f"audio track {index} duration changed: source {before_seconds:.2f}s, "
-                    f"output {after_seconds:.2f}s"
-                )
+                if not (
+                    after_seconds > before_seconds
+                    and source_understates(after_seconds)
+                ):
+                    return False, (
+                        f"audio track {index} duration changed: source "
+                        f"{before_seconds:.2f}s, output {after_seconds:.2f}s"
+                    )
         for field, label in (("channels", "channel count"), ("sample_rate", "sample rate")):
             before_value = before.get(field)
             after_value = after.get(field)

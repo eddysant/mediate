@@ -454,6 +454,93 @@ def _convert_photo(src: Path, tmp: Path, output_format: str = "webp") -> subproc
         repaired.unlink(missing_ok=True)
 
 
+def _heic_primary_stream(src: Path) -> Optional[dict]:
+    """The largest still image inside a HEIC.
+
+    HEIC is ISOBMFF, so FFmpeg opens it with the mov/mp4 demuxer and a file
+    carrying a thumbnail or depth map presents several video streams. Picking
+    by area avoids silently converting the thumbnail.
+    """
+    from .probe import heic_image_streams
+
+    streams = heic_image_streams(src)
+    if not streams:
+        return None
+    return max(
+        streams,
+        key=lambda stream: (stream.get("width") or 0) * (stream.get("height") or 0),
+    )
+
+
+def ffmpeg_can_decode_heic() -> bool:
+    """Whether this FFmpeg build can read HEIC stills."""
+    from .capabilities import ffmpeg_heic_support
+
+    return ffmpeg_heic_support()
+
+
+def _decode_heic(src: Path, png: Path) -> subprocess.CompletedProcess:
+    """Decode a HEIC still to PNG, preferring macOS sips.
+
+    PNG specifically: both decoders copy the EXIF block into it and cwebp
+    extracts EXIF from PNG, where a TIFF intermediate silently loses all
+    metadata. Off macOS, FFmpeg reads the same file through its mov/mp4
+    demuxer; any metadata it does drop is restored afterwards by
+    _repair_photo_metadata via ExifTool.
+    """
+    if sys.platform == "darwin" and shutil.which("sips"):
+        sips = _run(["sips", "-s", "format", "png", str(src), "--out", str(png)])
+        if sips.returncode == 0:
+            return sips
+        log.debug("sips could not decode %s (%s); trying ffmpeg", src.name, sips.stderr.strip())
+        png.unlink(missing_ok=True)
+
+    stream = _heic_primary_stream(src)
+    if stream is None:
+        return subprocess.CompletedProcess(
+            ["ffprobe", str(src)], 1, "",
+            "no decodable still image found in HEIC container",
+        )
+    index = stream.get("index")
+    decoded = _run([
+        "ffmpeg", "-nostdin", "-y", "-v", "error", "-i", str(src),
+        "-map", f"0:{index}" if index is not None else "0:v:0",
+        "-frames:v", "1", str(png),
+    ])
+    if decoded.returncode != 0:
+        return decoded
+    # A HEIC's auxiliary streams are a real hazard here: if the wrong one were
+    # decoded the conversion would quietly replace the photo with a thumbnail,
+    # and no later check compares photo dimensions.
+    expected = (stream.get("width"), stream.get("height"))
+    actual = _png_dimensions(png)
+    if None not in expected and actual is not None and actual != expected:
+        return subprocess.CompletedProcess(
+            decoded.args, 1, decoded.stdout,
+            decoded.stderr + (
+                f"\nHEIC decode produced {actual[0]}x{actual[1]} but the primary "
+                f"image is {expected[0]}x{expected[1]}; refusing to replace the "
+                "photo with an auxiliary image"
+            ),
+        )
+    return decoded
+
+
+def _png_dimensions(path: Path) -> Optional[tuple]:
+    """Read a PNG's IHDR dimensions without decoding the image."""
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(24)
+    except OSError:
+        return None
+    if len(header) < 24 or header[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    return (
+        int.from_bytes(header[16:20], "big"),
+        int.from_bytes(header[20:24], "big"),
+    )
+
+
 def _source_looks_truncated(stderr: str) -> bool:
     truncation_markers = (
         "File ended prematurely",
@@ -547,9 +634,9 @@ def _convert(
 
     png = tmp.with_suffix(".png")
     try:
-        sips = _run(["sips", "-s", "format", "png", str(src), "--out", str(png)])
-        if sips.returncode != 0:
-            return sips
+        decoded = _decode_heic(src, png)
+        if decoded.returncode != 0:
+            return decoded
         return _run(_build_command("photo", png, tmp, output_format=output_format))
     finally:
         png.unlink(missing_ok=True)
@@ -692,8 +779,13 @@ def classify_job(job: MediaJob, opts: Options):
     if kind == "heic":
         if not opts.convert_heic:
             return Outcome(SKIPPED, src, "HEIC (already space-efficient; --convert-heic to convert)")
-        if sys.platform != "darwin":
-            return Outcome(SKIPPED, src, "HEIC conversion requires macOS (sips)")
+        if sys.platform != "darwin" and not ffmpeg_can_decode_heic():
+            return Outcome(
+                SKIPPED,
+                src,
+                "HEIC conversion needs macOS sips or an FFmpeg build that reads "
+                "HEIC stills",
+            )
 
     return Plan(
         job=job,

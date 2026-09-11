@@ -6,6 +6,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -196,9 +197,48 @@ def _check_avifenc(report: CapabilityReport) -> None:
     report.versions["avifenc"] = _first_line(proc)
 
 
+_heic_support: Optional[bool] = None
+
+
+def ffmpeg_heic_support() -> bool:
+    """Whether FFmpeg can read HEIC stills, probed once per process.
+
+    HEIC is ISOBMFF carrying HEVC, so the mov/mp4 demuxer plus an hevc
+    decoder is what actually matters — there is no separate "heic" demuxer to
+    look for.
+    """
+    global _heic_support
+    if _heic_support is not None:
+        return _heic_support
+    try:
+        demuxers = _run(["ffmpeg", "-hide_banner", "-demuxers"])
+        decoders = _run(["ffmpeg", "-hide_banner", "-decoders"])
+    except (OSError, subprocess.TimeoutExpired):
+        _heic_support = False
+        return _heic_support
+    demuxer_output = demuxers.stdout + demuxers.stderr
+    decoder_output = decoders.stdout + decoders.stderr
+    _heic_support = ("mov,mp4" in demuxer_output or "mov " in demuxer_output) and (
+        re.search(r"^\s*V\S*\s+hevc\s", decoder_output, re.MULTILINE) is not None
+    )
+    return _heic_support
+
+
+def _check_heic(report: CapabilityReport) -> None:
+    if sys.platform == "darwin" and shutil.which("sips"):
+        return
+    if ffmpeg_heic_support():
+        report.versions["heic decoder"] = "ffmpeg (mov/mp4 demuxer + hevc)"
+        return
+    report.errors.append(
+        "--convert-heic needs macOS sips or an FFmpeg build that reads HEIC "
+        "stills (mov/mp4 demuxer plus an hevc decoder); " + _install_hint()
+    )
+
+
 def check_media_capabilities(
     *, require_video: bool, require_photos: bool, require_animated_webp: bool = False,
-    require_avif: bool = False,
+    require_avif: bool = False, require_heic: bool = False,
 ) -> CapabilityReport:
     report = CapabilityReport()
     if require_video or require_animated_webp:
@@ -207,4 +247,6 @@ def check_media_capabilities(
         _check_cwebp(report)
     if require_avif:
         _check_avifenc(report)
+    if require_heic:
+        _check_heic(report)
     return report

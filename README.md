@@ -8,7 +8,7 @@ validation checklist (and even then, it goes to the Trash, not oblivion).
 | Input | Output | Tool |
 |---|---|---|
 | JPEG / PNG / TIFF | Lossless WebP (default, `cwebp`) or lossless AVIF (`--output-format avif`, `avifenc`) | `cwebp` / `avifenc` |
-| HEIC / HEIF (opt-in, macOS) | Lossless WebP / AVIF via a sips PNG intermediate, EXIF preserved | `sips` + `cwebp` / `avifenc` |
+| HEIC / HEIF (opt-in) | Lossless WebP / AVIF via a sips PNG intermediate, EXIF preserved | `sips` + `cwebp` / `avifenc` |
 | MOV / MKV / AVI / WMV / WebM / ASF / VOB / legacy video | MP4 (h264 `-crf 18 -preset slow`, AAC 256k, `yuv420p`) | `ffmpeg` |
 | Animated GIF / animated WebP | MP4 (`faststart`, even-dimension scale filter) | `ffmpeg` |
 

@@ -11,7 +11,7 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 
 | Module | Role |
 |---|---|
-| `cli.py` | argparse, dual logging (console + `conversion.log`), planning-time skips, ThreadPoolExecutor, summary/exit codes |
+| `cli.py` | argparse, dual logging (console + `conversion.log`), `recover_pending_transactions`/`run_rename_shortcuts`/`build_options`/`plan_jobs`/`summarize_run` around a ThreadPoolExecutor, exit codes |
 | `scanner.py` | `os.walk` traversal → `MediaJob(path, kind)`; kind ∈ photo/heic/gif/webp/video/mp4; Live Photo pairing helper |
 | `probe.py` | cached `ffprobe -of json` helpers: codec/remux classification plus a normalized inventory of all streams, stream groups, chapters, track identity, rotation, colour, and artwork |
 | `converters.py` | command construction, stream-safety policy, temp-file protocol, `classify_job()` (every probe-based skip, no filesystem writes) + `process_job()`; includes `-c copy` remuxing for compatible containers and a rotation display-matrix finalizer |
@@ -72,8 +72,15 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   the job and used verbatim as the final path, so claiming with the wrong
   extension both mis-names the output and stops real collisions being seen.
   `tests/test_cli_main.py` guards this for both formats.
-- **HEIC pipeline must use a PNG intermediate** (`_convert` in `converters.py`):
-  `sips → PNG → cwebp`. sips copies EXIF into PNG and cwebp extracts it; with a
+- **HEIC pipeline must use a PNG intermediate** (`_decode_heic` in
+  `converters.py`): `sips → PNG → cwebp` on macOS, and FFmpeg's mov/mp4
+  demuxer (HEIC is ISOBMFF carrying HEVC — there is no separate "heic"
+  demuxer to look for) elsewhere. Both preserve the EXIF block; anything a
+  decoder drops is restored by `_repair_photo_metadata`. Because the mov
+  demuxer exposes *every* auxiliary image as a stream, the largest-area
+  stream is mapped explicitly and the decoded PNG's IHDR dimensions are
+  checked against it — otherwise a thumbnail or depth map would silently
+  replace the photo, which nothing downstream would catch. sips copies EXIF into PNG and cwebp extracts it; with a
   TIFF intermediate cwebp prints "EXIF extraction from TIFF is unsupported" and
   silently drops all metadata (the bug that shaped this design). cwebp can't
   read HEIC at all (HEVC-compressed stills, patent-encumbered).
@@ -90,6 +97,16 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 - **HEVC MP4s are skipped by default**: re-encoding HEVC→h264 at crf 18 *grows*
   the file (verified 7.6 KB → 11.3 KB on a test clip) and Apple plays HEVC
   natively. `--reencode-hevc` opts into the size hit for non-Apple targets.
+- **A container's declared duration can be a lie** (`verify_video_duration`):
+  concatenated MPEG program streams — how a ripped DVD's `VTS_01_N.VOB`
+  parts are normally joined — restart their timestamps at each join, so
+  ffprobe reports only the final segment (3.9s for a 10s file) and packet
+  spans are fooled identically. Only a decode is reliable, so
+  `decoded_duration()` is consulted **only** when validation would otherwise
+  fail *and* the output is longer than the source claims: a conversion cannot
+  invent content, but a container can understate itself. A short output is
+  still genuine truncation and fails on the cheap comparison without paying
+  for a decode. The same measurement settles per-audio-track durations.
 - **Validation requires empty stderr, not just exit 0**, on the video integrity
   pass — ffmpeg reports many corruptions on stderr while still exiting 0.
 - **Container signalling is exempt from removal risks** (`probe.py`):
@@ -258,5 +275,4 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 
 ## Improvement ideas (not yet done)
 
-1. **`--convert-heic` off macOS** — could fall back to ffmpeg ≥7 HEIC demuxing
-   where available instead of hard-requiring sips.
+*(none currently recorded)*

@@ -436,6 +436,33 @@ def _normalise_chapter(chapter: dict) -> dict:
     }
 
 
+def heic_image_streams(path: Path) -> List[dict]:
+    """Still image streams inside a HEIC/HEIF container.
+
+    Cached: a HEIC-heavy library would otherwise re-probe every file on each
+    run, and the answer only changes when the file does.
+    """
+    return _cached("heic-streams1", path, lambda: _heic_image_streams_uncached(path))
+
+
+def _heic_image_streams_uncached(path: Path) -> List[dict]:
+    data = _ffprobe_json([
+        "-show_entries", "stream=index,codec_name,width,height", str(path)
+    ])
+    if data is None:
+        return []
+    return [
+        {
+            "index": stream.get("index"),
+            "codec_name": stream.get("codec_name"),
+            "width": stream.get("width"),
+            "height": stream.get("height"),
+        }
+        for stream in data.get("streams", [])
+        if stream.get("width") and stream.get("height")
+    ]
+
+
 def video_inventory(path: Path) -> Optional[dict]:
     """Return a cached, JSON-serialisable inventory of every video stream.
 
@@ -890,6 +917,43 @@ def check_video_integrity(path: Path, progress_path: Optional[Path] = None) -> d
     if proc.returncode != 0 or stderr:
         return {"ok": False, "reason": _stderr_tail(stderr)}
     return {"ok": True, "reason": "ok"}
+
+
+def _decoded_duration_uncached(path: Path) -> "float | None":
+    cmd = [
+        "ffmpeg", "-nostdin", "-v", "error", "-i", str(path),
+        "-map", "0:v:0", "-f", "null", "-",
+    ]
+    try:
+        proc = run_ffmpeg_progress(cmd, path, media_duration(path), "measuring")
+    except FileNotFoundError:
+        return None
+    if proc.returncode != 0:
+        return None
+    for line in proc.stdout.splitlines():
+        name, separator, value = line.strip().partition("=")
+        if separator and name == "out_time_us":
+            try:
+                seconds = int(value) / 1_000_000
+            except ValueError:
+                return None
+            return seconds if seconds > 0 else None
+    return None
+
+
+def decoded_duration(path: Path) -> "float | None":
+    """Measure a file's real length by decoding it, or None if unreadable.
+
+    A container's declared duration can be badly wrong. Concatenated MPEG
+    program streams (how a ripped DVD's VTS_01_N.VOB parts are usually
+    joined) restart their timestamps at each join, so ffprobe reports only
+    the final segment — 3.9s for a 10s file — and packet spans are fooled the
+    same way. Decoding is the only reliable measure, so this is cached and
+    used as a fallback, never on the normal path.
+    """
+    return _cached(
+        "decoded-duration1", path, lambda: _decoded_duration_uncached(path), strong=True
+    )
 
 
 def video_health(path: Path) -> dict:

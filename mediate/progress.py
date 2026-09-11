@@ -284,9 +284,13 @@ def run_ffmpeg_progress(
         LIVE_PROGRESS.finish(key)
     if CANCELLATION.requested():
         raise ConversionCancelled("conversion cancelled")
+    # The last out_time FFmpeg reported is the decoded timeline length. It is
+    # echoed back on stdout (where it arrived) so callers that need a measured
+    # duration — rather than a container's declared one — can read it without
+    # decoding the file a second time.
     return subprocess.CompletedProcess(
         progress_cmd,
         proc.returncode,
-        "",
+        f"out_time_us={int(current * 1_000_000)}\n",
         stderr_chunks[0] if stderr_chunks else "",
     )

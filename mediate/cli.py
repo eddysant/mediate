@@ -9,6 +9,7 @@ import sys
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
+from typing import Optional
 
 from . import __version__
 from .capabilities import check_media_capabilities
@@ -205,7 +206,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--convert-heic",
         action="store_true",
-        help="convert HEIC/HEIF photos to lossless WebP via macOS sips "
+        help="convert HEIC/HEIF photos to lossless WebP (macOS sips, or an "
+        "FFmpeg build that reads HEIC stills elsewhere) "
         "(default: skip them; the lossless re-encode of an efficient lossy "
         "format usually grows the file — combine with --only-if-smaller)",
     )
@@ -389,37 +391,31 @@ def setup_logging(log_path: Path, verbose: bool) -> None:
     log.addHandler(file_handler)
 
 
-def main(argv=None) -> int:
-    args = parse_args(argv)
-    CANCELLATION.reset()
-
-    root = args.directory.expanduser().resolve()
-    if not root.is_dir():
-        print(f"error: not a directory: {root}", file=sys.stderr)
-        return 2
-
-    log_path = args.log_file or (root / "conversion.log")
-    setup_logging(log_path, args.verbose)
-
-    recovery = recover_transactions(root, dry_run=args.dry_run)
+def recover_pending_transactions(root: Path, dry_run: bool) -> Optional[int]:
+    """Resolve interrupted conversions. Returns an exit code, or None to go on."""
+    recovery = recover_transactions(root, dry_run=dry_run)
     for message in recovery.messages:
         level = logging.ERROR if message.startswith("unresolved") else logging.WARNING
         log.log(level, "transaction recovery: %s", message)
     if recovery.completed or recovery.rolled_back:
-        qualifier = "would handle" if args.dry_run else "handled"
+        qualifier = "would handle" if dry_run else "handled"
         log.warning(
             "transaction recovery: %s %d installed and %d incomplete conversion(s)",
             qualifier,
             recovery.completed,
             recovery.rolled_back,
         )
-    if recovery.unresolved and not args.dry_run:
+    if recovery.unresolved and not dry_run:
         log.error(
             "refusing new work while %d transaction(s) require manual recovery",
             recovery.unresolved,
         )
         return 2
+    return None
 
+
+def run_rename_shortcuts(root: Path, args: argparse.Namespace) -> Optional[int]:
+    """Handle the modes that finish without scanning for media."""
     if args.undo_renames:
         from .renamer import undo_last_batch
 
@@ -443,16 +439,22 @@ def main(argv=None) -> int:
             renamed, skipped, " (dry run)" if args.dry_run else " (undo with --undo-renames)",
         )
         return 0
+    return None
 
+
+def build_options(root: Path, args: argparse.Namespace):
+    """Resolve the disposal policy into Options, or return an exit code."""
     mode = HARD if args.hard_delete else GRAVEYARD if args.graveyard else TRASH
-    if sys.platform == "win32" and mode == TRASH and not (args.keep_originals or args.dry_run or args.rename_only):
+    if sys.platform == "win32" and mode == TRASH and not (
+        args.keep_originals or args.dry_run or args.rename_only
+    ):
         print(
             "error: the Windows Recycle Bin is not supported; use --graveyard DIR or --hard-delete",
             file=sys.stderr,
         )
         return 2
     dispose, dispose_label = make_disposer(mode, root, args.graveyard)
-    opts = Options(
+    return Options(
         dry_run=args.dry_run,
         keep_originals=args.keep_originals,
         only_if_smaller=args.only_if_smaller,
@@ -465,7 +467,90 @@ def main(argv=None) -> int:
         dispose=dispose,
         dispose_label=dispose_label,
         transaction_root=root,
-    )
+    ), dispose_label
+
+
+def plan_jobs(jobs, output_format: str, convert_live_photos: bool):
+    """Resolve every skip and output name that must be settled before the pool.
+
+    1. Live Photo pairs — converting either half breaks the pairing.
+    2. Output collisions are assigned distinct GUID-suffixed names here, so
+       concurrent workers can never target one path. Both would otherwise
+       pass process_job's own final.exists() check and the second rename
+       would clobber the first *after both originals were disposed*.
+
+    Returns (runnable jobs, planned skip outcomes).
+    """
+    companions = {} if convert_live_photos else find_live_photo_companions(jobs)
+    # Both halves are protected: converting either breaks the
+    # ContentIdentifier link Apple Photos uses to reunite them.
+    protected = {}
+    for mov, still in companions.items():
+        protected[mov] = f"Live Photo video of {still.name} (--convert-live-photos to convert)"
+        protected[still] = f"Live Photo still of {mov.name} (--convert-live-photos to convert)"
+    claimed = {}
+    runnable = []
+    planned_skips = []
+    for job in jobs:
+        if job.path in protected:
+            planned_skips.append(Outcome(SKIPPED, job.path, protected[job.path]))
+            continue
+        # The output format must match what process_job will actually produce:
+        # a claimed name is stored on the job and used verbatim as the final
+        # path, so computing it with the wrong extension would write (say)
+        # AVIF bytes into a .webp name and stop real collisions being claimed.
+        out = intended_output(job, output_format=output_format)
+        if out != job.path and (out in claimed or out.exists()):
+            out = unique_output_path(out, claimed)
+            job = replace(job, output=out)
+        claimed[out] = job.path
+        runnable.append(job)
+    return runnable, planned_skips
+
+
+def summarize_run(tally: dict, bytes_saved: int, dry_run: bool) -> str:
+    """The one-line closing summary."""
+    if dry_run:
+        return (
+            f"dry run complete: {tally[PLANNED]} would be converted, "
+            f"{tally[SKIPPED]} skipped"
+        )
+    parts = []
+    for status, label in (
+        (CONVERTED, "converted"), (REMUXED, "remuxed"), (REPAIRED, "repaired"),
+    ):
+        if tally[status]:
+            parts.append(f"{tally[status]} {label}")
+    parts.append(f"{tally[SKIPPED]} skipped")
+    parts.append(f"{tally[FAILED]} failed")
+    parts.append(f"{bytes_saved / (1024 * 1024):.1f} MB saved")
+    return "done: " + ", ".join(parts)
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    CANCELLATION.reset()
+
+    root = args.directory.expanduser().resolve()
+    if not root.is_dir():
+        print(f"error: not a directory: {root}", file=sys.stderr)
+        return 2
+
+    log_path = args.log_file or (root / "conversion.log")
+    setup_logging(log_path, args.verbose)
+
+    blocked = recover_pending_transactions(root, args.dry_run)
+    if blocked is not None:
+        return blocked
+
+    shortcut = run_rename_shortcuts(root, args)
+    if shortcut is not None:
+        return shortcut
+
+    built = build_options(root, args)
+    if isinstance(built, int):
+        return built
+    opts, dispose_label = built
 
     if args.rename_only:
         return run_rename_phase(root, args)
@@ -495,6 +580,7 @@ def main(argv=None) -> int:
         require_photos=has_photos,
         require_animated_webp=any(job.kind == "webp" for job in recognized),
         require_avif=has_photos and args.output_format == "avif",
+        require_heic=args.convert_heic and any(job.kind == "heic" for job in recognized),
     )
     for name, version in capability_report.versions.items():
         log.debug("toolchain: %s: %s", name, version)
@@ -541,34 +627,11 @@ def main(argv=None) -> int:
         save_probe_cache()
         return run_rename_phase(root, args) if args.rename else 0
 
-    # Planning-time skips, resolved before the pool starts:
-    # 1. Live Photo pairs — converting the .mov half breaks the pairing.
-    # 2. Output collisions are assigned distinct GUID-suffixed names before
-    #    workers start, so concurrent conversions can never target one path.
-    companions = {} if args.convert_live_photos else find_live_photo_companions(jobs)
-    # Both halves of a pair are protected: converting either one breaks the
-    # ContentIdentifier link Apple Photos uses to reunite them.
-    protected = {}
-    for mov, still in companions.items():
-        protected[mov] = f"Live Photo video of {still.name} (--convert-live-photos to convert)"
-        protected[still] = f"Live Photo still of {mov.name} (--convert-live-photos to convert)"
-    claimed = {}
-    runnable = []
-    planned_skips = []
-    for job in jobs:
-        if job.path in protected:
-            planned_skips.append(Outcome(SKIPPED, job.path, protected[job.path]))
-            continue
-        # The output format must match what process_job will actually produce:
-        # a claimed name is stored on the job and used verbatim as the final
-        # path, so computing it with the wrong extension would write (say)
-        # AVIF bytes into a .webp name and stop real collisions being claimed.
-        out = intended_output(job, output_format=args.output_format)
-        if out != job.path and (out in claimed or out.exists()):
-            out = unique_output_path(out, claimed)
-            job = replace(job, output=out)
-        claimed[out] = job.path
-        runnable.append(job)
+    runnable, planned_skips = plan_jobs(
+        jobs,
+        output_format=args.output_format,
+        convert_live_photos=args.convert_live_photos,
+    )
 
     journal = RunJournal(root, enabled=not args.dry_run)
     runnable, resumed_count = journal.prepare(runnable)
@@ -636,24 +699,7 @@ def main(argv=None) -> int:
         return 130
     journal.finish(interrupted=False)
 
-    if args.dry_run:
-        log.info(
-            "dry run complete: %d would be converted, %d skipped",
-            tally[PLANNED], tally[SKIPPED],
-        )
-    else:
-        saved_mb = bytes_saved / (1024 * 1024)
-        parts = []
-        if tally[CONVERTED]:
-            parts.append(f"{tally[CONVERTED]} converted")
-        if tally[REMUXED]:
-            parts.append(f"{tally[REMUXED]} remuxed")
-        if tally[REPAIRED]:
-            parts.append(f"{tally[REPAIRED]} repaired")
-        parts.append(f"{tally[SKIPPED]} skipped")
-        parts.append(f"{tally[FAILED]} failed")
-        parts.append(f"{saved_mb:.1f} MB saved")
-        log.info("done: %s", ", ".join(parts))
+    log.info("%s", summarize_run(tally, bytes_saved, args.dry_run))
     save_probe_cache()
     if args.rename:
         # Rename runs after conversion so freshly produced .webp/.mp4 files
