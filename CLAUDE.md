@@ -173,6 +173,19 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   the only record that makes renames reversible. `undo_last_batch` also
   survives a single unrestorable entry, and keeps the batch recorded when
   any entry failed so the remainder can be retried.
+- **The renamer skips symlinks** (`_walk_files`), matching the converter's
+  refusal of symlinked media. Renaming a link would move a pointer whose
+  target may live anywhere, and a broken link would be quietly tidied.
+- **Names are trimmed to 255 bytes** (`fit_within_name_max`): the filesystem
+  limit is bytes, not characters, so trimming happens on the encoded form
+  without splitting a character. The trailing `[N]` tag and any
+  `--date-prefix` are preserved and the descriptive middle is shortened —
+  dropping the tag would collapse two long series members onto one name.
+- **Invisible formatting is stripped, joiners are not** (`INVISIBLE_RE`):
+  zero-width space, LTR/RTL marks, directional overrides, word joiner and BOM
+  are scrape residue. U+200C/U+200D are deliberately excluded — they join
+  visible glyphs in Indic scripts and emoji, so stripping them would split a
+  family emoji into three people.
 - **Renamer gap-closing needs the deferred-apply loop** (`apply_renames`):
   `[2]→[1], [3]→[2]` — the second rename's target is occupied until the first
   happens. Renames whose target is another pending rename's source wait a

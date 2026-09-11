@@ -183,7 +183,10 @@ also left alone, which is what makes re-runs idempotent.
 `--date-prefix` prepends the capture date (`2019-06-01 Misty Vale [01].webp`)
 from EXIF via exiftool, video `creation_time`, or file mtime.
 
-**Safety** — a rename never overwrites. Live Photo `.mov` halves mirror their
+**Safety** — a rename never overwrites. Symlinks are skipped, matching the
+converter. Names are trimmed to the filesystem's 255-byte limit with the
+numbering tag and any date prefix kept intact, and invisible formatting
+(zero-width spaces, direction marks) is stripped while emoji joiners survive. Live Photo `.mov` halves mirror their
 still's rename and `.aae`/`.xmp` sidecars follow their media file, so pairings
 survive. Files that clean to the same name (`misty_vale.jpg` and
 `misty.vale.jpg` both becoming `Misty Vale`) join one numbered series rather

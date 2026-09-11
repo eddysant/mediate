@@ -114,8 +114,10 @@ class PlanRenamesTests(unittest.TestCase):
         path.write_bytes(b"x")
         return path
 
-    def plan(self):
-        return {p.src.name: p.dst.name for p in plan_renames(self.root)}
+    def plan(self, **kwargs):
+        return {
+            p.src.name: p.dst.name for p in plan_renames(self.root, **kwargs)
+        }
 
     def test_basic_example(self):
         self.touch("misty vale (1).jpg")
@@ -245,6 +247,47 @@ class PlanRenamesTests(unittest.TestCase):
         self.touch("Vacation [550e8400-e29b-41d4-a716-446655440000].jpg")
         self.touch("Nova Quinn [Example.com 1].jpg")
         self.assertEqual(self.plan(), {})
+
+    def test_symlinks_are_not_renamed(self):
+        # The converter refuses symlinked media; the renamer now agrees.
+        self.touch("real photo.jpg")
+        os.symlink(self.root / "real photo.jpg", self.root / "link photo.jpg")
+        os.symlink(self.root / "nowhere.jpg", self.root / "broken link.jpg")
+        self.assertEqual(self.plan(), {"real photo.jpg": "Real Photo.jpg"})
+
+    def test_an_over_long_name_is_trimmed_to_fit(self):
+        self.touch("a" * 245 + ".jpg")
+        plan = self.plan(date_prefix=True)
+        (produced,) = plan.values()
+        self.assertLessEqual(len(produced.encode("utf-8")), 255)
+        self.assertTrue(produced.startswith("20"), produced[:12])  # date kept
+
+    def test_truncation_keeps_the_series_tag_distinct(self):
+        # Trimming the middle must not collapse two members onto one name.
+        for i in (1, 2):
+            self.touch("b" * 245 + f" ({i}).jpg")
+        produced = set(self.plan(date_prefix=True).values())
+        self.assertEqual(len(produced), 2, produced)
+        for name in produced:
+            self.assertLessEqual(len(name.encode("utf-8")), 255)
+            self.assertRegex(name, r" \[\d+\]\.jpg$")
+
+    def test_invisible_formatting_is_stripped(self):
+        self.touch("photo\u200bshoot.jpg")
+        self.touch("\u202ereversed.jpg")
+        plan = self.plan()
+        self.assertEqual(plan["photo\u200bshoot.jpg"], "Photoshoot.jpg")
+        self.assertEqual(plan["\u202ereversed.jpg"], "Reversed.jpg")
+
+    def test_emoji_joiners_are_preserved(self):
+        # U+200D joins a family emoji into one glyph; stripping it would
+        # silently split it into three separate people.
+        name = "family \U0001F468\u200d\U0001F469\u200d\U0001F467.jpg"
+        self.touch(name)
+        self.assertEqual(
+            self.plan()[name],
+            "Family \U0001F468\u200d\U0001F469\u200d\U0001F467.jpg",
+        )
 
     def test_padding_widens_past_ninety_nine(self):
         # A flat width of 2 put "[100]" lexically between "[09]" and "[10]",

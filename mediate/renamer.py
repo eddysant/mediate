@@ -188,11 +188,17 @@ INITIAL_DOT_RE = re.compile(r"(?<![A-Za-z0-9])([A-Za-z])\.")
 DIGIT_DOT_RE = re.compile(r"(?<=\d)\.(?=\d)")
 # A word that is nothing but single letters and dots is an initialism.
 INITIALISM_RE = re.compile(r"^(?:[A-Za-z]\.)+[A-Za-z]?$")
+# Invisible formatting that is almost always scrape residue. U+200C/U+200D
+# (the zero-width non-joiner and joiner) are deliberately NOT here: they join
+# visible glyphs in Indic scripts and in emoji sequences, so stripping them
+# would silently split a family emoji into three people.
+INVISIBLE_RE = re.compile("[\u200b\u200e\u200f\u202a-\u202e\u2060\ufeff]")
 _KEEP_DOT = "\x00"
 
 
 def clean_base(base: str) -> str:
     base = unicodedata.normalize("NFC", base)
+    base = INVISIBLE_RE.sub("", base)
     if PROTECTED_RE.match(base) or NO_CLEAN_RE.match(base):
         return base.strip()
     # A date-stamped export carries a clock in its dots, so "12.30.45" must
@@ -242,6 +248,31 @@ def media_date(path: Path) -> str:
     return date.fromtimestamp(path.stat().st_mtime).isoformat()
 
 
+# Practical per-component limit on APFS/HFS+/ext4/NTFS.
+NAME_MAX_BYTES = 255
+TAG_TAIL_RE = re.compile(r" \[[^\]]*\]$")
+
+
+def fit_within_name_max(stem: str, ext: str) -> str:
+    """Trim a stem's middle so ``stem + ext`` fits the filesystem limit.
+
+    The trailing " [N]" tag is what keeps a series distinct and a leading
+    --date-prefix is the whole point of that flag, so both are kept and the
+    descriptive middle is shortened. Trimming is done on encoded bytes (the
+    limit is bytes, not characters) without splitting a character.
+    """
+    if len((stem + ext).encode("utf-8")) <= NAME_MAX_BYTES:
+        return stem
+    match = TAG_TAIL_RE.search(stem)
+    tag = match.group(0) if match else ""
+    head = stem[: match.start()] if match else stem
+    budget = NAME_MAX_BYTES - len((tag + ext).encode("utf-8"))
+    if budget <= 0:
+        return stem  # tag and extension alone overflow; let the rename fail
+    head = head.encode("utf-8")[:budget].decode("utf-8", "ignore").rstrip()
+    return head + tag if head else stem
+
+
 @dataclass
 class _Member:
     path: Path
@@ -258,8 +289,15 @@ def _walk_files(root: Path) -> Iterator[Path]:
             if not d.startswith(".") and Path(d).suffix.lower() not in BUNDLE_EXTS
         ]
         for name in sorted(filenames):
-            if not name.startswith("."):
-                yield Path(dirpath) / name
+            if name.startswith("."):
+                continue
+            path = Path(dirpath) / name
+            if path.is_symlink():
+                # The converter refuses symlinked media outright; renaming it
+                # here would move a link whose target may live anywhere.
+                log.debug("[skip] %s: symbolic link, not renamed", path)
+                continue
+            yield path
 
 
 def _tag(site: Optional[str], n: Optional[int], width: int) -> str:
@@ -334,6 +372,7 @@ def plan_renames(root: Path, date_prefix: bool = False) -> List[Rename]:
     def finalize(path: Path, new_stem: str, ext: str) -> str:
         if date_prefix and not DATE_START_RE.match(new_stem):
             new_stem = f"{media_date(path)} {new_stem}"
+        new_stem = fit_within_name_max(new_stem, ext)
         plans.append(Rename(path, path.with_name(new_stem + ext)))
         return new_stem  # what actually got emitted (mirrors/sidecars follow it)
 
