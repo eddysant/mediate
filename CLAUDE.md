@@ -15,13 +15,13 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 | `scanner.py` | `os.walk` traversal → `MediaJob(path, kind)`; kind ∈ photo/heic/gif/webp/video/mp4; Live Photo pairing helper |
 | `probe.py` | cached `ffprobe -of json` helpers: codec/remux classification plus a normalized inventory of all streams, stream groups, chapters, track identity, rotation, colour, and artwork |
 | `converters.py` | command construction, stream-safety policy, temp-file protocol, `classify_job()` (every probe-based skip, no filesystem writes) + `process_job()`; includes `-c copy` remuxing for compatible containers and a rotation display-matrix finalizer |
-| `validators.py` | exit/existence/size/full-decode checks plus photo metadata and video duration/stream/track/chapter/rotation/colour verification |
+| `validators.py` | exit/existence/size/full-decode checks plus photo metadata; `verify_video_streams` dispatches lazily to named per-concern checks (audio tracks, subtitles, artwork, chapters, video format) |
 | `progress.py` | concurrent FFmpeg progress plus cooperative cancellation and child termination |
 | `safety.py` | source snapshots, link/readability policy, output writability and aggregate per-filesystem free-space reservations |
 | `journal.py` | atomic `.mediate-run.json` state and interrupted-job prioritization |
 | `transaction.py` | durable two-phase validated-output replacement plus startup rollback/completion recovery |
 | `capabilities.py` | FFmpeg/cwebp version, encoder/demuxer, progress, rotation, smoke-encode, and ffprobe JSON preflight |
-| `disposal.py` | serializable Trash (macOS per-volume `.Trashes`, freedesktop elsewhere) / graveyard / hard-delete policy |
+| `disposal.py` | serializable Trash (macOS per-volume `.Trashes`, freedesktop elsewhere) / graveyard / hard-delete policy; `_same_volume` is a seam so tests can exercise the external-drive branch |
 | `macmeta.py` | ctypes `setattrlist(2)` to copy the original's birthtime (Finder "date created") onto outputs; no-op off macOS |
 | `exiftool.py` | pool of up to 4 persistent `exiftool -stay_open` daemons behind `run_exiftool(args)` (per-thread, atexit-stopped, one-shot fallback); all exiftool queries go through it |
 | `renamer.py` | `--rename`/`--rename-only` phase: stem parsing (paren/bracket/dash numbers, copy markers, `[site N]` tags, websites), cleanup + title case, per-(dir, base, site, ext) series renumbering compacted to 1 with gap-closing and zero-padding, GUID/random-token→folder-name, `--date-prefix`, `--rename-folders`, manifest + `--undo-renames`, never-overwrite apply loop |
@@ -118,6 +118,11 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   which would then also have permitted discarding real subtitles. DVD bitmap
   subtitles (`dvd_subtitle`) still block: MP4 cannot carry VOBSUB, so that
   loss is real and stays opt-in.
+- **Disposal tests must never touch the real Trash** (`test_disposal.py`):
+  every test redirects `HOME`/`XDG_DATA_HOME` into a temp dir, because
+  `Path.home()` reads `HOME` and an unpatched run would move fixtures into
+  the developer's own `~/.Trash`. Trash is the *default* mode, so this is the
+  path an ordinary invocation takes.
 - **Stream-inventory failures fail closed**: a video is skipped because it is
   unsafe to alter without knowing what it contains. Narrow codec/GIF probes
   still fail open into conversion/validation where no destructive stream

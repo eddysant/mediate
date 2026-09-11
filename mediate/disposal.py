@@ -39,6 +39,14 @@ def _move(src: Path, dest: Path) -> None:
         shutil.move(str(src), str(dest))
 
 
+def _same_volume(a: Path, b: Path) -> bool:
+    """Whether two paths live on the same filesystem. Unknown counts as same."""
+    try:
+        return a.stat().st_dev == b.stat().st_dev
+    except OSError:
+        return True
+
+
 def _trash_dir_for(path: Path) -> Path:
     """The Trash directory to use for a file, per platform convention."""
     if sys.platform == "darwin":
@@ -46,7 +54,7 @@ def _trash_dir_for(path: Path) -> Path:
         try:
             # A file on another volume gets that volume's .Trashes/<uid>,
             # avoiding a full copy of (potentially huge) video files.
-            if path.stat().st_dev != home_trash.stat().st_dev:
+            if not _same_volume(path, home_trash):
                 for parent in path.resolve().parents:
                     candidate = parent / ".Trashes" / str(os.getuid())
                     if (parent / ".Trashes").is_dir():

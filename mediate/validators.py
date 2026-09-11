@@ -381,56 +381,44 @@ def _subtitle_identity(stream: dict) -> dict:
     }
 
 
-def verify_video_streams(
-    src: Path,
-    output: Path,
-    source_inventory: "dict | None" = None,
-    allow_stream_removal: bool = False,
-    allow_video_downgrade: bool = False,
-    allow_truncated_source: bool = False,
-    preserve_video_codec: bool = False,
+def _recover_damaged_source_duration(
+    src: Path, output: Path, source, target, source_video, target_video, reason: str
 ) -> Tuple[bool, str]:
-    """Verify duration plus all stream/metadata promises made by conversion."""
-    ok, reason = verify_video_duration(src, output)
-    duration_note = "ok"
-    
-    source = source_inventory if source_inventory is not None else video_inventory(src)
-    target = video_inventory(output)
-    if source is None or target is None:
-        return False, "could not inventory source and output streams"
+    """Accept a duration mismatch when packet spans prove nothing was lost.
 
-    source_video = primary_video_streams(source)
-    target_video = primary_video_streams(target)
-    expected_source_videos = 1 if allow_stream_removal and source_video else len(source_video)
-    if expected_source_videos != 1 or len(target_video) != 1:
-        return False, (
-            f"primary video stream count changed: source {len(source_video)}, "
-            f"output {len(target_video)}"
-        )
-
-    if not ok:
-        source_packets = packet_stream_durations(src)
-        target_packets = packet_stream_durations(output)
-        paired_streams = [
-            *zip(source_video, target_video),
-            *zip(inventory_streams(source, "audio"), inventory_streams(target, "audio")),
-        ]
-        recovered = []
-        for before, after in paired_streams:
-            before_duration = source_packets.get(str(before.get("index")))
-            after_duration = target_packets.get(str(after.get("index")))
-            if before_duration is None or after_duration is None:
-                return False, reason
-            if abs(before_duration - after_duration) > max(1.0, before_duration * 0.02):
-                return False, reason
-            recovered.append(before_duration)
-        if not recovered:
+    A damaged container can declare a length its own packets do not support.
+    If every paired stream's readable span survived intact, the conversion
+    recovered all there was to recover.
+    """
+    source_packets = packet_stream_durations(src)
+    target_packets = packet_stream_durations(output)
+    paired_streams = [
+        *zip(source_video, target_video),
+        *zip(inventory_streams(source, "audio"), inventory_streams(target, "audio")),
+    ]
+    recovered = []
+    for before, after in paired_streams:
+        before_duration = source_packets.get(str(before.get("index")))
+        after_duration = target_packets.get(str(after.get("index")))
+        if before_duration is None or after_duration is None:
             return False, reason
-        duration_note = (
-            f"recovered all {max(recovered):.1f}s of readable media; "
-            f"the damaged source header claimed {media_duration(src):.1f}s"
-        )
+        if abs(before_duration - after_duration) > max(1.0, before_duration * 0.02):
+            return False, reason
+        recovered.append(before_duration)
+    if not recovered:
+        return False, reason
+    duration_note = (
+        f"recovered all {max(recovered):.1f}s of readable media; "
+        f"the damaged source header claimed {media_duration(src):.1f}s"
+    )
+    return True, duration_note
 
+
+def _verify_audio_tracks(
+    src: Path, output: Path, source, target, source_video, target_video,
+    allow_stream_removal: bool,
+) -> Tuple[bool, str]:
+    """Every audio track's identity, duration, layout, profile and A/V sync."""
     source_audio = inventory_streams(source, "audio")
     target_audio = inventory_streams(target, "audio")
     if len(source_audio) != len(target_audio):
@@ -552,7 +540,11 @@ def verify_video_streams(
                         f"{before_offset:+.3f}s vs output {after_offset:+.3f}s "
                         f"(tolerance {tolerance:.3f}s)"
                     )
+    return True, "ok"
 
+
+def _verify_subtitle_tracks(source, target) -> Tuple[bool, str]:
+    """Compatible text subtitles must survive as mov_text, with metadata."""
     source_subtitles = preservable_subtitle_streams(source)
     target_subtitles = inventory_streams(target, "subtitle")
     if len(source_subtitles) != len(target_subtitles):
@@ -580,7 +572,11 @@ def verify_video_streams(
             return False, f"subtitle track {index} is not MP4 mov_text"
         if _subtitle_identity(before) != _subtitle_identity(after):
             return False, f"subtitle track {index} language/title/disposition metadata changed"
+    return True, "ok"
 
+
+def _verify_artwork_streams(source, target) -> Tuple[bool, str]:
+    """Cover art that MP4 can retain must come through unchanged."""
     source_artwork = preservable_artwork_streams(source)
     target_artwork = preservable_artwork_streams(target)
     if len(source_artwork) != len(target_artwork):
@@ -593,7 +589,11 @@ def verify_video_streams(
             before_value = before.get(field)
             if before_value is not None and before_value != after.get(field):
                 return False, f"artwork stream {index} {field} changed"
+    return True, "ok"
 
+
+def _verify_chapters(source, target) -> Tuple[bool, str]:
+    """Chapter count, titles and timings."""
     source_chapters = source.get("chapters", [])
     target_chapters = target.get("chapters", [])
     if len(source_chapters) != len(target_chapters):
@@ -618,7 +618,13 @@ def verify_video_streams(
             return False, f"chapter {index} timing could not be verified"
         if start_delta > 0.5 or end_delta > 0.5:
             return False, f"chapter {index} timing changed"
+    return True, "ok"
 
+
+def _verify_video_format(
+    source_video, target_video, preserve_video_codec: bool, allow_video_downgrade: bool
+) -> Tuple[bool, str]:
+    """Codec/pixel format, rotation, colour, and the downgrade-guarded fields."""
     before_video = source_video[0]
     after_video = target_video[0]
     if preserve_video_codec and (
@@ -676,5 +682,66 @@ def verify_video_streams(
         }
         if not important.issubset(after_side_data):
             return False, "video HDR/dynamic-range side data changed"
+    return True, "ok"
+
+
+def verify_video_streams(
+    src: Path,
+    output: Path,
+    source_inventory: "dict | None" = None,
+    allow_stream_removal: bool = False,
+    allow_video_downgrade: bool = False,
+    allow_truncated_source: bool = False,
+    preserve_video_codec: bool = False,
+) -> Tuple[bool, str]:
+    """Verify duration plus all stream/metadata promises made by conversion.
+
+    Each stage is a named check returning (ok, reason) and the first failure
+    is returned as-is. The checks are deliberately lazy: a later stage may
+    assume what an earlier one established, and none should pay for probing a
+    conversion that has already been rejected. Order matters only in that the
+    primary video count comes first — every later stage assumes exactly one
+    picture stream on each side.
+    """
+    ok, reason = verify_video_duration(src, output)
+    duration_note = "ok"
+
+    source = source_inventory if source_inventory is not None else video_inventory(src)
+    target = video_inventory(output)
+    if source is None or target is None:
+        return False, "could not inventory source and output streams"
+
+    source_video = primary_video_streams(source)
+    target_video = primary_video_streams(target)
+    expected_source_videos = 1 if allow_stream_removal and source_video else len(source_video)
+    if expected_source_videos != 1 or len(target_video) != 1:
+        return False, (
+            f"primary video stream count changed: source {len(source_video)}, "
+            f"output {len(target_video)}"
+        )
+
+    if not ok:
+        recovered_ok, note = _recover_damaged_source_duration(
+            src, output, source, target, source_video, target_video, reason
+        )
+        if not recovered_ok:
+            return False, note
+        duration_note = note
+
+    for check in (
+        lambda: _verify_audio_tracks(
+            src, output, source, target, source_video, target_video,
+            allow_stream_removal,
+        ),
+        lambda: _verify_subtitle_tracks(source, target),
+        lambda: _verify_artwork_streams(source, target),
+        lambda: _verify_chapters(source, target),
+        lambda: _verify_video_format(
+            source_video, target_video, preserve_video_codec, allow_video_downgrade
+        ),
+    ):
+        check_ok, check_reason = check()
+        if not check_ok:
+            return False, check_reason
 
     return True, duration_note
