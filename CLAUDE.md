@@ -179,6 +179,21 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   round; anything still blocked when a full round makes no progress is skipped
   (never overwritten). `samefile()` distinguishes a real collision from a
   case-only rename on case-insensitive APFS (`exists()` lies there).
+- **Meaningful punctuation is protected before word cleanup** (`clean_base`):
+  a dot after a *single* letter is an initialism (`R.E.M.`, `e.e.`) and is
+  kept, then uppercased — a dot after a longer run stays a separator, so
+  `Mr. Smith` still flattens. A stem starting `YYYY-MM-DD` additionally keeps
+  digit-dot-digit (a clock), but is *not* exempted from title-casing: the
+  words around the timestamp are still tidied. Both protections work by
+  sentinel substitution around the existing `[_.]+` pass.
+- **A parenthesised 1900–2099 number is a year, not a counter** (`parse_stem`):
+  `The Matrix (1999)` used to become `The Matrix [1]`, destroying the year.
+  Only `(N)` is exempted — `[1999]` stays a tag and dash-numbers are
+  unaffected — so ordinary `photo (1)` duplicates still fold.
+- **Hyphens between capitalised words are deliberately NOT protected**: once
+  numbering is stripped, `Anne-Marie` is structurally identical to
+  `Tilly-Marsh`, and dash-as-separator is the common case. Keeping them would
+  turn `Tilly-Marsh-001` into `Tilly-Marsh [1]`.
 - **Renamer protected patterns run on the number-stripped base**: `IMG_1234
   (1).JPG` still gets `(1)→[1]` and `.jpg`, but the `IMG_1234` stem is
   verbatim. `PROTECTED_RE` must allow multi-group counters

@@ -66,6 +66,10 @@ TAG_RE = re.compile(r"^(?P<base>.*?)[ ]*\[(?:(?P<site>[^\]\s]+)[ ]+)?(?P<n>\d+)\
 TAG_SITE_RE = re.compile(r"^(?P<base>.*?)[ ]*\[(?P<site>[^\]\s]+\.[A-Za-z]{2,})\]$")
 BRACKET_TAIL_RE = re.compile(r"\[[^\]]*\]$")
 NUM_PAREN_RE = re.compile(r"^(?P<base>.*?)[ _]*\((?P<n>\d+)\)$")
+# "(1999)" in a filename is a release year, not Finder's duplicate counter.
+# Reading it as a counter renamed "The Matrix (1999)" to "The Matrix [1]" and
+# destroyed the year, so this range is excluded from numbering.
+YEAR_RANGE = range(1900, 2100)
 # Dash-number needs a non-digit, non-space char before the dash, so date
 # stems like "2023-01-05" don't lose their day.
 NUM_DASH_RE = re.compile(r"^(?P<base>.*?[^\s\d])[ ]*[-–][ ]*(?P<n>\d+)$")
@@ -153,7 +157,10 @@ def parse_stem(stem: str) -> ParsedName:
             for pattern in (NUM_PAREN_RE, NUM_DASH_RE):
                 m = pattern.match(stem)
                 if m:
-                    number = int(m.group("n"))
+                    candidate = int(m.group("n"))
+                    if pattern is NUM_PAREN_RE and candidate in YEAR_RANGE:
+                        break  # a year: leave it in the name
+                    number = candidate
                     stem = m.group("base")
                     break
             if number is None and not dup:
@@ -172,19 +179,40 @@ def parse_stem(stem: str) -> ParsedName:
     return ParsedName(stem, number, dup, site)
 
 
+# A dot directly after a *single* letter belongs to an initialism
+# ("R.E.M.", "e.e. cummings"). A dot after a longer run is a separator, so
+# "Mr. Smith" and "holiday.photo" still clean up.
+INITIAL_DOT_RE = re.compile(r"(?<![A-Za-z0-9])([A-Za-z])\.")
+# Digits either side of a dot are a time or a version, never a separator.
+# Only consulted for date-stamped names, where "12.30.45" is a clock.
+DIGIT_DOT_RE = re.compile(r"(?<=\d)\.(?=\d)")
+# A word that is nothing but single letters and dots is an initialism.
+INITIALISM_RE = re.compile(r"^(?:[A-Za-z]\.)+[A-Za-z]?$")
+_KEEP_DOT = "\x00"
+
+
 def clean_base(base: str) -> str:
     base = unicodedata.normalize("NFC", base)
     if PROTECTED_RE.match(base) or NO_CLEAN_RE.match(base):
         return base.strip()
+    # A date-stamped export carries a clock in its dots, so "12.30.45" must
+    # not become "12 30 45" — but the words around it still get tidied.
+    is_dated = bool(DATE_START_RE.match(base))
+    base = INITIAL_DOT_RE.sub(lambda m: m.group(1) + _KEEP_DOT, base)
+    if is_dated:
+        base = DIGIT_DOT_RE.sub(_KEEP_DOT, base)
     base = re.sub(r"[_.]+", " ", base)
     # Dashes become spaces when a letter is adjacent; digit-dash-digit
     # (dates, ranges) survives.
     base = re.sub(r"(?<=[A-Za-z])[-–]|[-–](?=[A-Za-z])", " ", base)
     base = re.sub(r"\s+", " ", base).strip(" -–_.")
+    base = base.replace(_KEEP_DOT, ".")
     words = base.split(" ")
     out = []
     for i, word in enumerate(words):
-        if word.islower():
+        if INITIALISM_RE.match(word):
+            out.append(word.upper())  # "e.e." -> "E.E.", "R.E.M." unchanged
+        elif word.islower():
             if i > 0 and word in SMALL_WORDS:
                 out.append(word)
             else:

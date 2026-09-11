@@ -246,6 +246,52 @@ class PlanRenamesTests(unittest.TestCase):
         self.touch("Nova Quinn [Example.com 1].jpg")
         self.assertEqual(self.plan(), {})
 
+    def test_a_parenthesised_year_is_not_a_duplicate_counter(self):
+        # "The Matrix (1999)" became "The Matrix [1]" — the year was read as
+        # Finder's duplicate marker and destroyed.
+        self.touch("The Matrix (1999).mp4")
+        self.touch("Blade Runner (2049).mkv")
+        self.assertEqual(self.plan(), {})
+
+    def test_ordinary_duplicate_counters_still_fold(self):
+        self.touch("photo (1).jpg")
+        self.touch("photo (2).jpg")
+        plan = self.plan()
+        self.assertEqual(plan["photo (1).jpg"], "Photo [1].jpg")
+        self.assertEqual(plan["photo (2).jpg"], "Photo [2].jpg")
+
+    def test_a_large_non_year_number_is_still_a_counter(self):
+        self.touch("photo (3000).jpg")
+        self.assertEqual(self.plan(), {"photo (3000).jpg": "Photo [1].jpg"})
+
+    def test_initialisms_keep_their_dots_and_are_uppercased(self):
+        self.touch("R.E.M. concert.jpg")
+        self.touch("e.e. cummings.jpg")
+        plan = self.plan()
+        self.assertEqual(plan["R.E.M. concert.jpg"], "R.E.M. Concert.jpg")
+        self.assertEqual(plan["e.e. cummings.jpg"], "E.E. Cummings.jpg")
+
+    def test_multi_letter_abbreviations_still_lose_their_dot(self):
+        # Only a *single* letter before the dot marks an initialism.
+        self.touch("Mr. Smith.jpg")
+        self.touch("holiday.photo.jpg")
+        plan = self.plan()
+        self.assertEqual(plan["Mr. Smith.jpg"], "Mr Smith.jpg")
+        self.assertEqual(plan["holiday.photo.jpg"], "Holiday Photo.jpg")
+
+    def test_a_date_stamped_name_keeps_its_clock_but_still_tidies_words(self):
+        self.touch("2023-01-05 12.30.45.jpg")
+        self.touch("2023-01-05 party.jpg")
+        plan = self.plan()
+        self.assertNotIn("2023-01-05 12.30.45.jpg", plan)  # clock intact
+        self.assertEqual(plan["2023-01-05 party.jpg"], "2023-01-05 Party.jpg")
+
+    def test_hyphenated_names_are_still_flattened(self):
+        # Deliberate: once numbering is stripped, "Anne-Marie" cannot be told
+        # apart from "Tilly-Marsh", and dashes-as-separators is the common case.
+        self.touch("Anne-Marie.jpg")
+        self.assertEqual(self.plan(), {"Anne-Marie.jpg": "Anne Marie.jpg"})
+
     def test_date_stems_survive_cleanup(self):
         self.touch("2023-01-05 party.jpg")
         self.assertEqual(self.plan(), {"2023-01-05 party.jpg": "2023-01-05 Party.jpg"})
