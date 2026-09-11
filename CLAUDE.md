@@ -215,9 +215,11 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   not); a bare space-number (`Terminator 2`) is never numbering. `SITE_RE`
   domain labels deliberately exclude dashes — in filenames a dash is a
   separator, not part of a hyphenated domain.
-- **Padding tracks the current series size** (width 2 iff ≥10 members), so a
-  series shrinking below 10 unpads on the next run. Numbering always
-  compacts to start at 1.
+- **Padding tracks the current series size** — width is the digit count of
+  the largest number, so a series shrinking below 10 unpads on the next run
+  and one passing 99 widens to 3. A flat width of 2 put `[100]` lexically
+  between `[09]` and `[10]`, which is the one thing padding exists to
+  prevent. Numbering always compacts to start at 1.
 - **Rename manifest**: every applied batch (files then folders, in execution
   order) is appended to `.mediate-renames.json` at the root; undo replays it
   reversed, so folder renames undo before the files inside them. Folder

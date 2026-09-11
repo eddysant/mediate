@@ -246,6 +246,29 @@ class PlanRenamesTests(unittest.TestCase):
         self.touch("Nova Quinn [Example.com 1].jpg")
         self.assertEqual(self.plan(), {})
 
+    def test_padding_widens_past_ninety_nine(self):
+        # A flat width of 2 put "[100]" lexically between "[09]" and "[10]",
+        # defeating the only reason padding exists.
+        for i in range(1, 106):
+            self.touch(f"shot ({i}).jpg")
+        plan = self.plan()
+        numeric = [plan[f"shot ({i}).jpg"] for i in range(1, 106)]
+        self.assertEqual(numeric[0], "Shot [001].jpg")
+        self.assertEqual(numeric[-1], "Shot [105].jpg")
+        self.assertEqual(sorted(numeric), numeric, "lexical order != numeric order")
+
+    def test_padding_tracks_the_series_size(self):
+        for i in range(1, 13):
+            self.touch(f"a ({i}).jpg")
+        plan = self.plan()
+        self.assertEqual(plan["a (1).jpg"], "A [01].jpg")
+        self.assertEqual(plan["a (12).jpg"], "A [12].jpg")
+
+    def test_a_short_series_is_not_padded(self):
+        for i in range(1, 4):
+            self.touch(f"b ({i}).jpg")
+        self.assertEqual(self.plan()["b (1).jpg"], "B [1].jpg")
+
     def test_a_parenthesised_year_is_not_a_duplicate_counter(self):
         # "The Matrix (1999)" became "The Matrix [1]" — the year was read as
         # Finder's duplicate marker and destroyed.

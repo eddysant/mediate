@@ -316,7 +316,11 @@ def _assign(groups: Dict[Tuple, List[_Member]]) -> Iterator[Tuple[_Member, str]]
             for m in dups:
                 assigned.append((m, seq))
                 seq += 1
-        width = 2 if seq - 1 >= 10 else 1
+        # Width is the digit count of the largest number in the series, not a
+        # flat 2: a 105-member series padded to 2 puts "[100]" lexically
+        # between "[09]" and "[10]", which is exactly what padding exists to
+        # prevent.
+        width = len(str(max(seq - 1, 1)))
         for m, n in assigned:
             yield m, m.cleaned + _tag(m.parsed.site, n, width)
 

@@ -160,8 +160,8 @@ tidied (`2023-01-05 party` → `2023-01-05 Party`).
 `Wren Tally [1]`, `Tilly-Marsh-001` → `Tilly Marsh [1]`. `Copy of X`,
 `X - copy` and `X copy 2` markers join the numbering. Every series compacts to
 start at 1 with gaps closed (`1,2,4` → `1,2,3`), and once a series reaches
-double digits, single digits are zero-padded (`[01]`…`[10]`) so lexical order
-matches numeric order. Series are per directory + base name + site +
+double digits, single digits are zero-padded (`[01]`…`[10]`, widening again
+past 99) so lexical order matches numeric order. Series are per directory + base name + site +
 extension, so different file types count independently. A bare space-number
 (`Terminator 2`) is *not* numbering; only `(N)`, `[N]` and dash-`N` forms are.
 Neither is a parenthesised year: `The Matrix (1999).mp4` keeps its year, while
