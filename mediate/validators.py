@@ -248,8 +248,17 @@ def verify_photo_metadata(src: Path, output: Path) -> Tuple[bool, str]:
     return True, "ok"
 
 
-def _durations_agree(src_dur: float, out_dur: float) -> bool:
-    return abs(src_dur - out_dur) <= max(1.0, src_dur * 0.02)
+# Whole-file durations tolerate a second; a single audio track is held to a
+# quarter of that. A rescue must use the tolerance of the check it overrides,
+# or it silently admits drift the check just rejected.
+FILE_DURATION_FLOOR = 1.0
+TRACK_DURATION_FLOOR = 0.25
+
+
+def _durations_agree(
+    src_dur: float, out_dur: float, floor: float = FILE_DURATION_FLOOR
+) -> bool:
+    return abs(src_dur - out_dur) <= max(floor, src_dur * 0.02)
 
 
 def verify_video_duration(src: Path, output: Path) -> Tuple[bool, str]:
@@ -447,13 +456,17 @@ def _verify_audio_tracks(
     # A container that understates its own length understates its per-track
     # durations too, so the same decoded measurement settles both. Resolved
     # at most once, and only when a track would otherwise fail.
-    measured_source: List[Optional[float]] = []
+    measured_source: Optional[float] = None
+    source_measured = False
 
     def source_understates(output_seconds: float) -> bool:
-        if not measured_source:
-            measured_source.append(decoded_duration(src))
-        measured = measured_source[0]
-        return measured is not None and _durations_agree(measured, output_seconds)
+        nonlocal measured_source, source_measured
+        if not source_measured:
+            measured_source = decoded_duration(src)
+            source_measured = True
+        return measured_source is not None and _durations_agree(
+            measured_source, output_seconds, floor=TRACK_DURATION_FLOOR
+        )
 
     for index, (before, after) in enumerate(zip(source_audio, target_audio), 1):
         if after.get("codec_name") != "aac":
@@ -471,7 +484,9 @@ def _verify_audio_tracks(
                 after_seconds = float(after_duration)
             except (TypeError, ValueError):
                 return False, f"audio track {index} duration could not be verified"
-            if abs(before_seconds - after_seconds) > max(0.25, before_seconds * 0.02):
+            if not _durations_agree(
+                before_seconds, after_seconds, floor=TRACK_DURATION_FLOOR
+            ):
                 if not (
                     after_seconds > before_seconds
                     and source_understates(after_seconds)

@@ -34,6 +34,21 @@ class ReplacementTransactionTests(unittest.TestCase):
         )
         return transaction, source, final, output
 
+    def test_a_transaction_without_a_disposal_policy_is_refused(self):
+        # Without a policy the only way to finish was to delete the original
+        # outright. recover_transactions already refuses that state.
+        source = self.root / "movie.mov"
+        source.write_bytes(b"original")
+        output = self.root / ".movie.part.mp4"
+        output.write_bytes(b"validated-output")
+        with self.assertRaises(TransactionError):
+            ReplacementTransaction.prepare(
+                self.root, source, self.root / "movie.mp4", output, None
+            )
+        self.assertEqual(source.read_bytes(), b"original")
+        leftovers = [p.name for p in self.root.iterdir() if p.name.startswith(".mediate-txn-")]
+        self.assertEqual(leftovers, [], "a refused transaction left a directory behind")
+
     def test_crash_after_staging_rolls_back_original(self):
         transaction, source, final, output = self.prepare()
 

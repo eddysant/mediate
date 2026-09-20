@@ -114,16 +114,19 @@ class _DaemonPool:
     def __init__(self, size: int = MAX_DAEMONS) -> None:
         self._size = max(1, size)
         self._daemons: List[_Daemon] = []
-        self._by_thread: dict = {}
+        # Thread-local rather than a dict keyed by thread id: an id-keyed map
+        # has no natural eviction, so it accumulates an entry for every
+        # thread the process has ever run. A thread-local's slot goes away
+        # with the thread that owns it.
+        self._assigned = threading.local()
         self._lock = threading.Lock()
         self._next = 0
 
     def acquire(self) -> _Daemon:
-        key = threading.get_ident()
+        daemon = getattr(self._assigned, "daemon", None)
+        if daemon is not None:
+            return daemon
         with self._lock:
-            daemon = self._by_thread.get(key)
-            if daemon is not None:
-                return daemon
             if len(self._daemons) < self._size:
                 daemon = _Daemon()
                 self._daemons.append(daemon)
@@ -132,14 +135,17 @@ class _DaemonPool:
                 # keeps its own lock, so sharing is correct, just serialized.
                 daemon = self._daemons[self._next % len(self._daemons)]
                 self._next += 1
-            self._by_thread[key] = daemon
-            return daemon
+        self._assigned.daemon = daemon
+        return daemon
 
     def stop(self) -> None:
         with self._lock:
             daemons = list(self._daemons)
             self._daemons.clear()
-            self._by_thread.clear()
+        # The thread-local assignments of other threads cannot be cleared from
+        # here, so a stopped daemon may still be handed back; _Daemon._ensure
+        # respawns a dead process, which makes that harmless.
+        self._assigned = threading.local()
         for daemon in daemons:
             daemon.stop()
 

@@ -802,6 +802,23 @@ class DurationFallbackTests(unittest.TestCase):
         ok, reason = self._verify(4.0, 10.0, None)
         self.assertFalse(ok)
 
+    def test_the_rescue_uses_the_track_tolerance_not_the_file_one(self):
+        # The per-track check allows 0.25s; the rescue used to allow 1.0s, so
+        # a track failing by 0.5s was rejected and then quietly readmitted.
+        from mediate.validators import (
+            FILE_DURATION_FLOOR, TRACK_DURATION_FLOOR, _durations_agree,
+        )
+
+        self.assertGreater(FILE_DURATION_FLOOR, TRACK_DURATION_FLOOR)
+        self.assertTrue(_durations_agree(10.0, 10.5))  # whole-file: fine
+        self.assertFalse(
+            _durations_agree(10.0, 10.5, floor=TRACK_DURATION_FLOOR),
+            "a 0.5s track drift must not pass the track tolerance",
+        )
+        self.assertTrue(_durations_agree(10.0, 10.2, floor=TRACK_DURATION_FLOOR))
+        # The 2% rule still dominates for long media.
+        self.assertTrue(_durations_agree(600.0, 610.0, floor=TRACK_DURATION_FLOOR))
+
     def test_durations_within_tolerance_never_decode(self):
         with patch("mediate.validators.decoded_duration") as decode:
             ok, _ = self._verify(10.0, 10.4, None)

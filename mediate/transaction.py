@@ -113,6 +113,12 @@ class ReplacementTransaction:
             raise TransactionError(f"source escapes transaction root: {source}")
         if source.parent != final.parent or final.parent != temporary.parent:
             raise TransactionError("source, temporary output, and final output must share a directory")
+        if disposer is None:
+            # Without a policy the only way to finish is to delete the
+            # original outright, which is never what a missing policy should
+            # mean. recover_transactions refuses the same state; refusing
+            # here costs nothing because nothing has been staged yet.
+            raise TransactionError("a replacement transaction needs a disposal policy")
         directory = source.parent / f"{TRANSACTION_PREFIX}{uuid.uuid4().hex}"
         directory.mkdir(mode=0o700)
         try:
@@ -277,16 +283,17 @@ class ReplacementTransaction:
         self._apply_timestamps()
         self._save("output_installed")
         checkpoint("output_installed")
-        description = ""
-        if self.disposer is not None:
-            try:
-                description = self.disposer(self.backup, self.source)
-            except OSError as exc:
-                self._rollback()
-                raise TransactionError(f"could not dispose of original: {exc}") from exc
-        else:
-            self.backup.unlink()
-            description = "original deleted"
+        if self.disposer is None:
+            # Reachable only for a transaction loaded from a manifest that
+            # recorded no policy. Restoring the original is the safe answer;
+            # deleting it because we forgot where it should go is not.
+            self._rollback()
+            raise TransactionError("transaction has no disposal policy; original restored")
+        try:
+            description = self.disposer(self.backup, self.source)
+        except OSError as exc:
+            self._rollback()
+            raise TransactionError(f"could not dispose of original: {exc}") from exc
         self._save("original_disposed")
         sidecars = self._dispose_sidecars()
         self._cleanup()

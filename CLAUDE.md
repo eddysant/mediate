@@ -23,7 +23,7 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 | `capabilities.py` | FFmpeg/cwebp version, encoder/demuxer, progress, rotation, smoke-encode, and ffprobe JSON preflight |
 | `disposal.py` | serializable Trash (macOS per-volume `.Trashes`, freedesktop elsewhere) / graveyard / hard-delete policy; `_same_volume` is a seam so tests can exercise the external-drive branch |
 | `macmeta.py` | ctypes `setattrlist(2)` to copy the original's birthtime (Finder "date created") onto outputs; no-op off macOS |
-| `exiftool.py` | pool of up to 4 persistent `exiftool -stay_open` daemons behind `run_exiftool(args)` (per-thread, atexit-stopped, one-shot fallback); all exiftool queries go through it |
+| `exiftool.py` | pool of up to 4 persistent `exiftool -stay_open` daemons behind `run_exiftool(args)` (assigned via `threading.local` so a slot dies with its thread, atexit-stopped, one-shot fallback); all exiftool queries go through it |
 | `renamer.py` | `--rename`/`--rename-only` phase: stem parsing (paren/bracket/dash numbers, copy markers, `[site N]` tags, websites), cleanup + title case, per-(dir, base, site, ext) series renumbering compacted to 1 with gap-closing and zero-padding, GUID/random-token→folder-name, `--date-prefix`, `--rename-folders`, manifest + `--undo-renames`, never-overwrite apply loop |
 
 ## The safety pipeline (order matters)
@@ -107,6 +107,17 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   invent content, but a container can understate itself. A short output is
   still genuine truncation and fails on the cheap comparison without paying
   for a decode. The same measurement settles per-audio-track durations.
+- **A rescue must use the tolerance of the check it overrides**
+  (`_durations_agree`): whole-file durations allow 1s
+  (`FILE_DURATION_FLOOR`), a single audio track 0.25s
+  (`TRACK_DURATION_FLOOR`). The understated-container rescue ran through the
+  file-level floor, so a track failing the 0.25s check by 0.5s was rejected
+  and then silently readmitted. Both callers now pass the floor explicitly.
+- **A transaction without a disposal policy is refused, not completed**
+  (`prepare`): the only way to finish one is to delete the original outright,
+  which is never what a missing policy should mean. `recover_transactions`
+  already refused the same state; `prepare` now fails before anything is
+  staged, and `commit` rolls back rather than deleting.
 - **Validation requires empty stderr, not just exit 0**, on the video integrity
   pass — ffmpeg reports many corruptions on stderr while still exiting 0.
 - **Container signalling is exempt from removal risks** (`probe.py`):
@@ -127,6 +138,10 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   unsafe to alter without knowing what it contains. Narrow codec/GIF probes
   still fail open into conversion/validation where no destructive stream
   selection can occur before the full video preflight.
+- **Capability probes called from workers must be locked**:
+  `ffmpeg_heic_support()` runs inside `classify_job`, so eight workers
+  reaching their first HEIC together would each spawn both ffmpeg listings to
+  compute one boolean. It locks like `_ffprobe_supports_stream_groups()`.
 - **Animated WebP is FFmpeg 9 capability-gated**: the scanner reads only the
   VP8X feature byte, so static WebPs remain ignored. Animation conversion is
   attempted only when FFmpeg exposes the native `webp_anim` demuxer; alpha and
