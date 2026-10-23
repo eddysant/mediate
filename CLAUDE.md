@@ -275,6 +275,19 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   10% updates plus one-minute heartbeats. The console logging handler clears
   and redraws live lines around ordinary records. stderr MUST be drained on a
   thread or the pipe fills and FFmpeg deadlocks.
+- **Live lines MUST fit the terminal** (`format_progress(max_columns=…)`):
+  the redraw erases one row per job, so a line wider than the terminal wraps
+  onto a second physical row that never gets cleared — the display smears
+  instead of updating, which is what long filenames used to do. The width is
+  re-read every draw (so a resize is picked up) **minus one column**, because
+  filling the last column leaves the cursor past the margin and some
+  terminals wrap there immediately. Space is allocated filename-first: the
+  ETA is dropped, then the speed, then the clock, then the bar shrinks to 8,
+  and only then is the name elided *in the middle* so the leading date and
+  the extension both survive. `_rendered_rows` still counts physical rows, so
+  a mis-detected width degrades rather than corrupting. Plain
+  (non-TTY) logs keep the unbounded line: nothing is redrawn there, and the
+  one-shot `[ok]`/`scanning` records stay full-fidelity on purpose.
 - **Standard MP4 health is opt-in via `--validate-existing` and full-decode
   cached**. Normal runs trust standard stream classification. With the flag,
   damaged files first get a lossless tolerant remux and only then a
