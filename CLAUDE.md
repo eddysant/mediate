@@ -303,7 +303,13 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   one per line, prepended to argv in `parse_args` unless `--no-config`.
   Tests must set `MEDIATE_CONFIG=/nonexistent` to stay hermetic.
 - **CI** (`.github/workflows/ci.yml`): unit tests on ubuntu+macos x Python
-  3.9 (the `requires-python` floor) and 3.12 for every push/PR; a `v*` tag
+  3.9 (the `requires-python` floor) and 3.12 for every push/PR. The 3.9
+  linux job is pinned to `ubuntu-24.04`: `setup-python` publishes 3.9 linux
+  builds only up to that image (3.9 went EOL in October 2025), so on
+  `ubuntu-latest` the job fails *inside setup-python* and silently **skips**
+  the tests rather than reporting a test failure. Watch for that shape —
+  a green-looking matrix with a skipped test step. Raising
+  `requires-python` past 3.9 is the real fix whenever that is acceptable; a `v*` tag
   additionally builds `mediate.pyz` (stdlib zipapp) and creates the GitHub
   Release with `--generate-notes`. Releasing = bump version in
   `__init__.py`/`pyproject.toml`, tag, push the tag — the release job now

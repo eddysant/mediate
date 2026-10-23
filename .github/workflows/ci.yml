@@ -15,6 +15,16 @@ jobs:
         # 3.9 is the floor declared in pyproject.toml; test it so the floor
         # stays honest, and the current stable release alongside it.
         python-version: ["3.9", "3.12"]
+        exclude:
+          # setup-python publishes Python 3.9 linux builds only up to Ubuntu
+          # 24.04 (3.9 went end-of-life in October 2025), and ubuntu-latest
+          # has rolled past that — the job failed in setup-python itself and
+          # skipped the tests. Pin the floor to the newest image that has it.
+          - os: ubuntu-latest
+            python-version: "3.9"
+        include:
+          - os: ubuntu-24.04
+            python-version: "3.9"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
