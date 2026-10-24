@@ -8,6 +8,7 @@ from concurrent.futures import Future
 from pathlib import Path
 from unittest.mock import patch
 
+from mediate import probecache
 from mediate.capabilities import CapabilityReport, _check_avifenc
 from mediate.cli import load_config_args
 from mediate.exiftool import _argfile_safe, exiftool_available, run_exiftool
@@ -158,30 +159,26 @@ class AvifInstallHintTests(unittest.TestCase):
 
 class ProbeCacheDurabilityTests(unittest.TestCase):
     def test_the_cache_is_replaced_atomically(self):
-        from mediate import probe
-
         with tempfile.TemporaryDirectory() as tmp:
             cache = Path(tmp) / "sub" / "probe-cache.json"
             cache.parent.mkdir()
             cache.write_text(json.dumps({"previous": 1}), encoding="utf-8")
-            with patch.object(probe, "_cache", {"fresh": {"v": "ok"}}), \
-                    patch.object(probe, "_cache_dirty", True), \
-                    patch.object(probe, "_cache_file", return_value=cache):
-                probe.save_probe_cache()
+            with patch.object(probecache, "_cache", {"fresh": {"v": "ok"}}), \
+                    patch.object(probecache, "_cache_dirty", True), \
+                    patch.object(probecache, "_cache_file", return_value=cache):
+                probecache.save_probe_cache()
             self.assertEqual(json.loads(cache.read_text()), {"fresh": {"v": "ok"}})
             self.assertEqual(list(cache.parent.iterdir()), [cache], "temp file left behind")
 
     def test_a_failed_write_leaves_the_previous_cache_intact(self):
-        from mediate import probe
-
         with tempfile.TemporaryDirectory() as tmp:
             cache = Path(tmp) / "probe-cache.json"
             cache.write_text(json.dumps({"previous": 1}), encoding="utf-8")
-            with patch.object(probe, "_cache", {"fresh": 1}), \
-                    patch.object(probe, "_cache_dirty", True), \
-                    patch.object(probe, "_cache_file", return_value=cache), \
-                    patch("mediate.probe.os.replace", side_effect=OSError("boom")):
-                probe.save_probe_cache()  # must not raise
+            with patch.object(probecache, "_cache", {"fresh": 1}), \
+                    patch.object(probecache, "_cache_dirty", True), \
+                    patch.object(probecache, "_cache_file", return_value=cache), \
+                    patch("mediate.probecache.os.replace", side_effect=OSError("boom")):
+                probecache.save_probe_cache()  # must not raise
             self.assertEqual(json.loads(cache.read_text()), {"previous": 1})
             self.assertEqual(list(cache.parent.iterdir()), [cache], "temp file left behind")
 
@@ -193,7 +190,12 @@ class VideoStreamStatusTests(unittest.TestCase):
     def _mock_status(self, probe_result):
         """Run video_stream_status with a mocked _ffprobe_json return."""
         from unittest.mock import patch
-        from mediate.probe import video_stream_status, STREAM_STANDARD, STREAM_HEVC, STREAM_NEEDS_CONVERSION
+        from mediate.probe import (
+            STREAM_HEVC,
+            STREAM_NEEDS_CONVERSION,
+            STREAM_STANDARD,
+            video_stream_status,
+        )
         with tempfile.TemporaryDirectory() as tmp:
             dummy = Path(tmp) / "test.mov"
             dummy.write_bytes(b"x")
@@ -212,7 +214,11 @@ class VideoStreamStatusTests(unittest.TestCase):
 
     def test_full_range_h264_alias_is_standard(self):
         from unittest.mock import patch
-        from mediate.probe import MP4_STANDARD, STREAM_STANDARD, _mp4_status_uncached
+        from mediate.probe import (
+            MP4_STANDARD,
+            STREAM_STANDARD,
+            _mp4_status_uncached,
+        )
         data = {"streams": [
             {"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuvj420p"},
             {"codec_type": "audio", "codec_name": "aac"},
@@ -290,7 +296,10 @@ class VideoStreamStatusTests(unittest.TestCase):
 
     def test_mp4_classification_explains_non_aac_audio(self):
         from unittest.mock import patch
-        from mediate.probe import MP4_NEEDS_CONVERSION, _mp4_classification_uncached
+        from mediate.probe import (
+            MP4_NEEDS_CONVERSION,
+            _mp4_classification_uncached,
+        )
 
         data = {"streams": [
             {
@@ -308,7 +317,10 @@ class VideoStreamStatusTests(unittest.TestCase):
 
     def test_mp4_with_non_apple_h264_tag_needs_only_remux(self):
         from unittest.mock import patch
-        from mediate.probe import MP4_NEEDS_CONVERSION, _mp4_classification_uncached
+        from mediate.probe import (
+            MP4_NEEDS_CONVERSION,
+            _mp4_classification_uncached,
+        )
 
         data = {"streams": [
             {
@@ -326,7 +338,10 @@ class VideoStreamStatusTests(unittest.TestCase):
 
     def test_mp4_with_hev1_tag_is_remuxed_for_apple_preview(self):
         from unittest.mock import patch
-        from mediate.probe import MP4_NEEDS_CONVERSION, _mp4_classification_uncached
+        from mediate.probe import (
+            MP4_NEEDS_CONVERSION,
+            _mp4_classification_uncached,
+        )
 
         data = {"streams": [
             {
@@ -344,7 +359,10 @@ class VideoStreamStatusTests(unittest.TestCase):
 
     def test_mp4_with_hvc1_and_apple_hevc_chroma_is_native(self):
         from unittest.mock import patch
-        from mediate.probe import MP4_HEVC, _mp4_classification_uncached
+        from mediate.probe import (
+            MP4_HEVC,
+            _mp4_classification_uncached,
+        )
 
         data = {"streams": [
             {
@@ -408,7 +426,7 @@ class ScanCompletionTests(unittest.TestCase):
         from unittest.mock import patch
         from mediate import probe
 
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(probe._cache, {}, clear=True):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(probecache._cache, {}, clear=True):
             source = Path(tmp) / "legacy.webm"
             output = Path(tmp) / "legacy.mp4"
             source.write_bytes(b"unchanged-source")
@@ -495,10 +513,10 @@ class ProbeCacheIdentityTests(unittest.TestCase):
                 return len(calls)
 
             kind = f"test-{id(path)}"
-            self.assertEqual(probe._cached(kind, path, compute, strong=True), 1)
+            self.assertEqual(probecache.cached(kind, path, compute, strong=True), 1)
             path.write_bytes(b"B" * 200000)
             os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
-            self.assertEqual(probe._cached(kind, path, compute, strong=True), 2)
+            self.assertEqual(probecache.cached(kind, path, compute, strong=True), 2)
 
 
 class WorkerResolutionTests(unittest.TestCase):

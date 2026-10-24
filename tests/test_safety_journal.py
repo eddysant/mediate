@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import subprocess
@@ -110,6 +111,139 @@ class JournalTests(unittest.TestCase):
 
         _ordered, count = RunJournal(self.root).prepare([job])
         self.assertEqual(count, 0)
+
+    def job(self, name: str = "movie.mov", content: bytes = b"x") -> MediaJob:
+        path = self.root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        return MediaJob(path, "video")
+
+    def state(self) -> dict:
+        return json.loads((self.root / ".mediate-run.json").read_text())
+
+    def test_a_clean_finish_is_distinguishable_from_an_interrupted_one(self):
+        job = self.job()
+        journal = RunJournal(self.root)
+        journal.prepare([job])
+        journal.mark(job, "converted")
+        journal.finish(interrupted=False)
+
+        state = self.state()
+        self.assertFalse(state["interrupted"])
+        self.assertIn("finished_at", state)
+        self.assertEqual(state["files"]["movie.mov"]["status"], "converted")
+        # A clean run leaves nothing to resume.
+        self.assertEqual(RunJournal(self.root).prepare([job])[1], 0)
+
+    def test_an_interrupted_run_reclassifies_unfinished_entries(self):
+        done, running, queued = (
+            self.job("done.mov"), self.job("running.mov"), self.job("queued.mov")
+        )
+        journal = RunJournal(self.root)
+        journal.prepare([done, running, queued])
+        journal.mark(done, "converted")
+        journal.mark(running, "running")
+        journal.finish(interrupted=True)
+
+        files = self.state()["files"]
+        self.assertEqual(files["done.mov"]["status"], "converted")
+        # Both the in-flight job and the one never started must come back.
+        self.assertEqual(files["running.mov"]["status"], "interrupted")
+        self.assertEqual(files["queued.mov"]["status"], "interrupted")
+
+    def test_a_failure_is_flushed_immediately_rather_than_throttled(self):
+        # Writes are throttled to one a second so a large run does not thrash
+        # the disk; a crash right after a failure would otherwise lose the one
+        # status the next run most needs.
+        job = self.job()
+        journal = RunJournal(self.root)
+        journal.prepare([job])
+        journal.mark(job, "failed", "ffmpeg exited 1")
+
+        entry = self.state()["files"]["movie.mov"]
+        self.assertEqual(entry["status"], "failed")
+        self.assertEqual(entry["detail"], "ffmpeg exited 1")
+
+    def test_a_corrupt_journal_is_discarded_rather_than_raising(self):
+        # The file is rewritten constantly; a truncated one must cost the
+        # resume information, not the run.
+        (self.root / ".mediate-run.json").write_text("{not json")
+        ordered, count = RunJournal(self.root).prepare([self.job()])
+        self.assertEqual(count, 0)
+        self.assertEqual(len(ordered), 1)
+
+    def test_a_journal_from_a_future_version_is_ignored(self):
+        # The identity matches, so only the version check can reject this; a
+        # newer schema read as version 1 would mis-resume the whole library.
+        job = self.job()
+        stat = job.path.stat()
+        (self.root / ".mediate-run.json").write_text(
+            json.dumps({
+                "version": 99,
+                "files": {
+                    "movie.mov": {
+                        "status": "running",
+                        "identity": {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns},
+                    }
+                },
+            })
+        )
+        self.assertEqual(RunJournal(self.root).prepare([job])[1], 0)
+
+    def test_preparing_clears_entries_for_files_no_longer_present(self):
+        first = self.job("first.mov")
+        journal = RunJournal(self.root)
+        journal.prepare([first, self.job("second.mov")])
+        journal.finish(interrupted=True)
+        (self.root / "second.mov").unlink()
+
+        RunJournal(self.root).prepare([first])
+        self.assertEqual(list(self.state()["files"]), ["first.mov"])
+
+    def test_a_file_outside_the_root_is_skipped_quietly(self):
+        # plan files and --apply-plan can name a path the journal has no key
+        # for; relative_to raises ValueError and must not reach the caller.
+        outside = Path(self._tmp.name).parent / "stray-journal-test.mov"
+        outside.write_bytes(b"x")
+        self.addCleanup(lambda: outside.unlink(missing_ok=True))
+        stray = MediaJob(outside, "video")
+
+        journal = RunJournal(self.root)
+        ordered, count = journal.prepare([stray])
+        journal.mark(stray, "converted")
+        journal.finish(interrupted=False)
+
+        self.assertEqual((ordered, count), ([stray], 0))
+        self.assertEqual(self.state()["files"], {})
+
+    def test_nested_paths_keep_their_relative_key(self):
+        nested = self.job("2019/summer/movie.mov")
+        journal = RunJournal(self.root)
+        journal.prepare([nested])
+        journal.finish(interrupted=False)
+        self.assertIn(str(Path("2019/summer/movie.mov")), self.state()["files"])
+
+    def test_a_disabled_journal_writes_nothing(self):
+        job = self.job()
+        journal = RunJournal(self.root, enabled=False)
+        journal.prepare([job])
+        journal.mark(job, "failed")
+        journal.finish(interrupted=True)
+        self.assertFalse((self.root / ".mediate-run.json").exists())
+
+    def test_a_disabled_journal_ignores_an_existing_file(self):
+        RunJournal(self.root).prepare([self.job()])
+        self.assertEqual(RunJournal(self.root, enabled=False)._data["files"], {})
+
+    def test_the_write_is_atomic_and_leaves_no_temp_behind(self):
+        # Same temp-file + os.replace protocol as the probe cache and the
+        # transaction manifest: a reader must never see a half-written file.
+        journal = RunJournal(self.root)
+        journal.prepare([self.job()])
+        journal.finish(interrupted=False)
+        leftovers = [p.name for p in self.root.glob(".mediate-run.json.*")]
+        self.assertEqual(leftovers, [])
+        self.assertIn("updated_at", self.state())
 
 
 class CancellationTests(unittest.TestCase):

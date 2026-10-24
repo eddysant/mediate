@@ -5,7 +5,7 @@ standardizes photos and videos into compatible, space-efficient formats — and
 only parts with an original after the converted file passes a strict
 validation checklist. Even then it goes to the Trash, not oblivion.
 
-Stdlib-only Python (≥ 3.9). Everything else is `ffmpeg`, `cwebp`, and friends.
+Stdlib-only Python (≥ 3.10). Everything else is `ffmpeg`, `cwebp`, and friends.
 
 **[Quick start](#quick-start)** · [What it converts](#what-it-converts) ·
 [Options](#options) · [Renaming](#name-standardization) ·

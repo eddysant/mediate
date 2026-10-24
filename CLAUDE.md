@@ -13,8 +13,13 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 |---|---|
 | `cli.py` | argparse, dual logging (console + `conversion.log`), `recover_pending_transactions`/`run_rename_shortcuts`/`build_options`/`plan_jobs`/`summarize_run` around a ThreadPoolExecutor, exit codes |
 | `scanner.py` | `os.walk` traversal → `MediaJob(path, kind)`; kind ∈ photo/heic/gif/webp/video/mp4; Live Photo pairing helper |
-| `probe.py` | cached `ffprobe -of json` helpers: codec/remux classification plus a normalized inventory of all streams, stream groups, chapters, track identity, rotation, colour, and artwork |
-| `converters.py` | command construction, stream-safety policy, temp-file protocol, `classify_job()` (every probe-based skip, no filesystem writes) + `process_job()`; includes `-c copy` remuxing for compatible containers and a rotation display-matrix finalizer |
+| `probe.py` | codec/remux classification, durations, and decode-health checks, all through `probecache` |
+| `probecache.py` | the cache itself: identity-keyed (+ sampled fingerprint) JSON memo under the user cache dir, plus the one `ffprobe -of json` call |
+| `inventory.py` | the normalized inventory of all streams, stream groups, chapters, track identity, rotation, colour, artwork — and the pure queries over it that the safety policy is built from |
+| `converters.py` | the pipeline: temp-file protocol, `classify_job()` (every probe-based skip, no filesystem writes) + `process_job()`, `Outcome`/`Options`/`Plan` |
+| `ffmpegcmd.py` | pure inventory→argv construction: explicit stream mapping, per-track metadata, `-c copy` remuxing for compatible containers, the rotation display-matrix finalizer |
+| `photo.py` | the still-image pipeline: cwebp/avifenc encode, HEIC→PNG decode, jpegtran/sips rescues, exiftool metadata repair |
+| `proc.py` | the shared `run(argv)` seam — argv lists, captured text, debug-logged; separate so photo and video can both use it without a cycle |
 | `validators.py` | exit/existence/size/full-decode checks plus photo metadata; `verify_video_streams` dispatches lazily to named per-concern checks (audio tracks, subtitles, artwork, chapters, video format) |
 | `progress.py` | concurrent FFmpeg progress plus cooperative cancellation and child termination |
 | `safety.py` | source snapshots, link/readability policy, output writability and aggregate per-filesystem free-space reservations |
@@ -261,14 +266,25 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   reversed, so folder renames undo before the files inside them. Folder
   plans are applied only after all file renames resolved — file plan paths
   are computed against pre-rename folder names.
-- **Probe results are cached** (`probe.py`: path+mtime_ns+ctime_ns+size+device+
+- **A skip reason is grouped, the detail is not** (`Outcome.reason`): the
+  closing summary counts files per reason, but most details embed a
+  filename, an exception or a stream list and would each be a group of one.
+  Those sites set `reason` explicitly; a detail that is already a constant
+  string is its own reason, so a new skip needs no extra work and degrades
+  to its own line rather than being miscounted.
+- **The declared Python floor is read, not repeated** (`PythonFloorTests`):
+  the AST check parses every module at the version `pyproject.toml`
+  declares. Hardcoding it there meant that raising `requires-python` left
+  the test silently asserting the old floor — the one thing it exists to
+  catch.
+- **Probe results are cached** (`probecache.py`: path+mtime_ns+ctime_ns+size+device+
   inode keyed JSON; health adds a sampled BLAKE2 fingerprint) in the user cache
   dir, loaded/saved by cli — a 50k-file re-run would otherwise
   spawn ffprobe per MP4/GIF/WebP animation. `load_probe_cache()` must run before the pool.
   The save is a temp-file + `os.replace`, like the journal and transaction
   manifests: a truncated cache silently discards expensive
   `--validate-existing` decode results.
-  `media_duration()` lives here too (shared by validation and progress).
+  `media_duration()` lives in `probe.py` (shared by validation and progress).
 - **Concurrent FFmpeg progress** (`progress.py`): all encodes, remuxes, and
   integrity decodes use `-progress pipe:1 -nostats`. Interactive terminals get
   one stable line per active worker (bar/time/speed/ETA); redirected logs get
@@ -303,13 +319,14 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   one per line, prepended to argv in `parse_args` unless `--no-config`.
   Tests must set `MEDIATE_CONFIG=/nonexistent` to stay hermetic.
 - **CI** (`.github/workflows/ci.yml`): unit tests on ubuntu+macos x Python
-  3.9 (the `requires-python` floor) and 3.12 for every push/PR. The 3.9
-  linux job is pinned to `ubuntu-24.04`: `setup-python` publishes 3.9 linux
-  builds only up to that image (3.9 went EOL in October 2025), so on
-  `ubuntu-latest` the job fails *inside setup-python* and silently **skips**
-  the tests rather than reporting a test failure. Watch for that shape —
-  a green-looking matrix with a skipped test step. Raising
-  `requires-python` past 3.9 is the real fix whenever that is acceptable; a `v*` tag
+  3.10 (the `requires-python` floor) and 3.12 for every push/PR. The floor
+  was 3.9 until it went EOL in October 2025: `setup-python` then stopped
+  publishing 3.9 linux builds past Ubuntu 24.04, `ubuntu-latest` rolled past
+  that image, and the job began failing *inside setup-python* and silently
+  **skipping** the tests rather than reporting a failure. Watch for that
+  shape whenever the floor nears EOL — a green-looking matrix with a skipped
+  test step. `tests/test_cli_main.py` reads the floor out of pyproject rather
+  than repeating it, so the AST check cannot drift from the declared one; a `v*` tag
   additionally builds `mediate.pyz` (stdlib zipapp) and creates the GitHub
   Release with `--generate-notes`. Releasing = bump version in
   `__init__.py`/`pyproject.toml`, tag, push the tag — the release job now
@@ -335,8 +352,9 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 - `python3 -m unittest discover tests` — pure-Python scanner/rename/probe tests
   plus `tests/test_cli_main.py`, which drives `cli.main()` end to end (output
   claiming per format, exit codes, rename/undo/plan phases, handler
-  idempotence) and `classify_job()` directly, and asserts every `mediate/*.py`
-  still parses under the declared 3.9 floor
+  idempotence, the closing summary's reason grouping, `--help` grouping) and
+  `classify_job()` directly, and asserts every `mediate/*.py`
+  still parses under the floor pyproject declares
   plus generated-media FFmpeg integration coverage for ASF/VOB, surround and
   multi-audio, chapters, subtitle/artwork policy, corruption, advanced-video
   blocking, rotation, failure-injected transactions, aggregate reservations,

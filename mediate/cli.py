@@ -6,6 +6,7 @@ import argparse
 import logging
 import os
 import sys
+from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
@@ -66,7 +67,10 @@ def _resolve_future(future: Future, job) -> Outcome:
         return Outcome(SKIPPED, job.path, "cancelled; partial output removed, original kept")
     except Exception as exc:  # process one bad media file without aborting the scan
         log.debug("unexpected worker failure for %s", job.path, exc_info=True)
-        return Outcome(FAILED, job.path, f"unexpected processing error: {exc}")
+        return Outcome(
+                FAILED, job.path, f"unexpected processing error: {exc}",
+                reason="unexpected processing error",
+            )
 
 
 def _filter_standardized_mp4(
@@ -186,24 +190,18 @@ def parse_args(argv=None) -> argparse.Namespace:
         action="store_true",
         help="print what would happen without converting or deleting anything",
     )
-    parser.add_argument(
-        "--keep-originals",
-        action="store_true",
-        help="convert but never touch the original files",
-    )
-    parser.add_argument(
-        "--only-if-smaller",
-        action="store_true",
-        help="keep the original (and discard the conversion) unless the output is "
-        "smaller — lossless WebP can be bigger than a camera JPEG",
-    )
-    parser.add_argument(
+
+    # argparse lists every flag in one block otherwise. At 25 options that
+    # reads as a wall rather than a menu, and the safety overrides — the ones
+    # that let mediate discard something — are the hardest to pick out.
+    selection = parser.add_argument_group("what gets converted")
+    selection.add_argument(
         "--reencode-hevc",
         action="store_true",
         help="re-encode HEVC MP4s to h264 (default: skip them — HEVC is smaller "
         "than h264 and plays natively on Apple devices)",
     )
-    parser.add_argument(
+    selection.add_argument(
         "--convert-heic",
         action="store_true",
         help="convert HEIC/HEIF photos to lossless WebP (macOS sips, or an "
@@ -211,84 +209,64 @@ def parse_args(argv=None) -> argparse.Namespace:
         "(default: skip them; the lossless re-encode of an efficient lossy "
         "format usually grows the file — combine with --only-if-smaller)",
     )
-    parser.add_argument(
+    selection.add_argument(
         "--convert-live-photos",
         action="store_true",
         help="convert .mov files even when a same-named still image sits next to "
         "them (default: skip such pairs, since converting the video half breaks "
         "Live Photo pairing in Apple Photos)",
     )
-    parser.add_argument(
+    selection.add_argument(
+        "--output-format",
+        choices=["webp", "avif"],
+        default="webp",
+        metavar="FORMAT",
+        help="photo output format: webp (default, lossless via cwebp) or avif "
+        "(lossless via avifenc — install with `brew install libavif`; "
+        "note: lossless AVIF is often larger than lossless WebP for photos)",
+    )
+
+    overrides = parser.add_argument_group(
+        "safety overrides",
+        "Each one permits a conversion mediate would otherwise refuse.",
+    )
+    overrides.add_argument(
         "--allow-stream-removal",
         action="store_true",
         help="allow video conversion to discard streams MP4 standardisation cannot "
         "safely preserve; compatible text subtitles and JPEG/PNG cover streams "
         "are retained automatically",
     )
-    parser.add_argument(
+    overrides.add_argument(
         "--allow-video-downgrade",
         action="store_true",
         help="allow 8-bit h264 conversion of HDR/high-bit-depth, alpha, interlaced, "
         "or variable/unusual-frame-rate video (default: warn and skip because "
         "picture semantics may change)",
     )
-    parser.add_argument(
+    overrides.add_argument(
         "--validate-existing",
         action="store_true",
         help="fully decode already-standardized MP4 files and attempt repair when "
         "damage is found (default: trust their stream format and skip them)",
     )
-    parser.add_argument(
-        "--rename",
+
+    originals = parser.add_argument_group(
+        "what happens to originals",
+        "Originals are moved to the Trash after validation unless told otherwise.",
+    )
+    originals.add_argument(
+        "--keep-originals",
         action="store_true",
-        help="after converting, standardize file names: cleanup + title case, "
-        "'(N)' -> '[N]' with gaps closed and zero-padding, GUID names replaced "
-        "by the folder name + [guid]",
+        help="convert but never touch the original files",
     )
-    parser.add_argument(
-        "--rename-only",
+    originals.add_argument(
+        "--only-if-smaller",
         action="store_true",
-        help="only standardize file names; no conversions",
+        help="keep the original (and discard the conversion) unless the output is "
+        "smaller — lossless WebP can be bigger than a camera JPEG",
     )
-    parser.add_argument(
-        "--rename-folders",
-        action="store_true",
-        help="with --rename/--rename-only: also clean directory names",
-    )
-    parser.add_argument(
-        "--date-prefix",
-        action="store_true",
-        help="with --rename/--rename-only: prefix names with the capture date "
-        "(YYYY-MM-DD, from EXIF via exiftool if installed, video metadata, or "
-        "file modification time)",
-    )
-    parser.add_argument(
-        "--undo-renames",
-        action="store_true",
-        help="reverse the most recent rename batch recorded in the library's "
-        ".mediate-renames.json, then exit",
-    )
-    parser.add_argument(
-        "--plan-file",
-        type=Path,
-        default=None,
-        metavar="PATH",
-        help="with --rename/--rename-only: write the proposed renames to PATH "
-        "as editable JSON instead of applying them",
-    )
-    parser.add_argument(
-        "--apply-plan",
-        type=Path,
-        default=None,
-        metavar="PATH",
-        help="apply a (possibly hand-edited) plan written by --plan-file, then exit",
-    )
-    parser.add_argument(
-        "--no-config",
-        action="store_true",
-        help="ignore the config file (~/.config/mediate/config)",
-    )
-    disposal = parser.add_mutually_exclusive_group()
+    disposal = originals.add_mutually_exclusive_group()
     disposal.add_argument(
         "--graveyard",
         type=Path,
@@ -301,16 +279,56 @@ def parse_args(argv=None) -> argparse.Namespace:
         action="store_true",
         help="permanently delete originals instead of moving them to the Trash",
     )
-    parser.add_argument(
-        "--output-format",
-        choices=["webp", "avif"],
-        default="webp",
-        metavar="FORMAT",
-        help="photo output format: webp (default, lossless via cwebp) or avif "
-        "(lossless via avifenc — install with `brew install libavif`; "
-        "note: lossless AVIF is often larger than lossless WebP for photos)",
+
+    renaming = parser.add_argument_group("renaming")
+    renaming.add_argument(
+        "--rename",
+        action="store_true",
+        help="after converting, standardize file names: cleanup + title case, "
+        "'(N)' -> '[N]' with gaps closed and zero-padding, GUID names replaced "
+        "by the folder name + [guid]",
     )
-    parser.add_argument(
+    renaming.add_argument(
+        "--rename-only",
+        action="store_true",
+        help="only standardize file names; no conversions",
+    )
+    renaming.add_argument(
+        "--rename-folders",
+        action="store_true",
+        help="with --rename/--rename-only: also clean directory names",
+    )
+    renaming.add_argument(
+        "--date-prefix",
+        action="store_true",
+        help="with --rename/--rename-only: prefix names with the capture date "
+        "(YYYY-MM-DD, from EXIF via exiftool if installed, video metadata, or "
+        "file modification time)",
+    )
+    renaming.add_argument(
+        "--undo-renames",
+        action="store_true",
+        help="reverse the most recent rename batch recorded in the library's "
+        ".mediate-renames.json, then exit",
+    )
+    renaming.add_argument(
+        "--plan-file",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="with --rename/--rename-only: write the proposed renames to PATH "
+        "as editable JSON instead of applying them",
+    )
+    renaming.add_argument(
+        "--apply-plan",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="apply a (possibly hand-edited) plan written by --plan-file, then exit",
+    )
+
+    run = parser.add_argument_group("run control and output")
+    run.add_argument(
         "--workers",
         type=_workers_arg,
         default="auto",
@@ -318,15 +336,20 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="concurrent conversions: an integer, or 'auto' to use the CPU count "
         "(default: auto — caps at 8 for video-heavy runs, uncapped for photos)",
     )
-    parser.add_argument(
+    run.add_argument(
         "--log-file",
         type=Path,
         default=None,
         metavar="PATH",
         help="detailed log file (default: conversion.log inside the target directory)",
     )
-    parser.add_argument("--verbose", action="store_true", help="show debug output on the console")
-    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    run.add_argument(
+        "--no-config",
+        action="store_true",
+        help="ignore the config file (~/.config/mediate/config)",
+    )
+    run.add_argument("--verbose", action="store_true", help="show debug output on the console")
+    run.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser.parse_args(argv)
 
 
@@ -488,12 +511,15 @@ def plan_jobs(jobs, output_format: str, convert_live_photos: bool):
     for mov, still in companions.items():
         protected[mov] = f"Live Photo video of {still.name} (--convert-live-photos to convert)"
         protected[still] = f"Live Photo still of {mov.name} (--convert-live-photos to convert)"
+    live_photo_reason = "half of a Live Photo pair (--convert-live-photos to convert)"
     claimed = {}
     runnable = []
     planned_skips = []
     for job in jobs:
         if job.path in protected:
-            planned_skips.append(Outcome(SKIPPED, job.path, protected[job.path]))
+            planned_skips.append(
+                Outcome(SKIPPED, job.path, protected[job.path], reason=live_photo_reason)
+            )
             continue
         # The output format must match what process_job will actually produce:
         # a claimed name is stored on the job and used verbatim as the final
@@ -508,23 +534,72 @@ def plan_jobs(jobs, output_format: str, convert_live_photos: bool):
     return runnable, planned_skips
 
 
-def summarize_run(tally: dict, bytes_saved: int, dry_run: bool) -> str:
-    """The one-line closing summary."""
+# Enough to show the long tail of a mixed library without burying the
+# headline when a run finds something new in every directory.
+MAX_REASON_LINES = 8
+
+
+def _format_saved(bytes_saved: int) -> str:
+    """Bytes as the largest unit that keeps the number readable."""
+    megabytes = bytes_saved / (1024 * 1024)
+    if abs(megabytes) >= 1024:
+        return f"{megabytes / 1024:.1f} GB saved"
+    return f"{megabytes:.1f} MB saved"
+
+
+def _reason_lines(label: str, counts: "Counter[str]") -> list[str]:
+    """One indented line per reason, most common first.
+
+    The per-file records are in the log, but on a large library they scroll
+    past by the thousand; the actionable part is which reasons account for
+    the count and which flag would change them.
+    """
+    if not counts:
+        return []
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    shown, hidden = ranked[:MAX_REASON_LINES], ranked[MAX_REASON_LINES:]
+    width = max(len(f"{count}") for _reason, count in shown)
+    lines = [f"  {label}:"]
+    lines.extend(f"    {count:>{width}} x {reason}" for reason, count in shown)
+    if hidden:
+        lines.append(
+            f"    {sum(count for _reason, count in hidden):>{width}} x "
+            f"other ({len(hidden)} further reason(s); see the log)"
+        )
+    return lines
+
+
+def summarize_run(
+    tally: dict,
+    bytes_saved: int,
+    dry_run: bool,
+    reasons: "dict[str, Counter[str]] | None" = None,
+) -> str:
+    """The closing summary: a headline, then why files were skipped/failed."""
     if dry_run:
-        return (
+        headline = (
             f"dry run complete: {tally[PLANNED]} would be converted, "
             f"{tally[SKIPPED]} skipped"
         )
-    parts = []
-    for status, label in (
-        (CONVERTED, "converted"), (REMUXED, "remuxed"), (REPAIRED, "repaired"),
-    ):
-        if tally[status]:
-            parts.append(f"{tally[status]} {label}")
-    parts.append(f"{tally[SKIPPED]} skipped")
-    parts.append(f"{tally[FAILED]} failed")
-    parts.append(f"{bytes_saved / (1024 * 1024):.1f} MB saved")
-    return "done: " + ", ".join(parts)
+        breakdown = (PLANNED, "planned"), (SKIPPED, "skipped")
+    else:
+        parts = []
+        for status, label in (
+            (CONVERTED, "converted"), (REMUXED, "remuxed"), (REPAIRED, "repaired"),
+        ):
+            if tally[status]:
+                parts.append(f"{tally[status]} {label}")
+        parts.append(f"{tally[SKIPPED]} skipped")
+        parts.append(f"{tally[FAILED]} failed")
+        parts.append(_format_saved(bytes_saved))
+        headline = "done: " + ", ".join(parts)
+        breakdown = (SKIPPED, "skipped"), (FAILED, "failed")
+    if not reasons:
+        return headline
+    lines = [headline]
+    for status, label in breakdown:
+        lines.extend(_reason_lines(label, reasons.get(status, Counter())))
+    return "\n".join(lines)
 
 
 def main(argv=None) -> int:
@@ -559,10 +634,9 @@ def main(argv=None) -> int:
         MP4_HEVC,
         MP4_STANDARD,
         completed_conversion_output,
-        load_probe_cache,
         mp4_status,
-        save_probe_cache,
     )
+    from .probecache import load_probe_cache, save_probe_cache
 
     load_probe_cache()
     recognized = list(iter_media(root))
@@ -654,7 +728,10 @@ def main(argv=None) -> int:
             journal.mark(job, "interrupted", "cancelled; original kept")
             raise
         except (OSError, SafetyError) as exc:
-            outcome = Outcome(FAILED, job.path, f"filesystem safety check failed: {exc}")
+            outcome = Outcome(
+                FAILED, job.path, f"filesystem safety check failed: {exc}",
+                reason="filesystem safety check failed",
+            )
         except Exception as exc:
             journal.mark(job, "failed", f"unexpected processing error: {exc}")
             raise
@@ -670,8 +747,14 @@ def main(argv=None) -> int:
         PLANNED: 0,
     }
     bytes_saved = 0
-    for outcome in planned_skips:
+    reasons: dict[str, Counter[str]] = {status: Counter() for status in tally}
+
+    def record(outcome) -> None:
         tally[outcome.status] += 1
+        reasons[outcome.status][outcome.reason or outcome.detail] += 1
+
+    for outcome in planned_skips:
+        record(outcome)
         log.info("%-6s %s %s", STATUS_MARKS[outcome.status], outcome.path.relative_to(root), outcome.detail)
     pool = ThreadPoolExecutor(max_workers=max(1, workers))
     futures = {pool.submit(process_journaled, job): job for job in runnable}
@@ -679,7 +762,7 @@ def main(argv=None) -> int:
     try:
         for future in as_completed(futures):
             outcome = _resolve_future(future, futures[future])
-            tally[outcome.status] += 1
+            record(outcome)
             bytes_saved += outcome.bytes_saved
             rel = outcome.path.relative_to(root)
             level = logging.ERROR if outcome.status == FAILED else logging.INFO
@@ -699,7 +782,7 @@ def main(argv=None) -> int:
         return 130
     journal.finish(interrupted=False)
 
-    log.info("%s", summarize_run(tally, bytes_saved, args.dry_run))
+    log.info("%s", summarize_run(tally, bytes_saved, args.dry_run, reasons))
     save_probe_cache()
     if args.rename:
         # Rename runs after conversion so freshly produced .webp/.mp4 files

@@ -12,7 +12,7 @@ from mediate.converters import (
     _explain_source_truncation,
     process_job,
 )
-from mediate.probe import (
+from mediate.inventory import (
     _video_inventory_uncached,
     advanced_video_features,
     preservable_artwork_streams,
@@ -69,8 +69,8 @@ class StreamPreflightTests(unittest.TestCase):
             "streams": [{"index": 0, "codec_type": "video", "codec_name": "h264"}],
             "stream_groups": [{"index": 2, "id": "0x10", "type": "LCEVC"}],
         }
-        with patch("mediate.probe._ffprobe_supports_stream_groups", return_value=True), patch(
-            "mediate.probe._ffprobe_json", return_value=data
+        with patch("mediate.inventory._ffprobe_supports_stream_groups", return_value=True), patch(
+            "mediate.inventory._ffprobe_json", return_value=data
         ) as probe:
             inventory = _video_inventory_uncached(Path("enhanced.mp4"))
         probe.assert_called_once_with([

@@ -12,19 +12,13 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        # 3.9 is the floor declared in pyproject.toml; test it so the floor
-        # stays honest, and the current stable release alongside it.
-        python-version: ["3.9", "3.12"]
-        exclude:
-          # setup-python publishes Python 3.9 linux builds only up to Ubuntu
-          # 24.04 (3.9 went end-of-life in October 2025), and ubuntu-latest
-          # has rolled past that — the job failed in setup-python itself and
-          # skipped the tests. Pin the floor to the newest image that has it.
-          - os: ubuntu-latest
-            python-version: "3.9"
-        include:
-          - os: ubuntu-24.04
-            python-version: "3.9"
+        # 3.10 is the floor declared in pyproject.toml; test it so the floor
+        # stays honest, and the current stable release alongside it. Keep an
+        # eye on the floor's end-of-life: setup-python stops publishing a
+        # version's linux builds a release or two after it goes EOL, and the
+        # failure lands *inside* setup-python, which leaves the matrix green
+        # with the test step merely skipped. 3.9 failed exactly that way.
+        python-version: ["3.10", "3.12"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5

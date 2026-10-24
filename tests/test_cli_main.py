@@ -11,6 +11,7 @@ import io
 import json
 import logging
 import pathlib
+import re
 import sys
 import tempfile
 import unittest
@@ -275,6 +276,19 @@ class ClassifyJobTests(MainTestCase):
         self.assertIn("preflight failed", decision.detail)
 
 
+def _tally(**counts):
+    """A zeroed status tally with the given statuses filled in."""
+    from mediate.converters import (
+        CONVERTED, FAILED, PLANNED, REMUXED, REPAIRED, SKIPPED,
+    )
+
+    base = {
+        CONVERTED: 0, REMUXED: 0, REPAIRED: 0, SKIPPED: 0, FAILED: 0, PLANNED: 0,
+    }
+    base.update(counts)
+    return base
+
+
 class ExtractedSeamTests(MainTestCase):
     """The pieces main() delegates to, exercised without running a whole scan."""
 
@@ -284,24 +298,126 @@ class ExtractedSeamTests(MainTestCase):
             CONVERTED, FAILED, PLANNED, REMUXED, REPAIRED, SKIPPED,
         )
 
-        def tally(**kw):
-            base = {
-                CONVERTED: 0, REMUXED: 0, REPAIRED: 0,
-                SKIPPED: 0, FAILED: 0, PLANNED: 0,
-            }
-            base.update(kw)
-            return base
-
         self.assertEqual(
-            summarize_run(tally(**{CONVERTED: 2, FAILED: 1}), 7_235_000, False),
+            summarize_run(_tally(**{CONVERTED: 2, FAILED: 1}), 7_235_000, False),
             "done: 2 converted, 0 skipped, 1 failed, 6.9 MB saved",
         )
         self.assertEqual(
-            summarize_run(tally(**{PLANNED: 2}), 0, True),
+            summarize_run(_tally(**{PLANNED: 2}), 0, True),
             "dry run complete: 2 would be converted, 0 skipped",
         )
         # Zero-count stages stay out of the line; skipped/failed always show.
-        self.assertNotIn("remuxed", summarize_run(tally(**{CONVERTED: 1}), 0, False))
+        self.assertNotIn("remuxed", summarize_run(_tally(**{CONVERTED: 1}), 0, False))
+
+    def test_the_disposal_flags_stay_mutually_exclusive_inside_their_group(self):
+        # --graveyard/--hard-delete sit in a mutually exclusive group nested
+        # in the "originals" help group; nesting it wrongly would silently
+        # accept both and let the last one win.
+        with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
+            cli.parse_args([str(self.root), "--hard-delete", "--graveyard", "/tmp/g"])
+
+    def test_every_option_is_filed_under_a_help_group(self):
+        # A flag added without a group lands back in the undifferentiated
+        # "options" block this grouping exists to break up.
+        parser_actions = cli.parse_args([str(self.root)])
+        self.assertTrue(hasattr(parser_actions, "workers"))
+        help_text = self._help_text()
+        for heading in (
+            "what gets converted:",
+            "safety overrides:",
+            "what happens to originals:",
+            "renaming:",
+            "run control and output:",
+        ):
+            self.assertIn(heading, help_text)
+        # Only -h and --dry-run are meant to remain ungrouped.
+        options_block = help_text.split("options:", 1)[1].split("\n\n", 1)[0]
+        self.assertIn("--dry-run", options_block)
+        self.assertNotIn("--workers", options_block)
+
+    def _help_text(self) -> str:
+        buffer = io.StringIO()
+        with self.assertRaises(SystemExit), redirect_stdout(buffer):
+            cli.parse_args(["--help"])
+        return buffer.getvalue()
+
+    def test_large_savings_are_reported_in_gigabytes(self):
+        from mediate.cli import _format_saved
+
+        self.assertEqual(_format_saved(7_235_000), "6.9 MB saved")
+        # A whole-library run reclaims gigabytes; "2150.4 MB" is unreadable.
+        self.assertEqual(_format_saved(2_300_000_000), "2.1 GB saved")
+        # An --only-if-smaller run that grew nothing must not read as a gain.
+        self.assertEqual(_format_saved(0), "0.0 MB saved")
+
+    def test_the_summary_groups_skip_and_failure_reasons(self):
+        from collections import Counter
+
+        from mediate.cli import summarize_run
+        from mediate.converters import CONVERTED, FAILED, SKIPPED
+
+        report = summarize_run(
+            _tally(**{CONVERTED: 1, SKIPPED: 24, FAILED: 3}),
+            0,
+            False,
+            {
+                SKIPPED: Counter({"HEVC MP4 (--reencode-hevc)": 20, "static WebP": 4}),
+                FAILED: Counter({"converter not found": 3}),
+            },
+        )
+        lines = report.splitlines()
+        self.assertTrue(lines[0].startswith("done: 1 converted"))
+        # Most common reason first, counts right-aligned to a common width.
+        self.assertEqual(lines[1], "  skipped:")
+        self.assertEqual(lines[2], "    20 x HEVC MP4 (--reencode-hevc)")
+        self.assertEqual(lines[3], "     4 x static WebP")
+        self.assertEqual(lines[4], "  failed:")
+        self.assertEqual(lines[5], "    3 x converter not found")
+
+    def test_a_long_tail_of_reasons_is_truncated(self):
+        from collections import Counter
+
+        from mediate.cli import MAX_REASON_LINES, summarize_run
+        from mediate.converters import SKIPPED
+
+        counts = Counter({f"reason {n}": 100 - n for n in range(MAX_REASON_LINES + 4)})
+        tally = _tally(**{SKIPPED: 0})
+        tally[SKIPPED] = sum(counts.values())
+        lines = summarize_run(tally, 0, False, {SKIPPED: counts}).splitlines()
+
+        # Headline + label + the cap + one roll-up line.
+        self.assertEqual(len(lines), MAX_REASON_LINES + 3)
+        self.assertIn("4 further reason(s)", lines[-1])
+
+    def test_an_empty_reason_group_adds_no_lines(self):
+        from collections import Counter
+
+        from mediate.cli import summarize_run
+        from mediate.converters import CONVERTED, FAILED, SKIPPED
+
+        tally = _tally(**{CONVERTED: 2})
+        report = summarize_run(
+            tally, 0, False, {SKIPPED: Counter(), FAILED: Counter()}
+        )
+        self.assertNotIn("\n", report)
+
+    def test_the_dry_run_summary_groups_planned_actions(self):
+        from collections import Counter
+
+        from mediate.cli import summarize_run
+        from mediate.converters import PLANNED, SKIPPED
+
+        tally = _tally(**{PLANNED: 5, SKIPPED: 1})
+        report = summarize_run(
+            tally, 0, True,
+            {
+                PLANNED: Counter({"would convert and move original to Trash": 5}),
+                SKIPPED: Counter({"static WebP (already standardized)": 1}),
+            },
+        )
+        self.assertIn("  planned:", report)
+        self.assertIn("5 x would convert and move original to Trash", report)
+        self.assertIn("1 x static WebP (already standardized)", report)
 
     def test_plan_jobs_claims_one_name_per_output(self):
         from mediate.cli import plan_jobs
@@ -368,17 +484,24 @@ class ExtractedSeamTests(MainTestCase):
 
 
 class PythonFloorTests(unittest.TestCase):
-    """pyproject declares >=3.9; keep the sources parseable there."""
+    """Keep the sources parseable on the floor pyproject declares."""
 
     def test_sources_parse_under_the_declared_minimum(self):
         root = pathlib.Path(__file__).resolve().parent.parent
+        # Read the floor rather than repeating it: a hardcoded version here
+        # silently stops testing the real floor the moment pyproject moves,
+        # which is the one thing this test exists to prevent.
+        declared = re.search(
+            r'requires-python\s*=\s*">=(\d+)\.(\d+)"',
+            (root / "pyproject.toml").read_text(),
+        )
+        self.assertIsNotNone(declared, "pyproject must declare requires-python >=X.Y")
+        floor = (int(declared.group(1)), int(declared.group(2)))
         for path in sorted(root.glob("mediate/*.py")):
             with self.subTest(path=path.name):
-                ast.parse(path.read_text(), str(path), feature_version=(3, 9))
+                ast.parse(path.read_text(), str(path), feature_version=floor)
 
     def test_the_packaged_version_matches_pyproject(self):
-        import re
-
         import mediate
 
         root = pathlib.Path(__file__).resolve().parent.parent

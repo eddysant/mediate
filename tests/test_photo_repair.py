@@ -12,13 +12,15 @@ from mediate.converters import (
     CONVERTED,
     Options,
     _convert,
+    process_job,
+    unique_output_path,
+)
+from mediate.photo import (
     _convert_photo,
     _decode_heic,
     _heic_primary_stream,
     _png_dimensions,
     _repair_photo_metadata,
-    process_job,
-    unique_output_path,
 )
 from mediate.scanner import MediaJob
 from mediate.validators import verify_photo_metadata
@@ -55,8 +57,8 @@ class PhotoRepairTests(unittest.TestCase):
             self.output.write_bytes(b"valid-webp")
             return subprocess.CompletedProcess(command, 0, "", "")
 
-        with patch("mediate.converters._jpegtran_path", return_value="jpegtran"), patch(
-            "mediate.converters._run", side_effect=run
+        with patch("mediate.photo._jpegtran_path", return_value="jpegtran"), patch(
+            "mediate.photo._run", side_effect=run
         ):
             result = _convert("photo", self.source, self.output)
 
@@ -68,8 +70,8 @@ class PhotoRepairTests(unittest.TestCase):
 
     def test_missing_jpegtran_returns_actionable_failure(self):
         failed = subprocess.CompletedProcess([], 1, "", TRUNCATED_ERROR)
-        with patch("mediate.converters._jpegtran_path", return_value=None), patch(
-            "mediate.converters._run", return_value=failed
+        with patch("mediate.photo._jpegtran_path", return_value=None), patch(
+            "mediate.photo._run", return_value=failed
         ):
             result = _convert_photo(self.source, self.output)
 
@@ -82,8 +84,8 @@ class PhotoRepairTests(unittest.TestCase):
         normalise = subprocess.CompletedProcess(
             ["jpegtran"], 1, "", "Invalid JPEG file structure"
         )
-        with patch("mediate.converters._jpegtran_path", return_value="jpegtran"), patch(
-            "mediate.converters._run", side_effect=[direct, normalise]
+        with patch("mediate.photo._jpegtran_path", return_value="jpegtran"), patch(
+            "mediate.photo._run", side_effect=[direct, normalise]
         ):
             result = _convert_photo(self.source, self.output)
 
@@ -95,8 +97,8 @@ class PhotoRepairTests(unittest.TestCase):
 
     def test_unrelated_cwebp_failure_does_not_attempt_repair(self):
         failure = subprocess.CompletedProcess([], 1, "", "Cannot open output file")
-        with patch("mediate.converters._jpegtran_path") as jpegtran, patch(
-            "mediate.converters._run", return_value=failure
+        with patch("mediate.photo._jpegtran_path") as jpegtran, patch(
+            "mediate.photo._run", return_value=failure
         ):
             result = _convert_photo(self.source, self.output)
 
@@ -144,8 +146,8 @@ class PhotoMetadataTests(unittest.TestCase):
         self.assertIn("capture date metadata not preserved", reason)
 
     def test_exiftool_can_restore_metadata_dropped_by_cwebp(self):
-        with patch("mediate.converters.exiftool_available", return_value=True), patch(
-            "mediate.converters.run_exiftool", return_value="1 image files updated\n"
+        with patch("mediate.photo.exiftool_available", return_value=True), patch(
+            "mediate.photo.run_exiftool", return_value="1 image files updated\n"
         ) as exiftool:
             self.assertTrue(
                 _repair_photo_metadata(Path("source.jpg"), Path("output.webp"))
@@ -227,7 +229,7 @@ class GifFallbackPlatformTests(unittest.TestCase):
         # Calling sips blind reported "converter not found: sips", blaming a
         # tool the user never asked for and discarding the actual reason.
         with patch.object(sys, "platform", "linux"), \
-                patch("mediate.converters._run", side_effect=self._cwebp_rejects):
+                patch("mediate.photo._run", side_effect=self._cwebp_rejects):
             result = _convert_photo(self.src, self.root / "out.webp")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Cannot read input picture file", result.stderr)
@@ -235,8 +237,8 @@ class GifFallbackPlatformTests(unittest.TestCase):
 
     def test_macos_without_sips_installed_also_falls_back_cleanly(self):
         with patch.object(sys, "platform", "darwin"), \
-                patch("mediate.converters.shutil.which", return_value=None), \
-                patch("mediate.converters._run", side_effect=self._cwebp_rejects):
+                patch("mediate.photo.shutil.which", return_value=None), \
+                patch("mediate.photo._run", side_effect=self._cwebp_rejects):
             result = _convert_photo(self.src, self.root / "out.webp")
         self.assertIn("Cannot read input picture file", result.stderr)
 
@@ -254,8 +256,8 @@ class GifFallbackPlatformTests(unittest.TestCase):
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
         with patch.object(sys, "platform", "darwin"), \
-                patch("mediate.converters.shutil.which", return_value="/usr/bin/sips"), \
-                patch("mediate.converters._run", side_effect=runner):
+                patch("mediate.photo.shutil.which", return_value="/usr/bin/sips"), \
+                patch("mediate.photo._run", side_effect=runner):
             result = _convert_photo(self.src, self.root / "out.webp")
         self.assertEqual(result.returncode, 0)
         self.assertIn("sips", calls)
@@ -276,13 +278,13 @@ class HeicDecodeTests(unittest.TestCase):
             {"index": 0, "codec_name": "hevc", "width": 160, "height": 120},
             {"index": 1, "codec_name": "hevc", "width": 4032, "height": 3024},
         ]
-        with patch("mediate.probe.heic_image_streams", return_value=streams):
+        with patch("mediate.inventory.heic_image_streams", return_value=streams):
             self.assertEqual(_heic_primary_stream(src)["index"], 1)
 
     def test_no_decodable_image_is_an_error_not_a_crash(self):
         src = self.root / "a.heic"
         src.write_bytes(b"x")
-        with patch("mediate.probe.heic_image_streams", return_value=[]), \
+        with patch("mediate.inventory.heic_image_streams", return_value=[]), \
                 patch.object(sys, "platform", "linux"):
             result = _decode_heic(src, self.root / "out.png")
         self.assertNotEqual(result.returncode, 0)
@@ -300,9 +302,9 @@ class HeicDecodeTests(unittest.TestCase):
             png.write_bytes(_png_bytes(160, 120))  # a thumbnail slipped through
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
-        with patch("mediate.probe.heic_image_streams", return_value=streams), \
+        with patch("mediate.inventory.heic_image_streams", return_value=streams), \
                 patch.object(sys, "platform", "linux"), \
-                patch("mediate.converters._run", side_effect=fake_run):
+                patch("mediate.photo._run", side_effect=fake_run):
             result = _decode_heic(src, png)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("auxiliary image", result.stderr)
@@ -317,9 +319,9 @@ class HeicDecodeTests(unittest.TestCase):
             png.write_bytes(_png_bytes(320, 240))
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
-        with patch("mediate.probe.heic_image_streams", return_value=streams), \
+        with patch("mediate.inventory.heic_image_streams", return_value=streams), \
                 patch.object(sys, "platform", "linux"), \
-                patch("mediate.converters._run", side_effect=fake_run):
+                patch("mediate.photo._run", side_effect=fake_run):
             result = _decode_heic(src, png)
         self.assertEqual(result.returncode, 0)
 

@@ -18,17 +18,19 @@ from typing import List, Optional, Tuple
 
 from .exiftool import exiftool_available, run_exiftool
 from .probe import (
-    COLOR_FIELDS,
-    DYNAMIC_RANGE_SIDE_DATA_MARKERS,
     STANDARD_H264_PIXEL_FORMATS,
-    audio_stream_label,
     check_video_integrity,
     decoded_duration,
     decoded_stream_starts,
-    inventory_streams,
-    is_commentary_stream,
     media_duration,
     packet_stream_durations,
+)
+from .inventory import (
+    COLOR_FIELDS,
+    DYNAMIC_RANGE_SIDE_DATA_MARKERS,
+    audio_stream_label,
+    inventory_streams,
+    is_commentary_stream,
     preservable_artwork_streams,
     preservable_subtitle_streams,
     primary_video_streams,
