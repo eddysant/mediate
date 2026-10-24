@@ -17,7 +17,7 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 | `probecache.py` | the cache itself: identity-keyed (+ sampled fingerprint) JSON memo under the user cache dir, plus the one `ffprobe -of json` call |
 | `inventory.py` | the normalized inventory of all streams, stream groups, chapters, track identity, rotation, colour, artwork — and the pure queries over it that the safety policy is built from |
 | `converters.py` | the pipeline: temp-file protocol, `classify_job()` (every probe-based skip, no filesystem writes) + `process_job()`, `Outcome`/`Options`/`Plan` |
-| `ffmpegcmd.py` | pure inventory→argv construction: explicit stream mapping, per-track metadata, `-c copy` remuxing for compatible containers, the rotation display-matrix finalizer |
+| `ffmpegcmd.py` | pure inventory→argv construction: explicit stream mapping, per-track metadata, encoder/preset selection (`--encode-preset`, `--hardware`), `-c copy` remuxing for compatible containers, the rotation display-matrix finalizer |
 | `photo.py` | the still-image pipeline: cwebp/avifenc encode, HEIC→PNG decode, jpegtran/sips rescues, exiftool metadata repair |
 | `proc.py` | the shared `run(argv)` seam — argv lists, captured text, debug-logged; separate so photo and video can both use it without a cycle |
 | `validators.py` | exit/existence/size/full-decode checks plus photo metadata; `verify_video_streams` dispatches lazily to named per-concern checks (audio tracks, subtitles, artwork, chapters, video format) |
@@ -266,6 +266,30 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   reversed, so folder renames undo before the files inside them. Folder
   plans are applied only after all file renames resolved — file plan paths
   are computed against pre-rename folder names.
+- **The encode preset default was measured, not assumed** (`ffmpegcmd.py`):
+  it was `-preset slow` until benchmarked on an M2. On grainy 1080p, `slow`
+  took 207s for a 532 MB file; `medium` took 76s for 524 MB — 2.7x faster
+  *and smaller*, because `slow`'s psy settings spend bits preserving grain
+  at crf 18. SSIM against the source was 0.9471 vs 0.9448; on clean footage
+  the gap was 0.000005. The default is now `medium` (x264's own default),
+  overridable with `--encode-preset`. Two things that are *not* levers:
+  worker count (8 workers 133s vs 1 worker 150s for the same eight files —
+  x264 already saturates the cores, so the pool does almost nothing for
+  video) and the post-encode validation decode (0.8s against a 16.7s
+  encode). Lowering crf *is* a lever but costs real quality (crf 20 →
+  SSIM 0.919) and is barely faster, so it stays at 18.
+- **`--hardware` must rewrite the chroma siting VideoToolbox drops**
+  (`_hardware_metadata_args`): `h264_videotoolbox` silently ignores
+  `-chroma_sample_location`, so the output VUI loses the source's siting and
+  the strict validator correctly rejected *every* source that declared it
+  ("chroma_location changed: source left, output None"). The fix is the
+  `h264_metadata` bitstream filter in the same encode pass, which patches
+  the VUI without touching a pixel (verified SSIM 1.000000) — not a
+  relaxed validator. Hardware is opt-in because its quality per byte is
+  genuinely lower: at a matched file size its SSIM was 0.925 vs libx264's
+  0.933, and reaching libx264's quality (q=90) grew a 977 MB source to
+  1.2 GB. `-q:v 75` is the size-matched setting; `-crf` is not supported by
+  that encoder at all, so the two encoders' argument lists cannot be shared.
 - **A skip reason is grouped, the detail is not** (`Outcome.reason`): the
   closing summary counts files per reason, but most details embed a
   filename, an exception or a stream list and would each be a group of one.

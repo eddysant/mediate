@@ -14,6 +14,7 @@ from typing import Optional
 
 from . import __version__
 from .capabilities import check_media_capabilities
+from .ffmpegcmd import DEFAULT_ENCODE_PRESET, X264_PRESETS
 from .converters import (
     CONVERTED,
     FAILED,
@@ -224,6 +225,27 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="photo output format: webp (default, lossless via cwebp) or avif "
         "(lossless via avifenc — install with `brew install libavif`; "
         "note: lossless AVIF is often larger than lossless WebP for photos)",
+    )
+
+    speed = parser.add_argument_group("encoding speed")
+    encoder = speed.add_mutually_exclusive_group()
+    encoder.add_argument(
+        "--encode-preset",
+        choices=X264_PRESETS,
+        default=DEFAULT_ENCODE_PRESET,
+        metavar="PRESET",
+        help=f"libx264 speed/efficiency preset (default: {DEFAULT_ENCODE_PRESET}). "
+        "Slower presets spend more time for a smaller file — though on grainy "
+        "footage at this quality level `slow` measured both slower and larger. "
+        f"One of: {', '.join(X264_PRESETS)}",
+    )
+    encoder.add_argument(
+        "--hardware",
+        action="store_true",
+        help="encode video with the platform hardware encoder (VideoToolbox on "
+        "macOS): several times faster, but measurably lower quality for the "
+        "same file size than libx264, so it is never the default. Outputs go "
+        "through the same strict validation either way",
     )
 
     overrides = parser.add_argument_group(
@@ -487,6 +509,8 @@ def build_options(root: Path, args: argparse.Namespace):
         allow_video_downgrade=args.allow_video_downgrade,
         validate_existing=args.validate_existing,
         output_format=args.output_format,
+        encode_preset=args.encode_preset,
+        hardware=args.hardware,
         dispose=dispose,
         dispose_label=dispose_label,
         transaction_root=root,
@@ -655,6 +679,7 @@ def main(argv=None) -> int:
         require_animated_webp=any(job.kind == "webp" for job in recognized),
         require_avif=has_photos and args.output_format == "avif",
         require_heic=args.convert_heic and any(job.kind == "heic" for job in recognized),
+        require_hardware=args.hardware,
     )
     for name, version in capability_report.versions.items():
         log.debug("toolchain: %s: %s", name, version)

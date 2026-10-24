@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from .ffmpegcmd import HARDWARE_VIDEO_ENCODER
+
 MINIMUM_FFMPEG = (6, 0)
 
 
@@ -184,6 +186,30 @@ def _check_ffmpeg(
         report.errors.append(f"FFmpeg smoke test could not complete: {exc}; {_install_hint()}")
 
 
+def _check_hardware_encoder(report: CapabilityReport) -> None:
+    """--hardware is useless without the platform encoder actually built in.
+
+    Checked up front rather than per file: discovering it at the first video
+    would leave a long run failing one job at a time with an ffmpeg error
+    that never names the flag that asked for it.
+    """
+    try:
+        encoders = _run(["ffmpeg", "-hide_banner", "-encoders"])
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        report.errors.append(f"could not list FFmpeg encoders: {exc}")
+        return
+    available = encoders.stdout + encoders.stderr
+    if not re.search(rf"\b{re.escape(HARDWARE_VIDEO_ENCODER)}\b", available):
+        report.errors.append(
+            f"--hardware needs the {HARDWARE_VIDEO_ENCODER} encoder, which this "
+            "FFmpeg build does not have"
+            + ("" if sys.platform == "darwin" else "; VideoToolbox is macOS-only")
+            + f". Drop --hardware (or {_install_hint()})"
+        )
+        return
+    report.versions["hardware encoder"] = HARDWARE_VIDEO_ENCODER
+
+
 def _check_avifenc(report: CapabilityReport) -> None:
     if not _check_binary("avifenc", report, AVIF_INSTALL_HINT):
         return
@@ -247,10 +273,13 @@ def _check_heic(report: CapabilityReport) -> None:
 def check_media_capabilities(
     *, require_video: bool, require_photos: bool, require_animated_webp: bool = False,
     require_avif: bool = False, require_heic: bool = False,
+    require_hardware: bool = False,
 ) -> CapabilityReport:
     report = CapabilityReport()
     if require_video or require_animated_webp:
         _check_ffmpeg(report, require_animated_webp=require_animated_webp)
+        if require_hardware and not report.errors:
+            _check_hardware_encoder(report)
     if require_photos:
         _check_cwebp(report)
     if require_avif:

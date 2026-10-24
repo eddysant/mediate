@@ -180,7 +180,7 @@ class OutputCollisionTests(unittest.TestCase):
         preferred.write_bytes(b"existing-output")
         fake_uuid = SimpleNamespace(hex="0123456789abcdef")
 
-        def convert(_kind, _src, output, _inventory=None, repair=False):
+        def convert(_kind, _src, output, _inventory=None, repair=False, **_kw):
             output.write_bytes(b"new-output")
             return subprocess.CompletedProcess([], 0, "", "")
 

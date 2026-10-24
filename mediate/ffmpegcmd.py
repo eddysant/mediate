@@ -26,6 +26,66 @@ from .inventory import (
     primary_video_streams,
 )
 
+# x264 speed/efficiency presets, slowest-compressing first. The default was
+# "slow" until it was measured: on grainy 1080p it took 2.7x as long as
+# "medium" and produced a *larger* file, because its psy settings spend bits
+# preserving grain at crf 18. On clean footage the SSIM difference against
+# the source was 0.000005. "medium" is x264's own default for the same
+# reason.
+X264_PRESETS = (
+    "veryslow", "slower", "slow", "medium", "fast",
+    "faster", "veryfast", "superfast", "ultrafast",
+)
+DEFAULT_ENCODE_PRESET = "medium"
+
+# VideoToolbox is constant-quality on Apple silicon; 75 is the value that
+# matched libx264 -crf 18's file size in testing (SSIM 0.925 vs 0.933) while
+# encoding about five times faster. Quality per byte is genuinely lower,
+# which is why hardware encoding is opt-in and never a default.
+HARDWARE_VIDEO_ENCODER = "h264_videotoolbox"
+HARDWARE_QUALITY = "75"
+
+# ffprobe's chroma_location names, in the H.264 figure E-1 order that the
+# h264_metadata bitstream filter's chroma_sample_loc_type uses.
+CHROMA_SAMPLE_LOC_TYPES = {
+    "left": 0,
+    "center": 1,
+    "topleft": 2,
+    "top": 3,
+    "bottomleft": 4,
+    "bottom": 5,
+}
+
+
+def _hardware_metadata_args(inventory: Optional[dict]) -> List[str]:
+    """Rewrite the one declaration VideoToolbox refuses to write.
+
+    h264_videotoolbox ignores -chroma_sample_location, so a hardware-encoded
+    output loses the source's chroma siting and the strict validator rejects
+    the conversion outright ("chroma_location changed: source left, output
+    None") — which is the safety net working, but it made --hardware fail on
+    any file that declared siting. The h264_metadata bitstream filter patches
+    the VUI of the encoder's own output, in the same pass and without
+    touching a pixel (verified SSIM 1.000000), so the declaration survives.
+    """
+    if not inventory:
+        return []
+    videos = primary_video_streams(inventory)
+    if not videos:
+        return []
+    location = videos[0].get("color", {}).get("chroma_location")
+    loc_type = CHROMA_SAMPLE_LOC_TYPES.get(location)
+    if loc_type is None:
+        return []
+    return ["-bsf:v", f"h264_metadata=chroma_sample_loc_type={loc_type}"]
+
+
+def _video_encoder_args(preset: str, hardware: bool) -> List[str]:
+    """How to encode the picture: hardware, or libx264 at `preset`."""
+    if hardware:
+        return ["-c:v:0", HARDWARE_VIDEO_ENCODER, "-q:v", HARDWARE_QUALITY]
+    return ["-c:v:0", "libx264", "-preset", preset, "-crf", "18"]
+
 
 def _video_mapping_args(inventory: dict) -> List[str]:
     """Map the primary picture and each preservable stream by absolute index."""
@@ -156,6 +216,8 @@ def _build_command(
     repair: bool = False,
     copy_video: bool = False,
     output_format: str = "webp",
+    encode_preset: str = DEFAULT_ENCODE_PRESET,
+    hardware: bool = False,
 ) -> List[str]:
     if kind == "photo":
         if output_format == "avif":
@@ -182,7 +244,7 @@ def _build_command(
             *(
                 ["-c:v:0", "copy"]
                 if copy_video
-                else ["-c:v:0", "libx264", "-preset", "slow", "-crf", "18"]
+                else _video_encoder_args(encode_preset, hardware)
             ),
             "-c:a", "aac", "-b:a", "256k",
             *_preserved_stream_codec_args(inventory),
@@ -195,6 +257,11 @@ def _build_command(
             ]),
             *(["-fps_mode", "passthrough"] if repair else []),
             *_video_metadata_args(inventory),
+            *(
+                _hardware_metadata_args(inventory)
+                if hardware and not copy_video
+                else []
+            ),
             "-tag:v:0", _apple_video_tag(inventory) if copy_video else "avc1",
             "-tag:a", "mp4a",
             "-brand", "mp42", "-movflags", "+faststart",
@@ -205,7 +272,7 @@ def _build_command(
             "ffmpeg", "-nostdin", "-y", "-i", str(input_path),
             "-tag:v:0", "avc1", "-brand", "mp42", "-movflags", "+faststart",
             "-pix_fmt", "yuv420p",
-            "-c:v", "libx264", "-preset", "slow", "-crf", "18",
+            *_video_encoder_args(encode_preset, hardware),
             "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
             str(output_path),
         ]

@@ -60,7 +60,7 @@ builds fail up front with an installation hint.
 |---|---|---|
 | JPEG / PNG / TIFF | Lossless WebP, or lossless AVIF with `--output-format avif` | `cwebp` / `avifenc` |
 | HEIC / HEIF (opt-in) | Lossless WebP / AVIF via a PNG intermediate, EXIF preserved | `sips` or `ffmpeg`, then `cwebp` / `avifenc` |
-| MOV / MKV / AVI / WMV / WebM / ASF / VOB / legacy video | MP4 (h264 `-crf 18 -preset slow`, AAC 256k, `yuv420p`) | `ffmpeg` |
+| MOV / MKV / AVI / WMV / WebM / ASF / VOB / legacy video | MP4 (h264 `-crf 18 -preset medium`, AAC 256k, `yuv420p`) | `ffmpeg` |
 | Animated GIF / animated WebP | MP4 (`faststart`, even-dimension scale filter) | `ffmpeg` |
 
 Legacy coverage includes QuickTime (`.mov`, `.qt`), Windows Media (`.asf`,
@@ -101,6 +101,35 @@ goes through the same ffprobe preflight and validation pipeline.
 - `--validate-existing` — fully decode already-standardized MP4s and repair
   any corruption found. This library-health pass is potentially expensive and
   off by default; newly converted outputs are always validated regardless.
+
+### Encoding speed
+
+Video encoding dominates a run, and the encoder preset is the only lever that
+matters much. Benchmarked on an Apple M2 against 1080p30 sources, measuring
+SSIM against the original rather than eyeballing:
+
+| preset | grainy 30s clip | size | SSIM | clean clip | SSIM |
+|---|---|---|---|---|---|
+| `slow` | 207s | 532 MB | 0.9471 | 13.1s | 0.997767 |
+| `medium` *(default)* | 76s | 524 MB | 0.9448 | 7.5s | 0.997762 |
+| `fast` | 66s | 522 MB | 0.9447 | 6.9s | 0.997744 |
+| `veryfast` | 22s | 421 MB | 0.9215 | 3.6s | — |
+
+- `--encode-preset PRESET` — libx264 preset, default `medium`. Note that on
+  grainy footage `slow` measured both slower *and larger*: its psy settings
+  spend bits preserving grain at this quality level. `veryfast` is where
+  quality genuinely starts to fall off.
+- `--hardware` — encode with the platform hardware encoder (VideoToolbox on
+  macOS). Roughly 5–7x faster than `medium`, but quality per byte is
+  measurably lower: at a matched file size its SSIM was 0.925 against
+  libx264's 0.933, and reaching libx264's quality grew a 977 MB source to
+  1.2 GB. That is why it is opt-in and not the default. Outputs go through
+  the same strict validation either way.
+
+Two things that are *not* worth tuning: `--workers` barely affects video (x264
+already saturates every core — 8 workers measured 133s against 1 worker's 150s
+for the same eight files), and the post-encode validation decode costs about
+5% of an encode.
 
 ### Accept a loss (explicit opt-ins)
 

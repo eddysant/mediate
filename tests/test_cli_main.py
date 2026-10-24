@@ -316,6 +316,36 @@ class ExtractedSeamTests(MainTestCase):
         with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
             cli.parse_args([str(self.root), "--hard-delete", "--graveyard", "/tmp/g"])
 
+    def test_the_speed_flags_reach_options(self):
+        opts, _label = cli.build_options(
+            self.root, cli.parse_args([str(self.root), "--encode-preset", "veryslow"])
+        )
+        self.assertEqual(opts.encode_preset, "veryslow")
+        self.assertFalse(opts.hardware)
+
+        opts, _label = cli.build_options(
+            self.root, cli.parse_args([str(self.root), "--hardware"])
+        )
+        self.assertTrue(opts.hardware)
+
+    def test_the_default_preset_is_the_measured_one(self):
+        from mediate.ffmpegcmd import DEFAULT_ENCODE_PRESET
+
+        opts, _label = cli.build_options(self.root, cli.parse_args([str(self.root)]))
+        self.assertEqual(opts.encode_preset, DEFAULT_ENCODE_PRESET)
+        self.assertEqual(opts.encode_preset, "medium")
+
+    def test_an_unknown_preset_is_rejected_at_parse_time(self):
+        # A typo must not silently fall back to a different speed.
+        with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
+            cli.parse_args([str(self.root), "--encode-preset", "sloww"])
+
+    def test_hardware_and_an_explicit_preset_conflict(self):
+        # --hardware ignores the libx264 preset entirely; accepting both
+        # would silently drop whichever the user meant.
+        with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
+            cli.parse_args([str(self.root), "--hardware", "--encode-preset", "fast"])
+
     def test_every_option_is_filed_under_a_help_group(self):
         # A flag added without a group lands back in the undifferentiated
         # "options" block this grouping exists to break up.
@@ -324,6 +354,7 @@ class ExtractedSeamTests(MainTestCase):
         help_text = self._help_text()
         for heading in (
             "what gets converted:",
+            "encoding speed:",
             "safety overrides:",
             "what happens to originals:",
             "renaming:",

@@ -59,7 +59,7 @@ class FilesystemSafetyTests(unittest.TestCase):
         source = self.root / "photo.jpg"
         source.write_bytes(b"source")
 
-        def convert(_kind, _src, output, _inventory=None, repair=False):
+        def convert(_kind, _src, output, _inventory=None, repair=False, **_kw):
             output.write_bytes(b"converted")
             return subprocess.CompletedProcess([], 0, "", "")
 

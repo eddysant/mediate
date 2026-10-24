@@ -199,6 +199,57 @@ class CapabilityPreflightTests(unittest.TestCase):
         self.assertFalse(report.ok)
         self.assertTrue(any("brew install ffmpeg webp" in error for error in report.errors))
 
+    @staticmethod
+    def _healthy_ffmpeg(encoders):
+        """A fake _run whose ffmpeg looks fine apart from its encoder list."""
+        def fake_run(args, timeout=20.0):
+            if "-version" in args:
+                return SimpleNamespace(returncode=0, stdout="ffmpeg version 8.1\n", stderr="")
+            if "-encoders" in args:
+                return SimpleNamespace(returncode=0, stdout=encoders, stderr="")
+            return SimpleNamespace(
+                returncode=0, stdout="-progress -display_rotation", stderr=""
+            )
+        return fake_run
+
+    def test_hardware_without_the_encoder_names_the_flag_that_asked_for_it(self):
+        # Caught up front: discovering it at the first video would fail a
+        # long run one job at a time, with an ffmpeg error that never
+        # mentions --hardware.
+        encoders = " V..... libx264 H.264\n A..... aac AAC\n"
+        with patch("mediate.capabilities.shutil.which", return_value="/tool"), \
+                patch("mediate.capabilities._run", self._healthy_ffmpeg(encoders)), \
+                patch("mediate.capabilities._check_ffmpeg"):
+            report = check_media_capabilities(
+                require_video=True, require_photos=False, require_hardware=True,
+            )
+        self.assertFalse(report.ok)
+        self.assertTrue(any("--hardware" in error for error in report.errors))
+        self.assertTrue(any("h264_videotoolbox" in error for error in report.errors))
+
+    def test_hardware_passes_when_the_encoder_is_present(self):
+        encoders = (
+            " V..... libx264 H.264\n A..... aac AAC\n"
+            " V....D h264_videotoolbox VideoToolbox H.264 Encoder\n"
+        )
+        with patch("mediate.capabilities.shutil.which", return_value="/tool"), \
+                patch("mediate.capabilities._run", self._healthy_ffmpeg(encoders)), \
+                patch("mediate.capabilities._check_ffmpeg"):
+            report = check_media_capabilities(
+                require_video=True, require_photos=False, require_hardware=True,
+            )
+        self.assertTrue(report.ok, report.errors)
+        self.assertEqual(report.versions["hardware encoder"], "h264_videotoolbox")
+
+    def test_hardware_is_not_probed_unless_asked_for(self):
+        encoders = " V..... libx264 H.264\n A..... aac AAC\n"
+        with patch("mediate.capabilities.shutil.which", return_value="/tool"), \
+                patch("mediate.capabilities._run", self._healthy_ffmpeg(encoders)), \
+                patch("mediate.capabilities._check_ffmpeg"):
+            report = check_media_capabilities(require_video=True, require_photos=False)
+        self.assertTrue(report.ok, report.errors)
+        self.assertNotIn("hardware encoder", report.versions)
+
     def test_animated_webp_requires_the_native_ffmpeg_9_demuxer(self):
         def fake_run(args, timeout=20.0):
             if "-version" in args:

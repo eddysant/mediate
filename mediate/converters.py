@@ -43,7 +43,12 @@ from .inventory import (
     stream_removal_risks,
     video_inventory,
 )
-from .ffmpegcmd import _build_command, _build_remux_command, _build_rotation_command
+from .ffmpegcmd import (
+    DEFAULT_ENCODE_PRESET,
+    _build_command,
+    _build_remux_command,
+    _build_rotation_command,
+)
 from .photo import (
     _convert_photo,
     _decode_heic,
@@ -84,6 +89,8 @@ class Options:
     allow_video_downgrade: bool = False
     validate_existing: bool = False
     output_format: str = "webp"  # "webp" | "avif"
+    encode_preset: str = DEFAULT_ENCODE_PRESET
+    hardware: bool = False
     dispose: Optional[Disposer] = None
     dispose_label: str = "delete original"
     transaction_root: Optional[Path] = None
@@ -163,6 +170,8 @@ def _convert(
     repair: bool = False,
     copy_video: bool = False,
     output_format: str = "webp",
+    encode_preset: str = DEFAULT_ENCODE_PRESET,
+    hardware: bool = False,
 ) -> subprocess.CompletedProcess:
     """Run the conversion subprocess(es) for a job. HEIC goes through a
     two-step pipeline: sips (built into macOS, decodes HEVC-compressed
@@ -178,7 +187,9 @@ def _convert(
             if rotation is not None:
                 encode_output = tmp.with_name(f".{tmp.name}.encoded.mp4")
         cmd = _build_command(
-            kind, src, encode_output, inventory, repair=repair, copy_video=copy_video
+            kind, src, encode_output, inventory,
+            repair=repair, copy_video=copy_video,
+            encode_preset=encode_preset, hardware=hardware,
         )
         total = media_duration(src)
         log.debug("running: %s", " ".join(cmd))
@@ -205,7 +216,9 @@ def _convert(
     if kind == "photo":
         return _convert_photo(src, tmp, output_format=output_format)
     if kind != "heic":
-        return _run(_build_command(kind, src, tmp))
+        return _run(_build_command(
+            kind, src, tmp, encode_preset=encode_preset, hardware=hardware,
+        ))
 
     png = tmp.with_suffix(".png")
     try:
@@ -466,7 +479,11 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
                 media_duration(src),
                 "repairing" if tolerant else "remuxing",
             )
-        convert_options = {"repair": stage == "repair-encode"}
+        convert_options = {
+            "repair": stage == "repair-encode",
+            "encode_preset": opts.encode_preset,
+            "hardware": opts.hardware,
+        }
         if stage == "convert" and copy_video:
             convert_options["copy_video"] = True
         if opts.output_format != "webp":

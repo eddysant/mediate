@@ -6,11 +6,14 @@ from unittest.mock import patch
 from mediate.converters import (
     Options,
     SKIPPED,
+    _explain_source_truncation,
+    process_job,
+)
+from mediate.ffmpegcmd import (
     _build_command,
     _build_remux_command,
     _build_rotation_command,
-    _explain_source_truncation,
-    process_job,
+    _hardware_metadata_args,
 )
 from mediate.inventory import (
     _video_inventory_uncached,
@@ -356,8 +359,98 @@ class StreamCommandTests(unittest.TestCase):
         command = _build_command("webp", Path("in.webp"), Path("out.mp4"))
         joined = " ".join(command)
         self.assertIn("-i in.webp", joined)
-        self.assertIn("-c:v libx264", joined)
+        # Stream-qualified (-c:v:0) since the encoder choice is shared with
+        # the video path; equivalent here, where there is one video stream.
+        self.assertIn("-c:v:0 libx264", joined)
         self.assertIn("scale=trunc(iw/2)*2:trunc(ih/2)*2", joined)
+
+    def test_the_default_preset_is_medium_not_slow(self):
+        # "slow" was the default until it was measured: on grainy 1080p it
+        # took 2.7x as long as "medium" for a *larger* file, and on clean
+        # footage the SSIM difference against the source was 0.000005.
+        command = _build_command("video", Path("in.mkv"), Path("out.mp4"), self.inventory)
+        joined = " ".join(command)
+        self.assertIn("-c:v:0 libx264 -preset medium -crf 18", joined)
+        self.assertNotIn("-preset slow", joined)
+
+    def test_an_explicit_preset_reaches_the_encoder(self):
+        for preset in ("veryslow", "fast", "ultrafast"):
+            with self.subTest(preset=preset):
+                command = _build_command(
+                    "video", Path("in.mkv"), Path("out.mp4"), self.inventory,
+                    encode_preset=preset,
+                )
+                self.assertIn(f"-preset {preset} -crf 18", " ".join(command))
+
+    def test_hardware_swaps_the_encoder_and_its_quality_control(self):
+        # VideoToolbox has no -crf; passing one is an error, not a no-op.
+        command = _build_command(
+            "video", Path("in.mkv"), Path("out.mp4"), self.inventory, hardware=True,
+        )
+        joined = " ".join(command)
+        self.assertIn("-c:v:0 h264_videotoolbox -q:v 75", joined)
+        self.assertNotIn("-crf", joined)
+        self.assertNotIn("libx264", joined)
+        self.assertNotIn("-preset", joined)
+
+    def test_hardware_rewrites_the_chroma_siting_videotoolbox_drops(self):
+        # h264_videotoolbox ignores -chroma_sample_location, so without this
+        # the strict validator rejects every source that declares siting.
+        command = _build_command(
+            "video", Path("in.mkv"), Path("out.mp4"), self.inventory, hardware=True,
+        )
+        self.assertIn(
+            "-bsf:v h264_metadata=chroma_sample_loc_type=0", " ".join(command)
+        )
+
+    def test_each_chroma_location_maps_to_its_figure_e1_type(self):
+        for location, loc_type in (
+            ("left", 0), ("center", 1), ("topleft", 2),
+            ("top", 3), ("bottomleft", 4), ("bottom", 5),
+        ):
+            with self.subTest(location=location):
+                inventory = _inventory(
+                    _stream("video", "vp9", color={"chroma_location": location})
+                )
+                self.assertEqual(
+                    _hardware_metadata_args(inventory),
+                    ["-bsf:v", f"h264_metadata=chroma_sample_loc_type={loc_type}"],
+                )
+
+    def test_no_bitstream_filter_without_a_siting_to_restore(self):
+        # Nothing to preserve, so nothing should be rewritten.
+        for color in ({}, {"chroma_location": "unknown"}, {"chroma_location": None}):
+            with self.subTest(color=color):
+                inventory = _inventory(_stream("video", "vp9", color=color))
+                self.assertEqual(_hardware_metadata_args(inventory), [])
+        self.assertEqual(_hardware_metadata_args(None), [])
+        self.assertEqual(_hardware_metadata_args(_inventory()), [])
+
+    def test_a_copied_video_stream_is_untouched_by_hardware(self):
+        # -c copy keeps the original bitstream, so neither the hardware
+        # encoder nor a VUI rewrite applies.
+        command = _build_command(
+            "video", Path("in.mov"), Path("out.mp4"), self.inventory,
+            hardware=True, copy_video=True,
+        )
+        joined = " ".join(command)
+        self.assertIn("-c:v:0 copy", joined)
+        self.assertNotIn("h264_videotoolbox", joined)
+        self.assertNotIn("-bsf:v", joined)
+
+    def test_the_animation_path_honours_the_preset_and_hardware(self):
+        self.assertIn(
+            "-c:v:0 libx264 -preset fast",
+            " ".join(_build_command(
+                "gif", Path("in.gif"), Path("out.mp4"), encode_preset="fast",
+            )),
+        )
+        self.assertIn(
+            "-c:v:0 h264_videotoolbox",
+            " ".join(_build_command(
+                "gif", Path("in.gif"), Path("out.mp4"), hardware=True,
+            )),
+        )
 
     def test_repair_command_enables_tolerant_timestamp_and_packet_handling(self):
         command = _build_command(
