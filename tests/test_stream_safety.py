@@ -26,7 +26,11 @@ from mediate.inventory import (
     stream_removal_risks,
 )
 from mediate.scanner import MediaJob
-from mediate.validators import validate_output, verify_apple_playback
+from mediate.validators import (
+    validate_output,
+    verify_apple_playback,
+    verify_mp4_layout,
+)
 from mediate.videoverify import verify_video_duration, verify_video_streams
 
 
@@ -986,6 +990,10 @@ class DecodeIntegrityTests(unittest.TestCase):
                 "mediate.validators.check_video_integrity",
                 return_value={"ok": True, "reason": "ok"},
             ) as check, patch(
+                # b"not-empty" is not an MP4; this test is about which
+                # streams the integrity decode maps.
+                "mediate.validators.verify_mp4_layout", return_value=(True, "ok")
+            ), patch(
                 "mediate.validators.verify_apple_playback",
                 return_value=(True, "ok"),
             ) as apple:
@@ -1002,6 +1010,8 @@ class DecodeIntegrityTests(unittest.TestCase):
                 "mediate.validators.check_video_integrity",
                 return_value={"ok": True, "reason": "ok"},
             ), patch(
+                "mediate.validators.verify_mp4_layout", return_value=(True, "ok")
+            ), patch(
                 "mediate.validators.verify_apple_playback",
                 return_value=(False, "AVFoundation could not open the MP4"),
             ):
@@ -1010,6 +1020,89 @@ class DecodeIntegrityTests(unittest.TestCase):
             result,
             (False, "Apple playback check failed: AVFoundation could not open the MP4"),
         )
+
+
+def _mp4(*kinds: bytes, brands: bytes = b"mp42mp42isomavc1") -> bytes:
+    """A synthetic MP4 with the given top-level boxes, in order."""
+    out = b""
+    for kind in kinds:
+        payload = brands if kind == b"ftyp" else b"\0" * 8
+        out += (8 + len(payload)).to_bytes(4, "big") + kind + payload
+    return out
+
+
+class Mp4LayoutTests(unittest.TestCase):
+    """The container promises every mp4-producing command makes."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def write(self, data: bytes) -> Path:
+        path = self.root / "out.mp4"
+        path.write_bytes(data)
+        return path
+
+    def test_a_faststart_mp4_is_accepted(self):
+        path = self.write(_mp4(b"ftyp", b"moov", b"free", b"mdat"))
+        ok, reason = verify_mp4_layout(path)
+        self.assertTrue(ok, reason)
+
+    def test_an_mp4_whose_index_follows_the_media_is_rejected(self):
+        # This is what dropping -movflags +faststart produces: playable, but
+        # a player streaming it must fetch the whole file before it starts.
+        path = self.write(_mp4(b"ftyp", b"free", b"mdat", b"moov"))
+        ok, reason = verify_mp4_layout(path)
+        self.assertFalse(ok)
+        self.assertIn("faststart", reason)
+
+    def test_a_missing_index_is_rejected(self):
+        ok, reason = verify_mp4_layout(self.write(_mp4(b"ftyp", b"mdat")))
+        self.assertFalse(ok)
+        self.assertIn("no moov index", reason)
+
+    def test_a_foreign_brand_is_rejected(self):
+        path = self.write(_mp4(b"ftyp", b"moov", b"mdat", brands=b"isomisom"))
+        ok, reason = verify_mp4_layout(path)
+        self.assertFalse(ok)
+        self.assertIn("mp42", reason)
+
+    def test_the_walk_does_not_read_the_media_payload(self):
+        # mdat is the entire video. The walk must seek past it by its header
+        # size, never read it, or validating a 4 GB file would load 4 GB.
+        payload = b"\0" * (4 * 1024 * 1024)
+        data = (
+            _mp4(b"ftyp", b"moov")
+            + (8 + len(payload)).to_bytes(4, "big") + b"mdat" + payload
+        )
+        path = self.write(data)
+        reads = []
+        real_open = Path.open
+
+        def counting_open(self_path, *args, **kwargs):
+            handle = real_open(self_path, *args, **kwargs)
+            real_read = handle.read
+
+            def read(size=-1):
+                reads.append(size)
+                return real_read(size)
+
+            handle.read = read
+            return handle
+
+        with patch.object(Path, "open", counting_open):
+            ok, reason = verify_mp4_layout(path)
+        self.assertTrue(ok, reason)
+        self.assertTrue(
+            all(size is not None and 0 <= size <= 64 for size in reads),
+            f"a read asked for more than a box header: {reads}",
+        )
+
+    def test_an_unreadable_output_fails_closed(self):
+        ok, reason = verify_mp4_layout(self.root / "missing.mp4")
+        self.assertFalse(ok)
+        self.assertIn("could not read", reason)
 
 
 class ApplePlaybackTests(unittest.TestCase):

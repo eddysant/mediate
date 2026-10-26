@@ -70,7 +70,8 @@ builds fail up front with an installation hint.
 > recovered to their original quality — the `.webp` files are what they are —
 > but anything still in the Trash or a graveyard is the untouched original.
 > Conversions now have their container checked for a genuine `VP8L` stream and
-> fail closed otherwise, so a lossy result keeps the original instead.
+> fail closed otherwise, so a lossy result keeps the original instead. AVIF
+> gets an equivalent (though weaker) check on its colour matrix.
 
 Legacy coverage includes QuickTime (`.mov`, `.qt`), Windows Media (`.asf`,
 `.wmv`, `.dvr-ms`, `.wtv`), DVD and camcorder formats (`.vob`, `.vro`, `.mod`,
@@ -314,10 +315,20 @@ An original is disposed of **only** after all of these pass:
 5. **(macOS videos)** AVFoundation — the playback stack behind Quick Look —
    reports the finished MP4 as playable. An FFmpeg-readable file that Apple
    rejects is discarded and the original left untouched.
-6. **Metadata survived.** A photo whose source has an EXIF capture date must
-   carry the same date in the output. This is what catches cwebp silently
-   dropping TIFF metadata.
-7. **Streams survived.** Duration matches within 1s/2%, and the full inventory
+6. **(Videos)** The MP4 is faststart — its `moov` index precedes the media,
+   so a player streaming it can start before downloading the whole file —
+   and declares the `mp42` brand. Both are requested by every mp4-producing
+   command; this confirms they reached the file.
+7. **(Photos) The output really is lossless.** A WebP must contain a `VP8L`
+   stream; an AVIF must declare an identity colour matrix in full range.
+   This is what catches an encoder that stops honouring `-lossless` — which
+   happened, silently, before v0.15.0.
+8. **Metadata survived.** A photo whose source has an EXIF capture date must
+   carry the same date in the output, and any ICC colour profile the source
+   carried must still be there. The first catches cwebp silently dropping
+   TIFF metadata; the second catches a wide-gamut photo losing its Display
+   P3 profile, which shifts every colour and breaks nothing visibly.
+9. **Streams survived.** Duration matches within 1s/2%, and the full inventory
    is checked: every audio track keeps its duration, language,
    title/commentary, dispositions, channel count and layout, sample rate,
    profile, and A/V start offset; chapters, rotation, colour, aspect ratio,

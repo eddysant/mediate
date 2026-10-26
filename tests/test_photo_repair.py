@@ -23,7 +23,12 @@ from mediate.photo import (
     _repair_photo_metadata,
 )
 from mediate.scanner import MediaJob
-from mediate.validators import verify_photo_metadata, verify_webp_is_lossless
+from mediate.validators import (
+    verify_avif_is_lossless,
+    verify_photo_color_profile,
+    verify_photo_metadata,
+    verify_webp_is_lossless,
+)
 
 
 TRUNCATED_ERROR = """libjpeg error: Premature end of JPEG file
@@ -392,6 +397,142 @@ class WebPLosslessTests(unittest.TestCase):
         ok, reason = verify_webp_is_lossless(missing)
         self.assertFalse(ok)
         self.assertIn("could not read", reason)
+
+
+def _avif(matrix: int, *, full_range: bool = True, colr: bool = True) -> bytes:
+    """A synthetic AVIF header with the given colr/nclx fields."""
+    head = b"\0" * 16 + b"ftypavif"
+    box = b""
+    if colr:
+        box = (
+            b"colrnclx"
+            + (2).to_bytes(2, "big")          # colour primaries
+            + (2).to_bytes(2, "big")          # transfer characteristics
+            + matrix.to_bytes(2, "big")
+            + bytes([0x80 if full_range else 0x00])
+        )
+    return head + box + b"\0\0\0\x08mdat" + b"\xff" * 64
+
+
+class AvifLosslessTests(unittest.TestCase):
+    """A weaker check than WebP's, so its limits are tested too."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def write(self, data: bytes) -> Path:
+        path = self.root / "out.avif"
+        path.write_bytes(data)
+        return path
+
+    def test_an_identity_matrix_in_full_range_is_accepted(self):
+        ok, reason = verify_avif_is_lossless(self.write(_avif(0)))
+        self.assertTrue(ok, reason)
+
+    def test_a_real_colour_matrix_is_rejected(self):
+        # avifenc writes 6 (BT.601) for a lossy encode and 0 for --lossless;
+        # anything but identity means the colour transform itself lost data.
+        for matrix in (1, 5, 6, 9):
+            with self.subTest(matrix=matrix):
+                ok, reason = verify_avif_is_lossless(self.write(_avif(matrix)))
+                self.assertFalse(ok)
+                self.assertIn(f"matrix coefficients {matrix}", reason)
+
+    def test_limited_range_is_rejected(self):
+        ok, reason = verify_avif_is_lossless(
+            self.write(_avif(0, full_range=False))
+        )
+        self.assertFalse(ok)
+        self.assertIn("limited range", reason)
+
+    def test_a_missing_colour_box_fails_closed(self):
+        # Being unable to confirm the promise that justifies deleting the
+        # original is not a reason to delete it.
+        ok, reason = verify_avif_is_lossless(self.write(_avif(0, colr=False)))
+        self.assertFalse(ok)
+        self.assertIn("no colr/nclx", reason)
+
+    def test_the_scan_stops_before_the_media_payload(self):
+        # A byte scan over pixel data could match "colrnclx" by chance and
+        # read a matrix out of noise, so the search must end at mdat.
+        planted = _avif(0, colr=False).replace(
+            b"\xff" * 64,
+            b"colrnclx" + (2).to_bytes(2, "big") * 2 + (0).to_bytes(2, "big") + b"\x80",
+        )
+        ok, reason = verify_avif_is_lossless(self.write(planted))
+        self.assertFalse(ok, "a colr box inside the media payload was trusted")
+        self.assertIn("no colr/nclx", reason)
+
+    def test_an_unreadable_output_fails_closed(self):
+        ok, reason = verify_avif_is_lossless(self.root / "gone.avif")
+        self.assertFalse(ok)
+        self.assertIn("could not read", reason)
+
+
+class ColorProfileTests(unittest.TestCase):
+    """A dropped ICC profile shifts colour and breaks nothing visibly."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        # ExifTool, where installed, answers for every format; these tests
+        # are about the logic, so the sniff path is exercised deliberately.
+        patcher = patch("mediate.validators.exiftool_available", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def png(self, name: str, *, icc: bool) -> Path:
+        path = self.root / name
+        body = b"\x89PNG\r\n\x1a\n" + (b"iCCP" if icc else b"gAMA") + b"\0" * 64
+        path.write_bytes(body)
+        return path
+
+    def webp(self, name: str, *, icc: bool) -> Path:
+        path = self.root / name
+        chunks = [b"VP8X"] + ([b"ICCP"] if icc else []) + [b"VP8L"]
+        path.write_bytes(_webp(*chunks))
+        return path
+
+    def test_a_preserved_profile_passes(self):
+        ok, reason = verify_photo_color_profile(
+            self.png("in.png", icc=True), self.webp("out.webp", icc=True)
+        )
+        self.assertTrue(ok, reason)
+
+    def test_a_dropped_profile_is_rejected(self):
+        ok, reason = verify_photo_color_profile(
+            self.png("in.png", icc=True), self.webp("out.webp", icc=False)
+        )
+        self.assertFalse(ok)
+        self.assertIn("ICC", reason)
+
+    def test_a_source_without_a_profile_needs_nothing_preserved(self):
+        # Most camera JPEGs are untagged sRGB; an untagged output is equally
+        # correct, so this must not fail.
+        ok, reason = verify_photo_color_profile(
+            self.png("in.png", icc=False), self.webp("out.webp", icc=False)
+        )
+        self.assertTrue(ok, reason)
+
+    def test_an_unreadable_source_format_passes_rather_than_guessing(self):
+        # Without ExifTool the sniff knows JPEG/PNG/TIFF only. A format it
+        # cannot read must not be treated as having no profile, nor block
+        # the conversion on ignorance.
+        exotic = self.root / "in.heic"
+        exotic.write_bytes(b"\0" * 64)
+        ok, reason = verify_photo_color_profile(
+            exotic, self.webp("out.webp", icc=False)
+        )
+        self.assertTrue(ok, reason)
+
+    def test_a_gained_profile_is_not_a_failure(self):
+        ok, reason = verify_photo_color_profile(
+            self.png("in.png", icc=False), self.webp("out.webp", icc=True)
+        )
+        self.assertTrue(ok, reason)
 
 
 if __name__ == "__main__":

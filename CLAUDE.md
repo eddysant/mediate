@@ -20,7 +20,7 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 | `ffmpegcmd.py` | pure inventory→argv construction: explicit stream mapping, per-track metadata, encoder/preset selection (`--encode-preset`, `--hardware`), `-c copy` remuxing for compatible containers, the rotation display-matrix finalizer |
 | `photo.py` | the still-image pipeline: cwebp/avifenc encode, HEIC→PNG decode, jpegtran/sips rescues, exiftool metadata repair |
 | `proc.py` | the shared `run(argv)` seam — argv lists, captured text, debug-logged; separate so photo and video can both use it without a cycle |
-| `validators.py` | the format-agnostic checklist: exit code, existence, size, full-decode health, Apple playback — plus the photo checks (capture date, and `verify_webp_is_lossless`, which reads the output's RIFF chunks) |
+| `validators.py` | the format-agnostic checklist: exit code, existence, size, full-decode health, `verify_mp4_layout` (faststart + mp42 brand), Apple playback — plus the photo checks: capture date, `verify_webp_is_lossless` (RIFF chunks), `verify_avif_is_lossless` (colr/nclx), `verify_photo_color_profile` (ICC) |
 | `videoverify.py` | what a converted video must still prove about its source: `verify_video_streams` dispatches lazily to named per-concern checks (audio tracks, subtitles, artwork, chapters, video format) over the duration/stream-identity normalizers |
 | `progress.py` | concurrent FFmpeg progress plus cooperative cancellation and child termination |
 | `safety.py` | source snapshots, link/readability policy, output writability and aggregate per-filesystem free-space reservations |
@@ -53,8 +53,10 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
    directory — never the final name, so a crash can't leave a half-written file
    looking finished.
 3. Validate (`validators.py`). Failure → delete temp, keep original, log stderr.
-4. Metadata verification: a WebP photo output must actually be a VP8L
-   (lossless) stream, and photos must keep their EXIF `DateTimeOriginal`.
+4. Metadata verification: a photo output must actually be lossless (WebP
+   VP8L; AVIF identity matrix in full range), must keep its EXIF
+   `DateTimeOriginal`, and must keep any ICC profile the source carried.
+   Every MP4 output must be faststart and mp42-branded.
    Videos must keep duration within 1s/2%, every audio track's duration/language/
    title/commentary/dispositions/channel layout/sample rate/profile/A-V offset,
    chapters and timings, rotation, compatible subtitle/art streams, and advanced
@@ -79,6 +81,38 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   the job and used verbatim as the final path, so claiming with the wrong
   extension both mis-names the output and stops real collisions being seen.
   `tests/test_cli_main.py` guards this for both formats.
+- **A promise in the argv is not a property of the file** — the lesson the
+  lossless bug taught, now applied to the rest of them. Three more checks
+  compare the output against what the command claimed, each cheap enough to
+  run on every file: `verify_mp4_layout` walks top-level ISOBMFF boxes **by
+  seeking** (never reading `mdat`, so a 4 GB file costs the same as a 40 KB
+  one) to require `moov` before `mdat` and an `mp42` brand, both asserted by
+  all three mp4-producing commands and previously unverified;
+  `verify_photo_color_profile` requires an ICC profile the source carried to
+  survive, since a dropped Display P3 profile shifts colour and leaves
+  nothing else to notice; and `verify_avif_is_lossless` reads the
+  `colr`/`nclx` box. Mutation-confirmed: dropping `+faststart` fails 6 of the
+  7 end-to-end tests, `-metadata none` fails the ICC test, and removing
+  `--lossless` from avifenc fails the AVIF test.
+- **The AVIF lossless check proves a *necessary* condition, not a
+  sufficient one** — and that asymmetry with WebP is deliberate. WebP says
+  `VP8L` or it does not. "Lossless AVIF" is a conjunction spread across the
+  AV1 sequence header, of which the cheaply readable part is the
+  `colr`/`nclx` box's matrix coefficients: measured on real avifenc output,
+  `--lossless` wrote identity (0) and the same source at `-q 60` wrote 6
+  (BT.601). So it catches an encoder that quietly stopped honouring
+  `--lossless` — the failure that actually happened on the WebP side — but
+  not a hypothetical identity-matrix encode with a lossy quantizer. A
+  missing `colr` box **fails closed**: being unable to confirm the promise
+  that justifies deleting the original is not a reason to delete it. The
+  byte scan stops at `mdat` so it cannot read a matrix out of pixel noise,
+  which has its own test.
+- **ICC checks pass on "cannot tell", lossless checks do not.** A photo
+  whose format neither ExifTool nor the byte sniff can read returns None
+  from `_has_icc_profile`, and the check passes: guessing "absent" would
+  fail every conversion of an unfamiliar format over a profile that was
+  never there. The lossless checks take the opposite line, because there the
+  unverifiable claim *is* the justification for disposal.
 - **`cwebp -preset` RESETS every parameter it follows — including
   `-lossless`** (`ffmpegcmd.py`). The photo command was
   `cwebp -lossless -metadata all -preset photo`, and that trailing preset
@@ -382,8 +416,9 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   **skipping** the tests rather than reporting a failure. Watch for that
   shape whenever the floor nears EOL — a green-looking matrix with a skipped
   test step. The macOS job additionally *asserts* `h264_videotoolbox` is in
-  the brewed FFmpeg: the `--hardware` tests skip themselves without it, and a
-  skipped test looks like a pass — the same failure shape one level down.
+  the brewed FFmpeg, and that `avifenc`/`avifdec` are on PATH: those tests
+  skip themselves without them, and a skipped test looks like a pass — the
+  same failure shape one level down.
   `tests/test_cli_main.py` reads the floor out of pyproject rather
   than repeating it, so the AST check cannot drift from the declared one; a `v*` tag
   additionally builds `mediate.pyz` (stdlib zipapp) and creates the GitHub

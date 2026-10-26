@@ -29,6 +29,7 @@ from mediate import cli
 from mediate.probe import video_health
 from mediate.inventory import inventory_streams, primary_video_streams, video_inventory
 from mediate.transaction import TRANSACTION_PREFIX
+from mediate.validators import verify_avif_is_lossless, verify_mp4_layout
 
 
 def _ffmpeg_has_encoder(name: str) -> bool:
@@ -239,6 +240,98 @@ class EndToEndRunTests(unittest.TestCase):
         self.assertIn(
             "psnr_avg:inf", proc.stdout,
             f"the conversion was not lossless: {proc.stdout.strip()}",
+        )
+
+    def test_every_converted_mp4_is_faststart_and_mp42_branded(self):
+        """Both are in every mp4 command; neither was ever checked."""
+        self.assertEqual(self.run_cli("--graveyard", str(self.graveyard)), 0)
+
+        produced = [
+            self.legacy.with_suffix(".mp4"),  # a full encode
+            self.ready.with_suffix(".mp4"),   # a stream-copy remux
+        ]
+        for output in produced:
+            with self.subTest(output=output.name):
+                self.assertTrue(output.exists())
+                ok, reason = verify_mp4_layout(output)
+                self.assertTrue(ok, reason)
+
+    def test_a_wide_gamut_photo_keeps_its_colour_profile(self):
+        """A dropped ICC profile shifts colour and looks like nothing."""
+        if not shutil.which("exiftool"):
+            self.skipTest("exiftool is required to embed and read an ICC profile")
+        profile = Path("/System/Library/ColorSync/Profiles/Display P3.icc")
+        if not profile.exists():
+            self.skipTest("no Display P3 profile available on this machine")
+        source = self.root / "wide-gamut.png"
+        self.ffmpeg(
+            "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=1:duration=1",
+            "-frames:v", "1", source,
+        )
+        subprocess.run(
+            ["exiftool", "-overwrite_original",
+             f"-icc_profile<={profile}", str(source)],
+            capture_output=True, text=True, check=True,
+        )
+        described = subprocess.run(
+            ["exiftool", "-s", "-s", "-s", "-ICC_Profile:ProfileDescription",
+             str(source)],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertEqual(described, "Display P3", "the fixture is not P3-tagged")
+
+        self.assertEqual(self.run_cli("--graveyard", str(self.graveyard)), 0)
+
+        output = source.with_suffix(".webp")
+        self.assertTrue(output.exists(), "the photo was not converted")
+        carried = subprocess.run(
+            ["exiftool", "-s", "-s", "-s", "-ICC_Profile:ProfileDescription",
+             str(output)],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertEqual(
+            carried, "Display P3",
+            "the output lost the source's colour profile",
+        )
+
+    def test_an_avif_conversion_is_lossless_and_keeps_its_profile(self):
+        """The AVIF path, exercised for real rather than argued about."""
+        if not (shutil.which("avifenc") and shutil.which("avifdec")):
+            self.skipTest("libavif (avifenc/avifdec) is required")
+        source = self.root / "to-avif.png"
+        self.ffmpeg(
+            "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=1:duration=1",
+            "-frames:v", "1", source,
+        )
+
+        self.assertEqual(
+            self.run_cli(
+                "--output-format", "avif", "--graveyard", str(self.graveyard)
+            ),
+            0,
+        )
+
+        output = source.with_suffix(".avif")
+        self.assertTrue(output.exists(), "the photo was not converted to AVIF")
+        ok, reason = verify_avif_is_lossless(output)
+        self.assertTrue(ok, reason)
+        # And prove it on the pixels, not just the colour box.
+        decoded = self.root / "from-avif.png"
+        subprocess.run(
+            ["avifdec", str(output), str(decoded)],
+            capture_output=True, text=True, check=True,
+        )
+        original = self.graveyard / "to-avif.png"
+        proc = subprocess.run(
+            ["ffmpeg", "-nostdin", "-v", "error", "-i", str(original),
+             "-i", str(decoded), "-lavfi", "[0:v][1:v]psnr=stats_file=-",
+             "-f", "null", "-"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(
+            "psnr_avg:inf", proc.stdout,
+            f"the AVIF conversion was not lossless: {proc.stdout.strip()}",
         )
 
     def test_an_already_standard_mp4_is_left_byte_identical(self):

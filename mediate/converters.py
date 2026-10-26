@@ -56,6 +56,8 @@ from .safety import SafetyError, SourceSnapshot, ensure_output_capacity
 from .transaction import ReplacementTransaction, TransactionError
 from .validators import (
     validate_output,
+    verify_avif_is_lossless,
+    verify_photo_color_profile,
     verify_photo_metadata,
     verify_apple_playback,
     verify_webp_is_lossless,
@@ -515,16 +517,23 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
             return valid, why
         if new_ext in (".webp", ".avif"):
             # The encode claims to be lossless; check the file, not the flag.
-            if new_ext == ".webp":
-                lossless_ok, lossless_why = verify_webp_is_lossless(tmp)
-                if not lossless_ok:
-                    return lossless_ok, lossless_why
+            check_lossless = (
+                verify_webp_is_lossless if new_ext == ".webp"
+                else verify_avif_is_lossless
+            )
+            lossless_ok, lossless_why = check_lossless(tmp)
+            if not lossless_ok:
+                return lossless_ok, lossless_why
             metadata_result = verify_photo_metadata(src, tmp)
-            if metadata_result[0]:
-                return metadata_result
-            if _repair_photo_metadata(src, tmp):
-                return verify_photo_metadata(src, tmp)
-            return metadata_result
+            if not metadata_result[0]:
+                if not _repair_photo_metadata(src, tmp):
+                    return metadata_result
+                metadata_result = verify_photo_metadata(src, tmp)
+                if not metadata_result[0]:
+                    return metadata_result
+            # An ICC profile is checked after any metadata repair, since the
+            # repair pass is what puts a dropped one back.
+            return verify_photo_color_profile(src, tmp)
         if kind in ("gif", "webp"):
             return verify_video_duration(src, tmp)
         result = verify_video_streams(

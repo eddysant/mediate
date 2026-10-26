@@ -46,6 +46,9 @@ jobs:
           # bottle drops it, fail here rather than quietly stopping covering
           # --hardware.
           ffmpeg -hide_banner -encoders 2>&1 | grep -q h264_videotoolbox
+          # Same reasoning for the AVIF path: its lossless and end-to-end
+          # tests skip themselves without libavif, and a skip reads as a pass.
+          command -v avifenc >/dev/null && command -v avifdec >/dev/null
       - name: Run unit tests
         env:
           MEDIATE_CONFIG: /nonexistent
