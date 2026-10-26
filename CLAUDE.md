@@ -1,6 +1,6 @@
 # mediate — Architecture Notes
 
-Stdlib-only Python (≥3.9) CLI by Misty Vale, built with AI assistance. Recursively
+Stdlib-only Python (≥3.10) CLI by Misty Vale, built with AI assistance. Recursively
 standardizes a media library: photos → lossless WebP (`cwebp`), videos and
 GIF/WebP animations → h264/yuv420p/AAC MP4 (`ffmpeg`). Originals are disposed
 of (Trash by
@@ -20,7 +20,8 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 | `ffmpegcmd.py` | pure inventory→argv construction: explicit stream mapping, per-track metadata, encoder/preset selection (`--encode-preset`, `--hardware`), `-c copy` remuxing for compatible containers, the rotation display-matrix finalizer |
 | `photo.py` | the still-image pipeline: cwebp/avifenc encode, HEIC→PNG decode, jpegtran/sips rescues, exiftool metadata repair |
 | `proc.py` | the shared `run(argv)` seam — argv lists, captured text, debug-logged; separate so photo and video can both use it without a cycle |
-| `validators.py` | exit/existence/size/full-decode checks plus photo metadata; `verify_video_streams` dispatches lazily to named per-concern checks (audio tracks, subtitles, artwork, chapters, video format) |
+| `validators.py` | the format-agnostic checklist: exit code, existence, size, full-decode health, Apple playback — plus the photo checks (capture date, and `verify_webp_is_lossless`, which reads the output's RIFF chunks) |
+| `videoverify.py` | what a converted video must still prove about its source: `verify_video_streams` dispatches lazily to named per-concern checks (audio tracks, subtitles, artwork, chapters, video format) over the duration/stream-identity normalizers |
 | `progress.py` | concurrent FFmpeg progress plus cooperative cancellation and child termination |
 | `safety.py` | source snapshots, link/readability policy, output writability and aggregate per-filesystem free-space reservations |
 | `journal.py` | atomic `.mediate-run.json` state and interrupted-job prioritization |
@@ -52,7 +53,8 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
    directory — never the final name, so a crash can't leave a half-written file
    looking finished.
 3. Validate (`validators.py`). Failure → delete temp, keep original, log stderr.
-4. Metadata verification: photos must keep their EXIF `DateTimeOriginal`.
+4. Metadata verification: a WebP photo output must actually be a VP8L
+   (lossless) stream, and photos must keep their EXIF `DateTimeOriginal`.
    Videos must keep duration within 1s/2%, every audio track's duration/language/
    title/commentary/dispositions/channel layout/sample rate/profile/A-V offset,
    chapters and timings, rotation, compatible subtitle/art streams, and advanced
@@ -77,6 +79,36 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   the job and used verbatim as the final path, so claiming with the wrong
   extension both mis-names the output and stops real collisions being seen.
   `tests/test_cli_main.py` guards this for both formats.
+- **`cwebp -preset` RESETS every parameter it follows — including
+  `-lossless`** (`ffmpegcmd.py`). The photo command was
+  `cwebp -lossless -metadata all -preset photo`, and that trailing preset
+  silently turned the whole encode *lossy*: measured on a PNG source, the
+  decoded output differed from the source at 31 dB PSNR (23,834 bytes
+  against 120,902 for the real lossless encode). Nothing caught it —
+  `verify_photo_metadata` only compares capture dates, so the file passed
+  validation and the original was disposed of. The tool's headline promise
+  was not being kept for any photo. The fix is to drop `-preset` entirely
+  (it only tunes *lossy* parameters, so before `-lossless` it is merely
+  inert) and, more importantly, to stop trusting the argument list:
+  `verify_webp_is_lossless` walks the output's RIFF chunks and requires
+  `VP8L`, failing closed on `VP8 ` or anything unrecognizable. Two tests
+  guard it from different directions — a command test asserting `-preset`
+  never appears, and an end-to-end test that decodes a converted PNG and
+  requires `psnr_avg:inf` against the original. Both were confirmed to fail
+  when the old argument order is reinstated. `avifenc --lossless --jobs all`
+  has no equivalent hazard and was verified lossless by decode, so the AVIF
+  path has no structural check; that asymmetry is deliberate, since proving
+  an AVIF lossless would mean parsing AV1 OBUs.
+- **Still-encoder effort was measured too, and the default stays**
+  (`ffmpegcmd.py`): on 3024x4032 lossless stills, cwebp's `fast` (`-z 3`)
+  was ~28% quicker for ~3% larger, and `max` (`-z 9`) was 4.3x slower for
+  ~1% smaller — and on grain it came out *larger*. avifenc's scale runs the
+  other way (`--speed` falls as effort rises), which is why `--photo-effort`
+  names levels (`fast`/`default`/`max`) instead of passing a number through
+  to two encoders. Also measured: `cwebp -mt` makes no difference whatsoever
+  to a lossless encode, so per-file threading is not a lever — the worker
+  pool is, which is why `_resolve_workers` leaves photo-only runs uncapped
+  while capping video.
 - **HEIC pipeline must use a PNG intermediate** (`_decode_heic` in
   `converters.py`): `sips → PNG → cwebp` on macOS, and FFmpeg's mov/mp4
   demuxer (HEIC is ISOBMFF carrying HEVC — there is no separate "heic"
@@ -349,7 +381,10 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   that image, and the job began failing *inside setup-python* and silently
   **skipping** the tests rather than reporting a failure. Watch for that
   shape whenever the floor nears EOL — a green-looking matrix with a skipped
-  test step. `tests/test_cli_main.py` reads the floor out of pyproject rather
+  test step. The macOS job additionally *asserts* `h264_videotoolbox` is in
+  the brewed FFmpeg: the `--hardware` tests skip themselves without it, and a
+  skipped test looks like a pass — the same failure shape one level down.
+  `tests/test_cli_main.py` reads the floor out of pyproject rather
   than repeating it, so the AST check cannot drift from the declared one; a `v*` tag
   additionally builds `mediate.pyz` (stdlib zipapp) and creates the GitHub
   Release with `--generate-notes`. Releasing = bump version in
@@ -373,6 +408,13 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 
 ## Testing
 
+- `tests/test_end_to_end.py` is the only test that runs `cli.main()` over real
+  media: scan → plan → convert → validate → transact → dispose → journal, in
+  one invocation, asserting on the filesystem afterwards (outputs playable,
+  every original accounted for in the graveyard, standard MP4s byte-identical,
+  no `.part.` or `.mediate-txn-` leftovers, a second run a no-op). It disposes
+  to a graveyard under its temp dir **and** redirects `HOME`, because both the
+  Trash and the probe cache are reached through `Path.home()`.
 - `python3 -m unittest discover tests` — pure-Python scanner/rename/probe tests
   plus `tests/test_cli_main.py`, which drives `cli.main()` end to end (output
   claiming per format, exit codes, rename/undo/plan phases, handler
@@ -382,7 +424,8 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   plus generated-media FFmpeg integration coverage for ASF/VOB, surround and
   multi-audio, chapters, subtitle/artwork policy, corruption, advanced-video
   blocking, rotation, failure-injected transactions, aggregate reservations,
-  and a real toolchain smoke check. Media tests auto-skip when
+  and a real toolchain smoke check, including a genuine VideoToolbox
+  encode-and-validate for `--hardware`. Media tests auto-skip when
   ffmpeg/ffprobe/libx264 are unavailable.
 - End-to-end verification is manual but scriptable: generate fixtures with
   ffmpeg lavfi (`testsrc=size=321x239` exercises the odd-dimension GIF filter;

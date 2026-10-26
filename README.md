@@ -63,6 +63,15 @@ builds fail up front with an installation hint.
 | MOV / MKV / AVI / WMV / WebM / ASF / VOB / legacy video | MP4 (h264 `-crf 18 -preset medium`, AAC 256k, `yuv420p`) | `ffmpeg` |
 | Animated GIF / animated WebP | MP4 (`faststart`, even-dimension scale filter) | `ffmpeg` |
 
+> **Photo conversions before v0.15.0 were not actually lossless.** A stray
+> `-preset photo` after `cwebp`'s `-lossless` flag reset the parameter set and
+> produced an ordinary lossy VP8 file. Validation did not notice, so those
+> originals were disposed of. Outputs from earlier versions cannot be
+> recovered to their original quality — the `.webp` files are what they are —
+> but anything still in the Trash or a graveyard is the untouched original.
+> Conversions now have their container checked for a genuine `VP8L` stream and
+> fail closed otherwise, so a lossy result keeps the original instead.
+
 Legacy coverage includes QuickTime (`.mov`, `.qt`), Windows Media (`.asf`,
 `.wmv`, `.dvr-ms`, `.wtv`), DVD and camcorder formats (`.vob`, `.vro`, `.mod`,
 `.tod`, `.dv`), RealMedia, Ogg video, MPEG transport and elementary streams,
@@ -126,10 +135,31 @@ SSIM against the original rather than eyeballing:
   1.2 GB. That is why it is opt-in and not the default. Outputs go through
   the same strict validation either way.
 
-Two things that are *not* worth tuning: `--workers` barely affects video (x264
-already saturates every core — 8 workers measured 133s against 1 worker's 150s
-for the same eight files), and the post-encode validation decode costs about
-5% of an encode.
+Two things that are *not* worth tuning for video: `--workers` barely affects it
+(x264 already saturates every core — 8 workers measured 133s against 1 worker's
+150s for the same eight files), and the post-encode validation decode costs
+about 5% of an encode.
+
+Photos are a different shape. They are always encoded losslessly, so effort
+trades time against file size and never against quality. Measured on
+3024x4032 stills:
+
+| level | cwebp | avifenc |
+|---|---|---|
+| `fast` | 3.4s, 4.09 MB | 0.6s, 5.99 MB |
+| `default` | 4.7s, 3.97 MB | 2.0s, 5.24 MB |
+| `max` | 20.4s, 3.93 MB | 60.8s, 4.71 MB |
+
+- `--photo-effort LEVEL` — `fast`, `default` or `max`. The levels are named
+  rather than numbered because the two encoders' own scales run in opposite
+  directions. For WebP the default is the sweet spot: `max` costs 4x the time
+  for 1% (and on grainy images it came out *larger*). For AVIF the range is
+  much wider, so `max` is a real option if size matters more than time.
+
+Unlike video, `--workers` *does* matter for photos: `cwebp -mt` made no
+measurable difference to a lossless encode, so the worker pool is the only
+parallelism there is — which is why mediate leaves it uncapped for photo-only
+runs and caps it at 8 when video is involved.
 
 ### Accept a loss (explicit opt-ins)
 

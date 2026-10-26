@@ -40,6 +40,12 @@ jobs:
           HOMEBREW_NO_ENV_HINTS: 1
         run: |
           brew install ffmpeg webp libavif
+          # The hardware-encode tests skip themselves when the encoder is
+          # missing, and a skipped test looks like a pass. macOS runners are
+          # real Apple hardware, so VideoToolbox must be there; if a future
+          # bottle drops it, fail here rather than quietly stopping covering
+          # --hardware.
+          ffmpeg -hide_banner -encoders 2>&1 | grep -q h264_videotoolbox
       - name: Run unit tests
         env:
           MEDIATE_CONFIG: /nonexistent

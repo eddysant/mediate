@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Optional
 
 from .exiftool import exiftool_available, run_exiftool
-from .ffmpegcmd import _build_command
+from .ffmpegcmd import DEFAULT_PHOTO_EFFORT, _build_command
 from .proc import run as _run
 
 log = logging.getLogger("mediate")
@@ -52,9 +52,17 @@ def _jpegtran_path() -> Optional[str]:
     return None
 
 
-def _convert_photo(src: Path, tmp: Path, output_format: str = "webp") -> subprocess.CompletedProcess:
+def _convert_photo(
+    src: Path,
+    tmp: Path,
+    output_format: str = "webp",
+    photo_effort: str = DEFAULT_PHOTO_EFFORT,
+) -> subprocess.CompletedProcess:
     """Convert a still, losslessly normalising a damaged JPEG if needed."""
-    direct = _run(_build_command("photo", src, tmp, output_format=output_format))
+    direct = _run(_build_command(
+        "photo", src, tmp, output_format=output_format,
+        photo_effort=photo_effort,
+    ))
     # avifenc error messages differ from cwebp; only trigger repair for cwebp failures
     if output_format == "avif":
         return direct
@@ -88,7 +96,10 @@ def _convert_photo(src: Path, tmp: Path, output_format: str = "webp") -> subproc
             if sips.returncode != 0:
                 direct.stderr += f"\nsips GIF decode fallback failed: {sips.stderr}"
                 return direct
-            retry = _run(_build_command("photo", png, tmp, output_format=output_format))
+            retry = _run(_build_command(
+                "photo", png, tmp, output_format=output_format,
+                photo_effort=photo_effort,
+            ))
             if retry.returncode == 0:
                 log.warning("       %s: decoded GIF with sips before WebP conversion", src.name)
             else:
@@ -126,7 +137,10 @@ def _convert_photo(src: Path, tmp: Path, output_format: str = "webp") -> subproc
                 direct.stderr + f"\nLossless jpegtran repair failed: {detail}",
             )
         tmp.unlink(missing_ok=True)
-        retry = _run(_build_command("photo", repaired, tmp, output_format=output_format))
+        retry = _run(_build_command(
+            "photo", repaired, tmp, output_format=output_format,
+            photo_effort=photo_effort,
+        ))
         if retry.returncode == 0:
             log.warning(
                 "       %s: repaired truncated JPEG losslessly with jpegtran before conversion",

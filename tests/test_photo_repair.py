@@ -23,7 +23,7 @@ from mediate.photo import (
     _repair_photo_metadata,
 )
 from mediate.scanner import MediaJob
-from mediate.validators import verify_photo_metadata
+from mediate.validators import verify_photo_metadata, verify_webp_is_lossless
 
 
 TRUNCATED_ERROR = """libjpeg error: Premature end of JPEG file
@@ -188,6 +188,10 @@ class OutputCollisionTests(unittest.TestCase):
             "mediate.converters._convert", side_effect=convert
         ), patch(
             "mediate.converters.verify_photo_metadata", return_value=(True, "ok")
+        ), patch(
+            # b"new-output" is not a WebP; this test is about the name it
+            # lands under, not about the encode.
+            "mediate.converters.verify_webp_is_lossless", return_value=(True, "ok")
         ):
             result = process_job(
                 MediaJob(source, "photo"), Options(keep_originals=True)
@@ -334,6 +338,60 @@ class HeicDecodeTests(unittest.TestCase):
         other = self.root / "a.bin"
         other.write_bytes(b"not a png at all, really quite definitely not")
         self.assertIsNone(_png_dimensions(other))
+
+
+def _webp(*chunks: bytes) -> bytes:
+    """A minimal WebP container holding the given chunks."""
+    body = b"WEBP"
+    for chunk_id in chunks:
+        payload = b"\0" * 8
+        body += chunk_id + len(payload).to_bytes(4, "little") + payload
+    return b"RIFF" + len(body).to_bytes(4, "little") + body
+
+
+class WebPLosslessTests(unittest.TestCase):
+    """The check that stands between a lossy encode and a deleted original."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def write(self, data: bytes) -> Path:
+        path = self.root / "out.webp"
+        path.write_bytes(data)
+        return path
+
+    def test_a_vp8l_still_is_accepted(self):
+        ok, reason = verify_webp_is_lossless(self.write(_webp(b"VP8L")))
+        self.assertTrue(ok, reason)
+
+    def test_a_lossy_vp8_still_is_rejected_by_name(self):
+        ok, reason = verify_webp_is_lossless(self.write(_webp(b"VP8 ")))
+        self.assertFalse(ok)
+        self.assertIn("lossy VP8", reason)
+
+    def test_an_extended_container_is_walked_to_find_the_image_chunk(self):
+        # -metadata all produces VP8X plus sibling EXIF/ICCP chunks, so the
+        # image chunk is not the first one. Stopping at VP8X would accept a
+        # lossy file in exactly the case the real encoder produces.
+        path = self.write(_webp(b"VP8X", b"ICCP", b"EXIF", b"VP8L"))
+        self.assertTrue(verify_webp_is_lossless(path)[0])
+        lossy = self.write(_webp(b"VP8X", b"ICCP", b"EXIF", b"VP8 "))
+        self.assertFalse(verify_webp_is_lossless(lossy)[0])
+
+    def test_something_that_is_not_a_webp_fails_closed(self):
+        for data in (b"", b"not a webp at all", _webp()):
+            with self.subTest(data=data[:12]):
+                ok, reason = verify_webp_is_lossless(self.write(data))
+                self.assertFalse(ok)
+                self.assertIn("not a recognizable WebP", reason)
+
+    def test_an_unreadable_output_fails_closed(self):
+        missing = self.root / "gone.webp"
+        ok, reason = verify_webp_is_lossless(missing)
+        self.assertFalse(ok)
+        self.assertIn("could not read", reason)
 
 
 if __name__ == "__main__":

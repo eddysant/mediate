@@ -13,6 +13,8 @@ from mediate.ffmpegcmd import (
     _build_command,
     _build_remux_command,
     _build_rotation_command,
+    DEFAULT_PHOTO_EFFORT,
+    PHOTO_EFFORTS,
     _hardware_metadata_args,
 )
 from mediate.inventory import (
@@ -24,12 +26,8 @@ from mediate.inventory import (
     stream_removal_risks,
 )
 from mediate.scanner import MediaJob
-from mediate.validators import (
-    validate_output,
-    verify_apple_playback,
-    verify_video_duration,
-    verify_video_streams,
-)
+from mediate.validators import validate_output, verify_apple_playback
+from mediate.videoverify import verify_video_duration, verify_video_streams
 
 
 def _stream(
@@ -517,6 +515,60 @@ class StreamCommandTests(unittest.TestCase):
         self.assertIn("-c copy", joined)
 
 
+class PhotoCommandTests(unittest.TestCase):
+    """cwebp/avifenc argument construction, where ordering is load-bearing."""
+
+    def photo_command(self, **kwargs) -> list:
+        return _build_command("photo", Path("in.png"), Path("out.x"), **kwargs)
+
+    def test_the_cwebp_command_never_carries_a_preset(self):
+        # This is the regression guard for a silent data-loss bug: cwebp's
+        # -preset resets every parameter it follows, so `-lossless ...
+        # -preset photo` wrote a lossy VP8 file, and the original was then
+        # disposed of. The flag has no lossless use, so it must not appear
+        # at all rather than merely appear earlier.
+        for effort in PHOTO_EFFORTS:
+            with self.subTest(effort=effort):
+                command = self.photo_command(photo_effort=effort)
+                self.assertNotIn("-preset", command)
+                self.assertIn("-lossless", command)
+
+    def test_the_avifenc_command_asks_for_lossless(self):
+        for effort in PHOTO_EFFORTS:
+            with self.subTest(effort=effort):
+                command = self.photo_command(
+                    output_format="avif", photo_effort=effort
+                )
+                self.assertEqual(command[0], "avifenc")
+                self.assertIn("--lossless", command)
+
+    def test_the_default_effort_adds_no_encoder_arguments(self):
+        # The shipped default must be each encoder's own default, so that
+        # "default" cannot drift away from what was measured.
+        for output_format, flag in (("webp", "-z"), ("avif", "--speed")):
+            with self.subTest(output_format=output_format):
+                command = self.photo_command(
+                    output_format=output_format, photo_effort=DEFAULT_PHOTO_EFFORT
+                )
+                self.assertNotIn(flag, command)
+
+    def test_the_effort_levels_move_each_encoder_its_own_way(self):
+        # cwebp's -z rises with effort and avifenc's --speed falls with it,
+        # so one shared level name must not map to one shared number.
+        webp = {
+            effort: self.photo_command(photo_effort=effort)
+            for effort in ("fast", "max")
+        }
+        self.assertEqual(webp["fast"][webp["fast"].index("-z") + 1], "3")
+        self.assertEqual(webp["max"][webp["max"].index("-z") + 1], "9")
+        avif = {
+            effort: self.photo_command(output_format="avif", photo_effort=effort)
+            for effort in ("fast", "max")
+        }
+        self.assertEqual(avif["fast"][avif["fast"].index("--speed") + 1], "10")
+        self.assertEqual(avif["max"][avif["max"].index("--speed") + 1], "0")
+
+
 class StreamValidationTests(unittest.TestCase):
     def setUp(self):
         self.video = _stream(
@@ -543,8 +595,8 @@ class StreamValidationTests(unittest.TestCase):
         self.chapter = {"start_time": "0.000", "end_time": "2.000", "title": "Opening"}
 
     def _verify(self, source, output, **kwargs):
-        with patch("mediate.validators.verify_video_duration", return_value=(True, "ok")), patch(
-            "mediate.validators.video_inventory", return_value=output
+        with patch("mediate.videoverify.verify_video_duration", return_value=(True, "ok")), patch(
+            "mediate.videoverify.video_inventory", return_value=output
         ):
             return verify_video_streams(
                 Path("source.mkv"), Path("output.mp4"), source, **kwargs
@@ -674,7 +726,7 @@ class StreamValidationTests(unittest.TestCase):
         source = _inventory(source_video, source_audio)
         output = _inventory(output_video, output_audio)
         with patch(
-            "mediate.validators.decoded_stream_starts",
+            "mediate.videoverify.decoded_stream_starts",
             side_effect=[{"0": 0.0, "1": 0.085}, {"0": 0.0, "1": 0.063}],
         ):
             self.assertEqual(self._verify(source, output), (True, "ok"))
@@ -801,14 +853,14 @@ class StreamValidationTests(unittest.TestCase):
         source = _inventory(self.video, self.japanese)
         output = _inventory(self.video, self.japanese)
         with patch(
-            "mediate.validators.verify_video_duration",
+            "mediate.videoverify.verify_video_duration",
             return_value=(False, "duration mismatch: source 34.7s vs output 21.5s"),
         ), patch(
-            "mediate.validators.video_inventory", return_value=output
+            "mediate.videoverify.video_inventory", return_value=output
         ), patch(
-            "mediate.validators.packet_stream_durations",
+            "mediate.videoverify.packet_stream_durations",
             side_effect=[{"0": 21.46, "1": 21.48}, {"0": 21.47, "1": 21.49}],
-        ), patch("mediate.validators.media_duration", return_value=34.688):
+        ), patch("mediate.videoverify.media_duration", return_value=34.688):
             ok, reason = verify_video_streams(
                 Path("source.webm"), Path("output.mp4"), source,
                 allow_truncated_source=True,
@@ -821,11 +873,11 @@ class StreamValidationTests(unittest.TestCase):
         output = _inventory(self.video, self.japanese)
         mismatch = "duration mismatch: source 34.7s vs output 15.0s"
         with patch(
-            "mediate.validators.verify_video_duration", return_value=(False, mismatch)
+            "mediate.videoverify.verify_video_duration", return_value=(False, mismatch)
         ), patch(
-            "mediate.validators.video_inventory", return_value=output
+            "mediate.videoverify.video_inventory", return_value=output
         ), patch(
-            "mediate.validators.packet_stream_durations",
+            "mediate.videoverify.packet_stream_durations",
             side_effect=[{"0": 21.46, "1": 21.48}, {"0": 15.0, "1": 15.0}],
         ):
             self.assertEqual(
@@ -853,8 +905,8 @@ class StreamValidationTests(unittest.TestCase):
             self.japanese,
         )
         output = _inventory(self.video, self.japanese)
-        with patch("mediate.validators.verify_video_duration", return_value=(True, "ok")), patch(
-            "mediate.validators.video_inventory", return_value=output
+        with patch("mediate.videoverify.verify_video_duration", return_value=(True, "ok")), patch(
+            "mediate.videoverify.video_inventory", return_value=output
         ):
             result = verify_video_streams(
                 Path("source.mkv"),
@@ -871,9 +923,9 @@ class DurationFallbackTests(unittest.TestCase):
     def _verify(self, declared_src, out_dur, decoded):
         src, out = Path("/src.vob"), Path("/out.mp4")
         with patch(
-            "mediate.validators.media_duration",
+            "mediate.videoverify.media_duration",
             side_effect=lambda p: declared_src if p == src else out_dur,
-        ), patch("mediate.validators.decoded_duration", return_value=decoded):
+        ), patch("mediate.videoverify.decoded_duration", return_value=decoded):
             return verify_video_duration(src, out)
 
     def test_understated_source_is_rescued_by_decoding(self):
@@ -898,7 +950,7 @@ class DurationFallbackTests(unittest.TestCase):
     def test_the_rescue_uses_the_track_tolerance_not_the_file_one(self):
         # The per-track check allows 0.25s; the rescue used to allow 1.0s, so
         # a track failing by 0.5s was rejected and then quietly readmitted.
-        from mediate.validators import (
+        from mediate.videoverify import (
             FILE_DURATION_FLOOR, TRACK_DURATION_FLOOR, _durations_agree,
         )
 
@@ -913,13 +965,13 @@ class DurationFallbackTests(unittest.TestCase):
         self.assertTrue(_durations_agree(600.0, 610.0, floor=TRACK_DURATION_FLOOR))
 
     def test_durations_within_tolerance_never_decode(self):
-        with patch("mediate.validators.decoded_duration") as decode:
+        with patch("mediate.videoverify.decoded_duration") as decode:
             ok, _ = self._verify(10.0, 10.4, None)
         self.assertTrue(ok)
         decode.assert_not_called()
 
     def test_a_truncated_output_never_pays_for_a_decode(self):
-        with patch("mediate.validators.decoded_duration") as decode:
+        with patch("mediate.videoverify.decoded_duration") as decode:
             ok, _ = self._verify(10.0, 4.0, None)
         self.assertFalse(ok)
         decode.assert_not_called()

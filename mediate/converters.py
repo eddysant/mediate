@@ -45,6 +45,7 @@ from .inventory import (
 )
 from .ffmpegcmd import (
     DEFAULT_ENCODE_PRESET,
+    DEFAULT_PHOTO_EFFORT,
     _build_command,
     _build_remux_command,
     _build_rotation_command,
@@ -63,9 +64,9 @@ from .validators import (
     validate_output,
     verify_photo_metadata,
     verify_apple_playback,
-    verify_video_duration,
-    verify_video_streams,
+    verify_webp_is_lossless,
 )
+from .videoverify import verify_video_duration, verify_video_streams
 
 log = logging.getLogger("mediate")
 
@@ -91,6 +92,7 @@ class Options:
     output_format: str = "webp"  # "webp" | "avif"
     encode_preset: str = DEFAULT_ENCODE_PRESET
     hardware: bool = False
+    photo_effort: str = DEFAULT_PHOTO_EFFORT
     dispose: Optional[Disposer] = None
     dispose_label: str = "delete original"
     transaction_root: Optional[Path] = None
@@ -172,6 +174,7 @@ def _convert(
     output_format: str = "webp",
     encode_preset: str = DEFAULT_ENCODE_PRESET,
     hardware: bool = False,
+    photo_effort: str = DEFAULT_PHOTO_EFFORT,
 ) -> subprocess.CompletedProcess:
     """Run the conversion subprocess(es) for a job. HEIC goes through a
     two-step pipeline: sips (built into macOS, decodes HEVC-compressed
@@ -214,7 +217,9 @@ def _convert(
         finally:
             encode_output.unlink(missing_ok=True)
     if kind == "photo":
-        return _convert_photo(src, tmp, output_format=output_format)
+        return _convert_photo(
+            src, tmp, output_format=output_format, photo_effort=photo_effort,
+        )
     if kind != "heic":
         return _run(_build_command(
             kind, src, tmp, encode_preset=encode_preset, hardware=hardware,
@@ -225,7 +230,10 @@ def _convert(
         decoded = _decode_heic(src, png)
         if decoded.returncode != 0:
             return decoded
-        return _run(_build_command("photo", png, tmp, output_format=output_format))
+        return _run(_build_command(
+            "photo", png, tmp, output_format=output_format,
+            photo_effort=photo_effort,
+        ))
     finally:
         png.unlink(missing_ok=True)
 
@@ -483,6 +491,7 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
             "repair": stage == "repair-encode",
             "encode_preset": opts.encode_preset,
             "hardware": opts.hardware,
+            "photo_effort": opts.photo_effort,
         }
         if stage == "convert" and copy_video:
             convert_options["copy_video"] = True
@@ -511,6 +520,11 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
         if not valid:
             return valid, why
         if new_ext in (".webp", ".avif"):
+            # The encode claims to be lossless; check the file, not the flag.
+            if new_ext == ".webp":
+                lossless_ok, lossless_why = verify_webp_is_lossless(tmp)
+                if not lossless_ok:
+                    return lossless_ok, lossless_why
             metadata_result = verify_photo_metadata(src, tmp)
             if metadata_result[0]:
                 return metadata_result

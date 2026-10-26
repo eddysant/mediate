@@ -68,6 +68,10 @@ class FilesystemSafetyTests(unittest.TestCase):
         ), patch(
             "mediate.converters.verify_photo_metadata", return_value=(True, "ok")
         ), patch(
+            # The fake output is not a real WebP, so the losslessness check
+            # would reject it before the concern this test is about.
+            "mediate.converters.verify_webp_is_lossless", return_value=(True, "ok")
+        ), patch(
             "mediate.converters.SourceSnapshot.unchanged", return_value=False
         ):
             outcome = process_job(MediaJob(source, "photo"), Options(keep_originals=True))

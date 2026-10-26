@@ -45,6 +45,29 @@ DEFAULT_ENCODE_PRESET = "medium"
 HARDWARE_VIDEO_ENCODER = "h264_videotoolbox"
 HARDWARE_QUALITY = "75"
 
+# How hard a still encoder should work, named by intent rather than by
+# number because the two encoders' own scales run in opposite directions:
+# cwebp's -z rises with effort, avifenc's --speed falls with it. One
+# user-facing name mapped onto a raw number would invert between formats.
+#
+# Measured on 3024x4032 stills (M2, lossless):
+#
+#   cwebp      default (= -z 6)   3.97 MB  4.7s      detailed image
+#              fast    (= -z 3)   4.09 MB  3.4s   -28% time, +3% size
+#              max     (= -z 9)   3.93 MB 20.4s   +4.3x time, -1% size
+#   avifenc    default (= sp 6)   5.24 MB  2.0s
+#              fast    (= sp 10)  5.99 MB  0.6s   -70% time, +14% size
+#              max     (= sp 0)   4.71 MB 60.8s  +30x time, -10% size
+#
+# So the shipped default stays put: `max` is never worth its time for WebP,
+# and `fast` trades size for it. cwebp's -mt is deliberately absent — it
+# made no measurable difference to a lossless encode at any size, which is
+# also why the worker pool is left uncapped for photo-only runs.
+PHOTO_EFFORTS = ("fast", "default", "max")
+DEFAULT_PHOTO_EFFORT = "default"
+_CWEBP_EFFORT = {"fast": ["-z", "3"], "max": ["-z", "9"]}
+_AVIFENC_EFFORT = {"fast": ["--speed", "10"], "max": ["--speed", "0"]}
+
 # ffprobe's chroma_location names, in the H.264 figure E-1 order that the
 # h264_metadata bitstream filter's chroma_sample_loc_type uses.
 CHROMA_SAMPLE_LOC_TYPES = {
@@ -218,15 +241,28 @@ def _build_command(
     output_format: str = "webp",
     encode_preset: str = DEFAULT_ENCODE_PRESET,
     hardware: bool = False,
+    photo_effort: str = DEFAULT_PHOTO_EFFORT,
 ) -> List[str]:
     if kind == "photo":
         if output_format == "avif":
             return [
                 "avifenc", "--lossless", "--jobs", "all",
+                *_AVIFENC_EFFORT.get(photo_effort, []),
                 str(input_path), str(output_path),
             ]
+        # No -preset here, and never one after -lossless: cwebp's -preset
+        # resets the whole parameter set, including the lossless flag, so
+        # `-lossless ... -preset photo` silently produced a *lossy* file
+        # whose originals were then disposed of. Measured on a PNG source:
+        # with the preset the decode differed from the source at 31 dB PSNR;
+        # without it the decode is pixel-identical. `-preset photo` placed
+        # *before* -lossless is merely inert — it only tunes lossy
+        # parameters — so dropping it is the honest fix, and
+        # `verify_webp_is_lossless` now checks the claim rather than
+        # trusting the argument list.
         return [
-            "cwebp", "-lossless", "-metadata", "all", "-preset", "photo",
+            "cwebp", "-lossless", "-metadata", "all",
+            *_CWEBP_EFFORT.get(photo_effort, []),
             str(input_path), "-o", str(output_path),
         ]
     if kind == "video":

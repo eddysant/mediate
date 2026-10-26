@@ -340,6 +340,28 @@ class ExtractedSeamTests(MainTestCase):
         with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
             cli.parse_args([str(self.root), "--encode-preset", "sloww"])
 
+    def test_the_photo_effort_flag_reaches_options(self):
+        from mediate.ffmpegcmd import DEFAULT_PHOTO_EFFORT
+
+        opts, _label = cli.build_options(self.root, cli.parse_args([str(self.root)]))
+        self.assertEqual(opts.photo_effort, DEFAULT_PHOTO_EFFORT)
+
+        opts, _label = cli.build_options(
+            self.root, cli.parse_args([str(self.root), "--photo-effort", "fast"])
+        )
+        self.assertEqual(opts.photo_effort, "fast")
+
+    def test_an_unknown_photo_effort_is_rejected_at_parse_time(self):
+        with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
+            cli.parse_args([str(self.root), "--photo-effort", "fastest"])
+
+    def test_photo_effort_is_compatible_with_the_video_speed_flags(self):
+        # Stills and video are encoded by different tools, so unlike
+        # --hardware and --encode-preset these two do not conflict.
+        args = cli.parse_args([str(self.root), "--hardware", "--photo-effort", "max"])
+        self.assertTrue(args.hardware)
+        self.assertEqual(args.photo_effort, "max")
+
     def test_hardware_and_an_explicit_preset_conflict(self):
         # --hardware ignores the libx264 preset entirely; accepting both
         # would silently drop whichever the user meant.

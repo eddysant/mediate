@@ -14,7 +14,12 @@ from typing import Optional
 
 from . import __version__
 from .capabilities import check_media_capabilities
-from .ffmpegcmd import DEFAULT_ENCODE_PRESET, X264_PRESETS
+from .ffmpegcmd import (
+    DEFAULT_ENCODE_PRESET,
+    DEFAULT_PHOTO_EFFORT,
+    PHOTO_EFFORTS,
+    X264_PRESETS,
+)
 from .converters import (
     CONVERTED,
     FAILED,
@@ -246,6 +251,17 @@ def parse_args(argv=None) -> argparse.Namespace:
         "macOS): several times faster, but measurably lower quality for the "
         "same file size than libx264, so it is never the default. Outputs go "
         "through the same strict validation either way",
+    )
+    speed.add_argument(
+        "--photo-effort",
+        choices=PHOTO_EFFORTS,
+        default=DEFAULT_PHOTO_EFFORT,
+        metavar="LEVEL",
+        help="how hard the still encoder works (default: "
+        f"{DEFAULT_PHOTO_EFFORT}). Photos are always lossless, so this trades "
+        "time against file size only, never quality: `fast` measured about "
+        "30%% quicker for 3%% larger WebP, `max` about 4x slower for 1%% "
+        "smaller. One of: " + ", ".join(PHOTO_EFFORTS),
     )
 
     overrides = parser.add_argument_group(
@@ -511,6 +527,7 @@ def build_options(root: Path, args: argparse.Namespace):
         output_format=args.output_format,
         encode_preset=args.encode_preset,
         hardware=args.hardware,
+        photo_effort=args.photo_effort,
         dispose=dispose,
         dispose_label=dispose_label,
         transaction_root=root,

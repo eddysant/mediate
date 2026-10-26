@@ -22,6 +22,7 @@ from mediate.converters import (
     process_job,
 )
 from mediate.disposal import DisposalPolicy, HARD
+from mediate.ffmpegcmd import HARDWARE_VIDEO_ENCODER
 from mediate.probe import (
     check_video_integrity,
     video_health,
@@ -83,12 +84,19 @@ class FFmpegIntegrationTests(unittest.TestCase):
         if missing:
             self.skipTest(f"FFmpeg encoder(s) unavailable: {', '.join(missing)}")
 
-    def convert(self, path: Path, *, allow_stream_removal: bool = False):
+    def convert(
+        self,
+        path: Path,
+        *,
+        allow_stream_removal: bool = False,
+        hardware: bool = False,
+    ):
         return process_job(
             MediaJob(path, "video"),
             Options(
                 keep_originals=True,
                 allow_stream_removal=allow_stream_removal,
+                hardware=hardware,
             ),
         )
 
@@ -513,6 +521,56 @@ class FFmpegIntegrationTests(unittest.TestCase):
         self.assertTrue(source.exists())
         self.assertTrue(repaired.exists())
         self.assertTrue(video_health(repaired)["ok"])
+
+    def test_hardware_encode_preserves_chroma_siting_end_to_end(self):
+        # h264_videotoolbox silently ignores -chroma_sample_location, so
+        # without the h264_metadata bitstream filter the strict validator
+        # rejects every source that declares a siting. That rejection was
+        # only ever reproduced by hand on an Apple machine; this is the
+        # test that reproduces it in CI. macOS runners are real Apple
+        # hardware, so VideoToolbox is genuinely exercised there.
+        self.require_encoders(HARDWARE_VIDEO_ENCODER, "ffv1", "aac")
+        source = self.root / "sited.mkv"
+        self.ffmpeg(
+            "-f", "lavfi", "-i", "testsrc2=size=96x64:rate=12:duration=1",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+            "-c:v", "ffv1", "-pix_fmt", "yuv420p",
+            "-chroma_sample_location", "topleft", "-c:a", "aac", source,
+        )
+        self.assertEqual(
+            primary_video_streams(video_inventory(source))[0]["color"]["chroma_location"],
+            "topleft",
+            "fixture does not declare the siting the test is about",
+        )
+
+        outcome = self.convert(source, hardware=True)
+        output = source.with_suffix(".mp4")
+        self.assertEqual(outcome.status, CONVERTED, outcome.detail)
+        self.assertTrue(output.exists())
+        video = primary_video_streams(video_inventory(output))[0]
+        self.assertEqual(video["codec_name"], "h264")
+        self.assertEqual(video["color"]["chroma_location"], "topleft")
+
+    def test_hardware_encode_works_on_a_source_declaring_no_siting(self):
+        # The bitstream filter is applied only when there is a siting to
+        # carry. A source without one must still encode and validate, which
+        # is what proves the filter is conditional rather than always-on.
+        self.require_encoders(HARDWARE_VIDEO_ENCODER, "ffv1")
+        source = self.root / "unsited.nut"
+        self.ffmpeg(
+            "-f", "lavfi", "-i", "testsrc2=size=96x64:rate=12:duration=1",
+            "-c:v", "ffv1", "-pix_fmt", "yuv420p", source,
+        )
+        self.assertIsNone(
+            primary_video_streams(video_inventory(source))[0]["color"].get(
+                "chroma_location"
+            ),
+            "fixture declares a siting, so it cannot test the absent case",
+        )
+
+        outcome = self.convert(source, hardware=True)
+        self.assertEqual(outcome.status, CONVERTED, outcome.detail)
+        self.assertTrue(source.with_suffix(".mp4").exists())
 
     def test_high_bit_depth_source_is_blocked_before_destructive_encode(self):
         self.require_encoders("ffv1")
