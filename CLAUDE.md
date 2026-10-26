@@ -416,9 +416,13 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   **skipping** the tests rather than reporting a failure. Watch for that
   shape whenever the floor nears EOL — a green-looking matrix with a skipped
   test step. The macOS job additionally *asserts* `h264_videotoolbox` is in
-  the brewed FFmpeg, and that `avifenc`/`avifdec` are on PATH: those tests
-  skip themselves without them, and a skipped test looks like a pass — the
-  same failure shape one level down.
+  the brewed FFmpeg, and that `avifenc`/`avifdec` and `exiftool` are on
+  PATH: those tests skip themselves without them, and a skipped test looks
+  like a pass — the same failure shape one level down. **ExifTool is
+  installed on both runners for exactly this reason**: it is optional at
+  runtime, but without it the capture-date and colour-profile checks fall
+  back to a byte sniff and the end-to-end ICC test skips, so the check
+  shipped with no real-media coverage on any job until it was added.
   `tests/test_cli_main.py` reads the floor out of pyproject rather
   than repeating it, so the AST check cannot drift from the declared one; a `v*` tag
   additionally builds `mediate.pyz` (stdlib zipapp) and creates the GitHub

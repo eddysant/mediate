@@ -32,14 +32,20 @@ jobs:
             sudo apt-get update
             sudo apt-get install -y ffmpeg webp
           fi
+          # ExifTool is optional at runtime, but the colour-profile and
+          # capture-date tests fall back to a byte sniff without it and the
+          # end-to-end ICC test skips entirely — so the check would ship with
+          # no real-media coverage anywhere.
+          sudo apt-get install -y libimage-exiftool-perl
           ffmpeg -hide_banner -encoders 2>&1 | grep -q libx264
+          command -v exiftool >/dev/null
       - name: Install media tools (macOS)
         if: runner.os == 'macOS'
         env:
           HOMEBREW_NO_REQUIRE_TAP_TRUST: 1
           HOMEBREW_NO_ENV_HINTS: 1
         run: |
-          brew install ffmpeg webp libavif
+          brew install ffmpeg webp libavif exiftool
           # The hardware-encode tests skip themselves when the encoder is
           # missing, and a skipped test looks like a pass. macOS runners are
           # real Apple hardware, so VideoToolbox must be there; if a future
@@ -49,6 +55,7 @@ jobs:
           # Same reasoning for the AVIF path: its lossless and end-to-end
           # tests skip themselves without libavif, and a skip reads as a pass.
           command -v avifenc >/dev/null && command -v avifdec >/dev/null
+          command -v exiftool >/dev/null
       - name: Run unit tests
         env:
           MEDIATE_CONFIG: /nonexistent
