@@ -31,13 +31,7 @@ from .probe import (
     webp_animation_info,
 )
 from .inventory import (
-    COLOR_FIELDS,
     advanced_video_features,
-    audio_stream_label,
-    inventory_streams,
-    is_commentary_stream,
-    preservable_artwork_streams,
-    preservable_subtitle_streams,
     preservation_summary,
     primary_video_streams,
     stream_removal_risks,
