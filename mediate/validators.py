@@ -16,7 +16,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -96,12 +95,10 @@ _apple_check_lock = threading.Lock()
 def verify_apple_playback(path: Path) -> Tuple[bool, str]:
     """Require macOS AVFoundation—the stack behind Quick Look—to open output.
 
-    FFmpeg accepting its own MP4 is necessary but not sufficient. On macOS,
-    Homebrew already depends on Apple's command-line tools, so use Swift to
-    ask AVFoundation whether the finished asset is actually playable.
+    FFmpeg accepting its own MP4 is necessary but not sufficient. Homebrew
+    already depends on Apple's command-line tools, so use Swift to ask
+    AVFoundation whether the finished asset is actually playable.
     """
-    if sys.platform != "darwin":
-        return True, "not running on macOS"
     swift = shutil.which("swift")
     if not swift:
         return _verify_quicklook_playback(path)

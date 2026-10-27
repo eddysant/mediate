@@ -19,7 +19,7 @@ from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
-from mediate import cli
+from mediate import __version__, cli
 from mediate.converters import Options, Outcome, SKIPPED, classify_job
 
 
@@ -206,16 +206,17 @@ class ClassifyJobTests(MainTestCase):
         self.assertEqual(decision.status, SKIPPED)
         self.assertIn("--convert-heic", decision.detail)
 
-    def test_opted_in_heic_produces_a_plan_on_macos(self):
+    def test_opted_in_heic_produces_a_plan_with_sips(self):
         path = self.touch("a.heic")
-        with patch.object(sys, "platform", "darwin"):
-            decision = classify_job(self.job(path, "heic"), Options(convert_heic=True))
+        decision = classify_job(self.job(path, "heic"), Options(convert_heic=True))
         self.assertNotIsInstance(decision, Outcome)
         self.assertEqual(decision.kind, "heic")
 
-    def test_opted_in_heic_uses_ffmpeg_off_macos(self):
+    def test_opted_in_heic_falls_back_to_ffmpeg_without_sips(self):
+        # sips ships with macOS, but a stripped-down system or a PATH that
+        # hides it must fall through to FFmpeg rather than skip the file.
         path = self.touch("a.heic")
-        with patch.object(sys, "platform", "linux"), \
+        with patch("mediate.converters.shutil.which", return_value=None), \
                 patch("mediate.converters.ffmpeg_can_decode_heic", return_value=True):
             decision = classify_job(self.job(path, "heic"), Options(convert_heic=True))
         self.assertNotIsInstance(decision, Outcome)
@@ -223,7 +224,7 @@ class ClassifyJobTests(MainTestCase):
 
     def test_opted_in_heic_is_skipped_without_any_decoder(self):
         path = self.touch("a.heic")
-        with patch.object(sys, "platform", "linux"), \
+        with patch("mediate.converters.shutil.which", return_value=None), \
                 patch("mediate.converters.ffmpeg_can_decode_heic", return_value=False):
             decision = classify_job(self.job(path, "heic"), Options(convert_heic=True))
         self.assertIsInstance(decision, Outcome)
@@ -339,6 +340,41 @@ class ExtractedSeamTests(MainTestCase):
         # A typo must not silently fall back to a different speed.
         with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
             cli.parse_args([str(self.root), "--encode-preset", "sloww"])
+
+    def test_a_non_macos_platform_is_refused_before_anything_runs(self):
+        # The pipeline's guarantees are Apple's. Running anywhere else used
+        # to fall back to weaker checks on the same destructive path.
+        buffer = io.StringIO()
+        with patch.object(cli.sys, "platform", "linux"), redirect_stderr(buffer):
+            code = cli.main([str(self.root)])
+        self.assertEqual(code, 2)
+        self.assertIn("macOS-only", buffer.getvalue())
+
+    def test_the_refusal_happens_before_any_work(self):
+        # Nothing may be touched first: no log file, no transaction
+        # recovery, no rename phase. Only argument parsing precedes it, so
+        # that --version and --help still answer on any platform.
+        with patch.object(cli.sys, "platform", "win32"), \
+                patch("mediate.cli.setup_logging") as logging_setup, \
+                patch("mediate.cli.recover_pending_transactions") as recover, \
+                redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.main([str(self.root)]), 2)
+        logging_setup.assert_not_called()
+        recover.assert_not_called()
+
+    def test_version_still_answers_on_an_unsupported_platform(self):
+        # Packaging and the release job both read --version from a build
+        # that may not be running on a Mac.
+        buffer = io.StringIO()
+        with patch.object(cli.sys, "platform", "linux"), \
+                redirect_stdout(buffer), self.assertRaises(SystemExit) as exit:
+            cli.main([str(self.root), "--version"])
+        self.assertEqual(exit.exception.code, 0)
+        self.assertIn(__version__, buffer.getvalue())
+
+    def test_macos_is_not_refused(self):
+        with patch.object(cli.sys, "platform", "darwin"):
+            self.assertIsNone(cli.require_macos())
 
     def test_the_photo_effort_flag_reaches_options(self):
         from mediate.ffmpegcmd import DEFAULT_PHOTO_EFFORT

@@ -21,7 +21,6 @@ import json
 import logging
 import os
 import subprocess
-import sys
 import threading
 from pathlib import Path
 
@@ -36,11 +35,7 @@ _cache_dirty = False
 
 
 def _cache_file() -> Path:
-    if sys.platform == "darwin":
-        base = Path.home() / "Library" / "Caches"
-    else:
-        base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
-    return base / "mediate" / "probe-cache.json"
+    return Path.home() / "Library" / "Caches" / "mediate" / "probe-cache.json"
 
 
 def load_probe_cache() -> None:

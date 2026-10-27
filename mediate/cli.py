@@ -506,14 +506,6 @@ def run_rename_shortcuts(root: Path, args: argparse.Namespace) -> Optional[int]:
 def build_options(root: Path, args: argparse.Namespace):
     """Resolve the disposal policy into Options, or return an exit code."""
     mode = HARD if args.hard_delete else GRAVEYARD if args.graveyard else TRASH
-    if sys.platform == "win32" and mode == TRASH and not (
-        args.keep_originals or args.dry_run or args.rename_only
-    ):
-        print(
-            "error: the Windows Recycle Bin is not supported; use --graveyard DIR or --hard-delete",
-            file=sys.stderr,
-        )
-        return 2
     dispose, dispose_label = make_disposer(mode, root, args.graveyard)
     return Options(
         dry_run=args.dry_run,
@@ -643,8 +635,36 @@ def summarize_run(
     return "\n".join(lines)
 
 
+def require_macos() -> Optional[int]:
+    """Refuse to run anywhere the pipeline's assumptions do not hold.
+
+    mediate deletes originals, and the checks that make that safe are
+    Apple's: AVFoundation playback validation, `sips` for HEIC stills,
+    `setattrlist` for Finder's creation date, the per-volume `.Trashes`
+    layout. Those used to have fallbacks for other platforms, which meant
+    the destructive path ran with fewer guarantees than it was written
+    for — and nothing tested them. Failing here is the honest alternative
+    to pretending.
+    """
+    if sys.platform == "darwin":
+        return None
+    print(
+        f"error: mediate is macOS-only (this is {sys.platform}). It relies on "
+        "AVFoundation, sips, setattrlist and the macOS Trash layout to make "
+        "deleting originals safe.",
+        file=sys.stderr,
+    )
+    return 2
+
+
 def main(argv=None) -> int:
+    # Arguments are parsed first so --version and --help answer anywhere,
+    # which packaging and the release job both rely on; parse_args reads the
+    # config file and nothing else. The guard then runs before any work.
     args = parse_args(argv)
+    unsupported = require_macos()
+    if unsupported is not None:
+        return unsupported
     CANCELLATION.reset()
 
     root = args.directory.expanduser().resolve()

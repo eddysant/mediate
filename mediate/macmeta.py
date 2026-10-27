@@ -1,4 +1,4 @@
-"""macOS file-metadata helpers (no-ops elsewhere).
+"""macOS file-metadata helpers.
 
 Finder's "date created" is the file's birthtime, which a fresh conversion
 resets to "now". EXIF dates survive inside the converted files, but Finder
@@ -12,7 +12,6 @@ import ctypes
 import ctypes.util
 import logging
 import os
-import sys
 from pathlib import Path
 
 log = logging.getLogger("mediate")
@@ -37,12 +36,10 @@ class _attrlist(ctypes.Structure):
     ]
 
 
-_libc = None
-if sys.platform == "darwin":
-    try:
-        _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-    except OSError:  # pragma: no cover
-        _libc = None
+try:
+    _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+except OSError:  # pragma: no cover
+    _libc = None
 
 
 def get_birthtime(path: Path) -> float | None:
@@ -53,8 +50,9 @@ def get_birthtime(path: Path) -> float | None:
 
 
 def set_birthtime(path: Path, timestamp: float) -> bool:
-    """Set the file's creation date on macOS. Returns False (harmlessly)
-    anywhere it can't be done."""
+    """Set the file's creation date. Returns False (harmlessly) if libc
+    could not be loaded at all, which leaves the output's own birthtime in
+    place rather than failing a conversion over Finder sort order."""
     if _libc is None:
         return False
     attrs = _attrlist(bitmapcount=ATTR_BIT_MAP_COUNT, commonattr=ATTR_CMN_CRTIME)

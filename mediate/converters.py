@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
-import sys
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -375,11 +375,11 @@ def classify_job(job: MediaJob, opts: Options):
     if kind == "heic":
         if not opts.convert_heic:
             return Outcome(SKIPPED, src, "HEIC (already space-efficient; --convert-heic to convert)")
-        if sys.platform != "darwin" and not ffmpeg_can_decode_heic():
+        if not shutil.which("sips") and not ffmpeg_can_decode_heic():
             return Outcome(
                 SKIPPED,
                 src,
-                "HEIC conversion needs macOS sips or an FFmpeg build that reads "
+                "HEIC conversion needs sips or an FFmpeg build that reads "
                 "HEIC stills",
             )
 

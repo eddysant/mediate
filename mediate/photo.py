@@ -15,7 +15,6 @@ import logging
 import os
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 from typing import Optional
 
@@ -81,10 +80,10 @@ def _convert_photo(
         return direct
 
     if src.suffix.lower() == ".gif" and decode_failure:
-        # sips is macOS-only. Calling it blind turned a readable cwebp
-        # diagnostic into "converter not found: sips" on every other
-        # platform, blaming a tool the user never asked for.
-        if not (sys.platform == "darwin" and shutil.which("sips")):
+        # _run raises FileNotFoundError when sips is absent, which
+        # process_job reports as "converter not found: sips" — blaming a tool
+        # the user never asked for and discarding the real cwebp diagnostic.
+        if not shutil.which("sips"):
             direct.stderr += (
                 "\nThe GIF decode fallback needs macOS sips, which is not "
                 "available here; the original cwebp failure stands."
@@ -187,15 +186,16 @@ def ffmpeg_can_decode_heic() -> bool:
 
 
 def _decode_heic(src: Path, png: Path) -> subprocess.CompletedProcess:
-    """Decode a HEIC still to PNG, preferring macOS sips.
+    """Decode a HEIC still to PNG, preferring sips.
 
     PNG specifically: both decoders copy the EXIF block into it and cwebp
     extracts EXIF from PNG, where a TIFF intermediate silently loses all
-    metadata. Off macOS, FFmpeg reads the same file through its mov/mp4
-    demuxer; any metadata it does drop is restored afterwards by
-    _repair_photo_metadata via ExifTool.
+    metadata. FFmpeg reads the same file through its mov/mp4 demuxer and is
+    the fallback when sips is missing or chokes on a particular file; any
+    metadata it drops is restored afterwards by _repair_photo_metadata via
+    ExifTool.
     """
-    if sys.platform == "darwin" and shutil.which("sips"):
+    if shutil.which("sips"):
         sips = _run(["sips", "-s", "format", "png", str(src), "--out", str(png)])
         if sips.returncode == 0:
             return sips

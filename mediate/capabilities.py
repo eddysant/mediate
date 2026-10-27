@@ -6,7 +6,6 @@ import json
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import threading
 from dataclasses import dataclass, field
@@ -203,8 +202,7 @@ def _check_hardware_encoder(report: CapabilityReport) -> None:
         report.errors.append(
             f"--hardware needs the {HARDWARE_VIDEO_ENCODER} encoder, which this "
             "FFmpeg build does not have"
-            + ("" if sys.platform == "darwin" else "; VideoToolbox is macOS-only")
-            + f". Drop --hardware (or {_install_hint()})"
+            f". Drop --hardware (or {_install_hint()})"
         )
         return
     report.versions["hardware encoder"] = HARDWARE_VIDEO_ENCODER
@@ -259,13 +257,13 @@ def ffmpeg_heic_support() -> bool:
 
 
 def _check_heic(report: CapabilityReport) -> None:
-    if sys.platform == "darwin" and shutil.which("sips"):
+    if shutil.which("sips"):
         return
     if ffmpeg_heic_support():
         report.versions["heic decoder"] = "ffmpeg (mov/mp4 demuxer + hevc)"
         return
     report.errors.append(
-        "--convert-heic needs macOS sips or an FFmpeg build that reads HEIC "
+        "--convert-heic needs sips or an FFmpeg build that reads HEIC "
         "stills (mov/mp4 demuxer plus an hevc decoder); " + _install_hint()
     )
 

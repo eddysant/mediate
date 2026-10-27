@@ -1,6 +1,6 @@
 # mediate — Architecture Notes
 
-Stdlib-only Python (≥3.10) CLI by Misty Vale, built with AI assistance. Recursively
+macOS-only, stdlib-only Python (≥3.10) CLI by Misty Vale, built with AI assistance. Recursively
 standardizes a media library: photos → lossless WebP (`cwebp`), videos and
 GIF/WebP animations → h264/yuv420p/AAC MP4 (`ffmpeg`). Originals are disposed
 of (Trash by
@@ -27,8 +27,8 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 | `journal.py` | atomic `.mediate-run.json` state and interrupted-job prioritization |
 | `transaction.py` | durable two-phase validated-output replacement plus startup rollback/completion recovery |
 | `capabilities.py` | FFmpeg/cwebp version, encoder/demuxer, progress, rotation, smoke-encode, and ffprobe JSON preflight |
-| `disposal.py` | serializable Trash (macOS per-volume `.Trashes`, freedesktop elsewhere) / graveyard / hard-delete policy; `_same_volume` is a seam so tests can exercise the external-drive branch |
-| `macmeta.py` | ctypes `setattrlist(2)` to copy the original's birthtime (Finder "date created") onto outputs; no-op off macOS |
+| `disposal.py` | serializable Trash (the file's own volume's `.Trashes`, else `~/.Trash`) / graveyard / hard-delete policy; `_same_volume` is a seam so tests can exercise the external-drive branch |
+| `macmeta.py` | ctypes `setattrlist(2)` to copy the original's birthtime (Finder "date created") onto outputs |
 | `exiftool.py` | pool of up to 4 persistent `exiftool -stay_open` daemons behind `run_exiftool(args)` (assigned via `threading.local` so a slot dies with its thread, atexit-stopped, one-shot fallback); all exiftool queries go through it |
 | `renamer.py` | `--rename`/`--rename-only` phase: stem parsing (paren/bracket/dash numbers, copy markers, `[site N]` tags, websites), cleanup + title case, per-(dir, base, site, ext) series renumbering compacted to 1 with gap-closing and zero-padding, GUID/random-token→folder-name, `--date-prefix`, `--rename-folders`, manifest + `--undo-renames`, never-overwrite apply loop |
 
@@ -144,9 +144,10 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   pool is, which is why `_resolve_workers` leaves photo-only runs uncapped
   while capping video.
 - **HEIC pipeline must use a PNG intermediate** (`_decode_heic` in
-  `converters.py`): `sips → PNG → cwebp` on macOS, and FFmpeg's mov/mp4
+  `photo.py`): `sips → PNG → cwebp`, falling back to FFmpeg's mov/mp4
   demuxer (HEIC is ISOBMFF carrying HEVC — there is no separate "heic"
-  demuxer to look for) elsewhere. Both preserve the EXIF block; anything a
+  demuxer to look for) when sips is missing or chokes on a particular
+  file. Both preserve the EXIF block; anything a
   decoder drops is restored by `_repair_photo_metadata`. Because the mov
   demuxer exposes *every* auxiliary image as a stream, the largest-area
   stream is mapped explicitly and the decoded PNG's IHDR dimensions are
@@ -201,7 +202,7 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   subtitles (`dvd_subtitle`) still block: MP4 cannot carry VOBSUB, so that
   loss is real and stays opt-in.
 - **Disposal tests must never touch the real Trash** (`test_disposal.py`):
-  every test redirects `HOME`/`XDG_DATA_HOME` into a temp dir, because
+  every test redirects `HOME` into a temp dir, because
   `Path.home()` reads `HOME` and an unpatched run would move fixtures into
   the developer's own `~/.Trash`. Trash is the *default* mode, so this is the
   path an ordinary invocation takes.
@@ -264,12 +265,22 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   own check), matching the converter's refusal of symlinked media. Renaming
   a link moves a pointer whose target may live anywhere, and a broken link
   would be quietly tidied.
-- **Every `sips` call needs a platform guard**: it is macOS-only, and `_run`
-  raises `FileNotFoundError` elsewhere, which `process_job` reports as
-  "converter not found: sips" — blaming a tool the user never asked for and
-  discarding the real cwebp diagnostic. Both call sites (the GIF decode
-  fallback in `_convert_photo` and `_decode_heic`) check
-  `sys.platform == "darwin" and shutil.which("sips")`.
+- **Every `sips` call still needs a `shutil.which` guard**, even now that
+  mediate is macOS-only: `_run` raises `FileNotFoundError` when it is
+  absent, which `process_job` reports as "converter not found: sips" —
+  blaming a tool the user never asked for and discarding the real cwebp
+  diagnostic. Both call sites (the GIF decode fallback in `_convert_photo`
+  and `_decode_heic`) check it. The platform half of that condition is gone;
+  the presence half is what the guard was actually for.
+- **macOS-only is enforced in exactly one place** (`require_macos` in
+  `cli.py`), and it runs *after* `parse_args` so `--version` and `--help`
+  still answer anywhere — packaging and the release job both read `--version`
+  from a build that is not on a Mac. Before that ordering was fixed the
+  guard broke the release workflow's own verification step. There used to be
+  eleven platform branches across eight modules (freedesktop Trash, XDG
+  cache dir, a Windows Recycle Bin refusal, `macmeta` no-op, an Apple
+  playback skip); they are gone, because the destructive path was running
+  with weaker guarantees on platforms nothing tested.
 - **Names are trimmed to 255 bytes** (`fit_within_name_max`): the filesystem
   limit is bytes, not characters, so trimming happens on the encoded form
   without splitting a character. The trailing `[N]` tag and any
@@ -408,14 +419,17 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
 - **Config file** (`~/.config/mediate/config` or `$MEDIATE_CONFIG`): flags
   one per line, prepended to argv in `parse_args` unless `--no-config`.
   Tests must set `MEDIATE_CONFIG=/nonexistent` to stay hermetic.
-- **CI** (`.github/workflows/ci.yml`): unit tests on ubuntu+macos x Python
-  3.10 (the `requires-python` floor) and 3.12 for every push/PR. The floor
-  was 3.9 until it went EOL in October 2025: `setup-python` then stopped
-  publishing 3.9 linux builds past Ubuntu 24.04, `ubuntu-latest` rolled past
-  that image, and the job began failing *inside setup-python* and silently
-  **skipping** the tests rather than reporting a failure. Watch for that
-  shape whenever the floor nears EOL — a green-looking matrix with a skipped
-  test step. The macOS job additionally *asserts* `h264_videotoolbox` is in
+- **CI** (`.github/workflows/ci.yml`): unit tests on macos x Python
+  3.10 (the `requires-python` floor) and 3.12 for every push/PR. Ubuntu was
+  dropped when mediate became macOS-only — it had been the only thing
+  exercising eleven non-macOS branches, and once those branches went there
+  was nothing left for it to test. The floor was 3.9 until it went EOL in
+  October 2025: `setup-python` then stopped publishing 3.9 linux builds past
+  Ubuntu 24.04, `ubuntu-latest` rolled past that image, and the job began
+  failing *inside setup-python* and silently **skipping** the tests rather
+  than reporting a failure. Watch for that shape whenever the floor nears
+  EOL — a green-looking matrix with a skipped test step. The test job
+  additionally *asserts* `h264_videotoolbox` is in
   the brewed FFmpeg, and that `avifenc`/`avifdec` and `exiftool` are on
   PATH: those tests skip themselves without them, and a skipped test looks
   like a pass — the same failure shape one level down. **ExifTool is
@@ -429,7 +443,9 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   Release with `--generate-notes`. Releasing = bump version in
   `__init__.py`/`pyproject.toml`, tag, push the tag — the release job now
   **fails** if the tag disagrees with either file, or if the built zipapp's
-  `--version` disagrees with the tag.
+  `--version` disagrees with the tag. The release job still runs on
+  `ubuntu-latest`: building a stdlib zipapp is platform-neutral, and
+  `--version` answers there because `require_macos` runs after `parse_args`.
 - **Homebrew tap** (`eddysant/homebrew-tap`, sibling checkout at
   `~/Code/homebrew-tap`): `Formula/mediate.rb` wraps the release source
   tarball (libexec + PYTHONPATH bin shim on brewed python; ffmpeg/webp as

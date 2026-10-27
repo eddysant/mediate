@@ -5,7 +5,12 @@ standardizes photos and videos into compatible, space-efficient formats — and
 only parts with an original after the converted file passes a strict
 validation checklist. Even then it goes to the Trash, not oblivion.
 
-Stdlib-only Python (≥ 3.10). Everything else is `ffmpeg`, `cwebp`, and friends.
+**macOS only.** Stdlib-only Python (≥ 3.10); everything else is `ffmpeg`,
+`cwebp`, and friends. The checks that make deleting an original safe are
+Apple's — AVFoundation playback validation, `sips` for HEIC stills,
+`setattrlist` for Finder's creation date, the per-volume `.Trashes` layout —
+so mediate refuses to run anywhere else rather than doing the destructive
+part with weaker guarantees.
 
 **[Quick start](#quick-start)** · [What it converts](#what-it-converts) ·
 [Options](#options) · [Renaming](#name-standardization) ·
@@ -40,15 +45,16 @@ From a checkout, use `python3 -m mediate` in place of `mediate`.
 
 | | |
 |---|---|
+| **macOS** | not optional; mediate exits with an error on other platforms |
 | **Required** | `ffmpeg`, `ffprobe`, `cwebp` — `brew install ffmpeg webp` |
 | FFmpeg 6+ | 9+ only if animated WebPs are present |
 | `avifenc` | optional, for `--output-format avif` — `brew install libavif` |
 | `jpegtran` | optional, enables lossless recovery of truncated JPEGs — `brew install jpeg-turbo` (bundled in the Homebrew formula) |
 | `exiftool` | optional, improves metadata checks, Live Photo detection, and `--date-prefix` |
 
-HEIC conversion needs either macOS (`sips` is built in) or an FFmpeg build
-that reads HEIC stills — most do, since HEIC is ISOBMFF and FFmpeg reads it
-through the mov/mp4 demuxer.
+HEIC conversion uses `sips`, which is built into macOS. If it is somehow
+missing or chokes on a particular file, mediate falls back to FFmpeg, which
+reads HEIC stills through its mov/mp4 demuxer since HEIC is ISOBMFF.
 
 Before converting anything, mediate checks tool versions and runs a tiny
 h264/AAC encode plus a JSON probe. Missing encoders and mismatched FFmpeg
@@ -380,9 +386,9 @@ index.
 
 ### Beyond the checklist
 
-- **Originals go to the Trash by default** — per-volume `.Trashes` on macOS so
-  external drives aren't copied across volumes, freedesktop trash with
-  `.trashinfo` on Linux. Video re-encoding is lossy: once an original is
+- **Originals go to the Trash by default** — the file's own volume's
+  `.Trashes`, so a video on an external drive is a rename rather than a full
+  copy to `~/.Trash`. Video re-encoding is lossy: once an original is
   hard-deleted that quality is gone forever, so recoverability is the default.
 - **Nothing is written under its final name until it is proven.** Conversions
   go to a hidden temp name (`.name.<rand>.part.ext`) and enter a durable
@@ -416,8 +422,8 @@ index.
 
 ## How it works
 
-**Caching.** ffprobe results are cached in `~/Library/Caches/mediate` (or
-`$XDG_CACHE_HOME`), keyed by path, nanosecond mtime/ctime, size, device and
+**Caching.** ffprobe results are cached in `~/Library/Caches/mediate`,
+keyed by path, nanosecond mtime/ctime, size, device and
 inode. Expensive full-decode health entries also carry a sampled BLAKE2
 fingerprint. Completed MP4s are reported as one aggregate "already
 standardized" count. With `--keep-originals`, each validated source/output

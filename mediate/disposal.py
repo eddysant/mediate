@@ -9,9 +9,7 @@ from __future__ import annotations
 
 import os
 import shutil
-import sys
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -48,47 +46,26 @@ def _same_volume(a: Path, b: Path) -> bool:
 
 
 def _trash_dir_for(path: Path) -> Path:
-    """The Trash directory to use for a file, per platform convention."""
-    if sys.platform == "darwin":
-        home_trash = Path.home() / ".Trash"
-        try:
-            # A file on another volume gets that volume's .Trashes/<uid>,
-            # avoiding a full copy of (potentially huge) video files.
-            if not _same_volume(path, home_trash):
-                for parent in path.resolve().parents:
-                    candidate = parent / ".Trashes" / str(os.getuid())
-                    if (parent / ".Trashes").is_dir():
-                        candidate.mkdir(parents=True, exist_ok=True)
-                        return candidate
-        except OSError:
-            pass
-        return home_trash
-    # freedesktop.org convention (Linux/BSD).
-    xdg_data = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
-    return xdg_data / "Trash" / "files"
+    """The Trash directory to use for a file."""
+    home_trash = Path.home() / ".Trash"
+    try:
+        # A file on another volume gets that volume's .Trashes/<uid>,
+        # avoiding a full copy of (potentially huge) video files.
+        if not _same_volume(path, home_trash):
+            for parent in path.resolve().parents:
+                candidate = parent / ".Trashes" / str(os.getuid())
+                if (parent / ".Trashes").is_dir():
+                    candidate.mkdir(parents=True, exist_ok=True)
+                    return candidate
+    except OSError:
+        pass
+    return home_trash
 
 
 def _send_to_trash(path: Path, original_path: Optional[Path] = None) -> str:
     logical_path = original_path or path
-    trash_dir = _trash_dir_for(path)
-    dest = _unique_dest(trash_dir, logical_path.name)
+    dest = _unique_dest(_trash_dir_for(path), logical_path.name)
     _move(path, dest)
-    if sys.platform != "darwin":
-        # Minimal freedesktop trashinfo so desktop Trash UIs can restore it.
-        info_dir = trash_dir.parent / "info"
-        info_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            (info_dir / f"{dest.name}.trashinfo").write_text(
-                "[Trash Info]\n"
-                f"Path={logical_path}\n"
-                f"DeletionDate={datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}\n",
-                encoding="utf-8",
-            )
-        except OSError:
-            # The file is already safely in Trash. Missing UI metadata must
-            # not make the replacement transaction attempt an impossible
-            # rollback from a source path that no longer exists.
-            pass
     return "original moved to Trash"
 
 

@@ -218,7 +218,7 @@ def _png_bytes(width: int, height: int) -> bytes:
     return b"\x89PNG\r\n\x1a\n" + chunk
 
 
-class GifFallbackPlatformTests(unittest.TestCase):
+class GifFallbackTests(unittest.TestCase):
     """The GIF decode fallback is macOS-only and must say so."""
 
     def setUp(self):
@@ -234,22 +234,15 @@ class GifFallbackPlatformTests(unittest.TestCase):
             raise FileNotFoundError(2, "No such file or directory", "sips")
         return subprocess.CompletedProcess(cmd, 1, "", "Cannot read input picture file")
 
-    def test_off_macos_keeps_the_real_cwebp_error(self):
+    def test_without_sips_the_real_cwebp_error_survives(self):
         # Calling sips blind reported "converter not found: sips", blaming a
         # tool the user never asked for and discarding the actual reason.
-        with patch.object(sys, "platform", "linux"), \
+        with patch("mediate.photo.shutil.which", return_value=None), \
                 patch("mediate.photo._run", side_effect=self._cwebp_rejects):
             result = _convert_photo(self.src, self.root / "out.webp")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Cannot read input picture file", result.stderr)
-        self.assertIn("macOS sips", result.stderr)
-
-    def test_macos_without_sips_installed_also_falls_back_cleanly(self):
-        with patch.object(sys, "platform", "darwin"), \
-                patch("mediate.photo.shutil.which", return_value=None), \
-                patch("mediate.photo._run", side_effect=self._cwebp_rejects):
-            result = _convert_photo(self.src, self.root / "out.webp")
-        self.assertIn("Cannot read input picture file", result.stderr)
+        self.assertIn("sips", result.stderr)
 
     def test_macos_with_sips_still_retries_through_it(self):
         calls = []
@@ -294,7 +287,7 @@ class HeicDecodeTests(unittest.TestCase):
         src = self.root / "a.heic"
         src.write_bytes(b"x")
         with patch("mediate.inventory.heic_image_streams", return_value=[]), \
-                patch.object(sys, "platform", "linux"):
+                patch("mediate.photo.shutil.which", return_value=None):
             result = _decode_heic(src, self.root / "out.png")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("no decodable still image", result.stderr)
@@ -312,7 +305,7 @@ class HeicDecodeTests(unittest.TestCase):
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
         with patch("mediate.inventory.heic_image_streams", return_value=streams), \
-                patch.object(sys, "platform", "linux"), \
+                patch("mediate.photo.shutil.which", return_value=None), \
                 patch("mediate.photo._run", side_effect=fake_run):
             result = _decode_heic(src, png)
         self.assertNotEqual(result.returncode, 0)
@@ -329,7 +322,7 @@ class HeicDecodeTests(unittest.TestCase):
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
         with patch("mediate.inventory.heic_image_streams", return_value=streams), \
-                patch.object(sys, "platform", "linux"), \
+                patch("mediate.photo.shutil.which", return_value=None), \
                 patch("mediate.photo._run", side_effect=fake_run):
             result = _decode_heic(src, png)
         self.assertEqual(result.returncode, 0)

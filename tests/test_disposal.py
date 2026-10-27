@@ -4,12 +4,11 @@ Only hard-delete was previously exercised, and only incidentally by the
 FFmpeg integration tests — yet Trash is the *default*, so this is the code
 that runs on an ordinary invocation and moves the user's originals.
 
-Every test here redirects HOME/XDG_DATA_HOME into a temporary directory, so
-nothing can reach the real Trash.
+Every test here redirects HOME into a temporary directory, so nothing can
+reach the real Trash.
 """
 
 import os
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -69,8 +68,7 @@ class UniqueDestTests(DisposalTestCase):
 class TrashDirTests(DisposalTestCase):
     def test_macos_uses_the_home_trash_on_the_same_volume(self):
         media = self.touch("a.jpg")
-        with patch.object(sys, "platform", "darwin"):
-            self.assertEqual(_trash_dir_for(media), self.home / ".Trash")
+        self.assertEqual(_trash_dir_for(media), self.home / ".Trash")
 
     def test_macos_prefers_the_files_own_volume(self):
         # Moving a large video from an external drive to ~/.Trash would be a
@@ -79,24 +77,15 @@ class TrashDirTests(DisposalTestCase):
         volume = self.root / "Volumes/Media"
         (volume / ".Trashes").mkdir(parents=True)
         media = self.touch("Volumes/Media/movie.mov")
-        with patch.object(sys, "platform", "darwin"), \
-                patch("mediate.disposal._same_volume", return_value=False):
+        with patch("mediate.disposal._same_volume", return_value=False):
             resolved = _trash_dir_for(media)
         self.assertEqual(resolved, volume.resolve() / ".Trashes" / str(os.getuid()))
         self.assertTrue(resolved.is_dir())
 
     def test_macos_falls_back_to_home_when_the_volume_has_no_trashes(self):
         media = self.touch("Volumes/Media/movie.mov")
-        with patch.object(sys, "platform", "darwin"), \
-                patch("mediate.disposal._same_volume", return_value=False):
+        with patch("mediate.disposal._same_volume", return_value=False):
             self.assertEqual(_trash_dir_for(media), self.home / ".Trash")
-
-    def test_freedesktop_layout_elsewhere(self):
-        media = self.touch("a.jpg")
-        with patch.object(sys, "platform", "linux"):
-            self.assertEqual(
-                _trash_dir_for(media), self.home / ".local/share/Trash/files"
-            )
 
     def test_same_volume_treats_an_unreadable_path_as_same(self):
         # Unknown must not send a file to a volume Trash that may not exist.
@@ -106,8 +95,7 @@ class TrashDirTests(DisposalTestCase):
 class SendToTrashTests(DisposalTestCase):
     def test_the_file_is_moved_out_of_the_library(self):
         media = self.touch("a.jpg", b"payload")
-        with patch.object(sys, "platform", "darwin"):
-            message = _send_to_trash(media)
+        message = _send_to_trash(media)
         self.assertFalse(media.exists())
         trashed = self.home / ".Trash/a.jpg"
         self.assertEqual(trashed.read_bytes(), b"payload")
@@ -116,41 +104,15 @@ class SendToTrashTests(DisposalTestCase):
     def test_a_name_already_in_the_trash_is_not_overwritten(self):
         (self.home / ".Trash/a.jpg").write_bytes(b"older")
         media = self.touch("a.jpg", b"newer")
-        with patch.object(sys, "platform", "darwin"):
-            _send_to_trash(media)
+        _send_to_trash(media)
         self.assertEqual((self.home / ".Trash/a.jpg").read_bytes(), b"older")
         self.assertEqual((self.home / ".Trash/a 2.jpg").read_bytes(), b"newer")
-
-    def test_freedesktop_writes_restorable_trashinfo(self):
-        media = self.touch("a.jpg", b"payload")
-        with patch.object(sys, "platform", "linux"):
-            _send_to_trash(media)
-        files = self.home / ".local/share/Trash/files"
-        info = self.home / ".local/share/Trash/info/a.jpg.trashinfo"
-        self.assertEqual((files / "a.jpg").read_bytes(), b"payload")
-        body = info.read_text()
-        self.assertIn("[Trash Info]", body)
-        self.assertIn(f"Path={media}", body)
-        self.assertIn("DeletionDate=", body)
-
-    def test_an_unwritable_info_dir_still_leaves_the_file_trashed(self):
-        # The file is already safely in the Trash; missing UI metadata must
-        # not raise, or the transaction would try to roll back from a source
-        # path that no longer exists.
-        media = self.touch("a.jpg", b"payload")
-        with patch.object(sys, "platform", "linux"), \
-                patch("mediate.disposal.Path.write_text", side_effect=OSError("nope")):
-            message = _send_to_trash(media)
-        self.assertFalse(media.exists())
-        self.assertTrue((self.home / ".local/share/Trash/files/a.jpg").exists())
-        self.assertIn("Trash", message)
 
     def test_the_original_path_names_the_trashed_file(self):
         # Disposal runs on a staged copy, so the name must come from the
         # logical original rather than the temporary staging path.
         staged = self.touch("staged.tmp", b"payload")
-        with patch.object(sys, "platform", "darwin"):
-            _send_to_trash(staged, original_path=self.root / "holiday.jpg")
+        _send_to_trash(staged, original_path=self.root / "holiday.jpg")
         self.assertTrue((self.home / ".Trash/holiday.jpg").exists())
 
 

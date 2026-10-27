@@ -1106,20 +1106,21 @@ class Mp4LayoutTests(unittest.TestCase):
 
 
 class ApplePlaybackTests(unittest.TestCase):
-    def test_non_macos_does_not_require_apple_tooling(self):
-        with patch("mediate.validators.sys.platform", "linux"), patch(
-            "mediate.validators.subprocess.run"
-        ) as run:
-            self.assertEqual(
-                verify_apple_playback(Path("output.mp4")),
-                (True, "not running on macOS"),
-            )
-        run.assert_not_called()
+    def test_without_the_swift_frontend_quick_look_is_used(self):
+        # The Swift command-line frontend ships with Xcode, not with macOS,
+        # so a Mac with only the Command Line Tools falls back to qlmanage
+        # rather than skipping the check.
+        with patch("mediate.validators.shutil.which", return_value=None), patch(
+            "mediate.validators._verify_quicklook_playback",
+            return_value=(True, "ok"),
+        ) as quicklook:
+            self.assertEqual(verify_apple_playback(Path("output.mp4")), (True, "ok"))
+        quicklook.assert_called_once()
 
     def test_avfoundation_timeout_fails_closed(self):
         import subprocess
 
-        with patch("mediate.validators.sys.platform", "darwin"), patch(
+        with patch(
             "mediate.validators.shutil.which", return_value="/usr/bin/swift"
         ), patch(
             "mediate.validators.subprocess.run",
