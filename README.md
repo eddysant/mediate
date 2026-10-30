@@ -12,10 +12,10 @@ Apple's — AVFoundation playback validation, `sips` for HEIC stills,
 so mediate refuses to run anywhere else rather than doing the destructive
 part with weaker guarantees.
 
-**[Quick start](#quick-start)** · [What it converts](#what-it-converts) ·
-[Options](#options) · [Renaming](#name-standardization) ·
-[Config](#config-file) · [What it skips](#what-it-skips) ·
-[Safety](#safety-protocol) · [How it works](#how-it-works) · [Tests](#tests)
+[Quick start](#quick-start) · [What it converts](#what-it-converts) ·
+[Options](#options) · [Renaming](#renaming) · [Config](#config-file) ·
+[What it skips](#what-it-skips) · [Is it safe?](#is-it-safe) ·
+[Tests](#tests)
 
 ## Quick start
 
@@ -25,11 +25,11 @@ brew install eddysant/tap/mediate     # installs ffmpeg + webp too
 
 Or grab the single-file `mediate.pyz` from the
 [latest release](https://github.com/eddysant/mediate/releases/latest), or run
-straight from a checkout with no install at all.
+straight from a checkout with `python3 -m mediate`.
 
 ```sh
-mediate ~/Pictures/Library --dry-run              # see what would happen
-mediate ~/Pictures/Library                        # convert; originals -> Trash
+mediate ~/Pictures/Library --dry-run   # see what would happen
+mediate ~/Pictures/Library             # convert; originals -> Trash
 ```
 
 Always start with `--dry-run`. A good full-strength invocation for a real
@@ -39,26 +39,19 @@ library:
 mediate ~/Pictures/Library --only-if-smaller --convert-heic
 ```
 
-From a checkout, use `python3 -m mediate` in place of `mediate`.
-
 ### Requirements
 
 | | |
 |---|---|
-| **macOS** | not optional; mediate exits with an error on other platforms |
 | **Required** | `ffmpeg`, `ffprobe`, `cwebp` — `brew install ffmpeg webp` |
 | FFmpeg 6+ | 9+ only if animated WebPs are present |
 | `avifenc` | optional, for `--output-format avif` — `brew install libavif` |
-| `jpegtran` | optional, enables lossless recovery of truncated JPEGs — `brew install jpeg-turbo` (bundled in the Homebrew formula) |
+| `jpegtran` | optional, recovers truncated JPEGs — `brew install jpeg-turbo` (bundled in the Homebrew formula) |
 | `exiftool` | optional, improves metadata checks, Live Photo detection, and `--date-prefix` |
 
-HEIC conversion uses `sips`, which is built into macOS. If it is somehow
-missing or chokes on a particular file, mediate falls back to FFmpeg, which
-reads HEIC stills through its mov/mp4 demuxer since HEIC is ISOBMFF.
-
-Before converting anything, mediate checks tool versions and runs a tiny
-h264/AAC encode plus a JSON probe. Missing encoders and mismatched FFmpeg
-builds fail up front with an installation hint.
+HEIC conversion uses `sips`, built into macOS, falling back to FFmpeg. Before
+converting anything, mediate checks tool versions and runs a tiny test encode,
+so missing encoders fail up front with an installation hint.
 
 ## What it converts
 
@@ -69,21 +62,19 @@ builds fail up front with an installation hint.
 | MOV / MKV / AVI / WMV / WebM / ASF / VOB / legacy video | MP4 (h264 `-crf 18 -preset medium`, AAC 256k, `yuv420p`) | `ffmpeg` |
 | Animated GIF / animated WebP | MP4 (`faststart`, even-dimension scale filter) | `ffmpeg` |
 
-> **Photo conversions before v0.15.0 were not actually lossless.** A stray
-> `-preset photo` after `cwebp`'s `-lossless` flag reset the parameter set and
-> produced an ordinary lossy VP8 file. Validation did not notice, so those
-> originals were disposed of. Outputs from earlier versions cannot be
-> recovered to their original quality — the `.webp` files are what they are —
-> but anything still in the Trash or a graveyard is the untouched original.
-> Conversions now have their container checked for a genuine `VP8L` stream and
-> fail closed otherwise, so a lossy result keeps the original instead. AVIF
-> gets an equivalent (though weaker) check on its colour matrix.
+Legacy coverage includes QuickTime, Windows Media (`.asf`, `.wmv`, `.dvr-ms`,
+`.wtv`), DVD and camcorder formats (`.vob`, `.vro`, `.mod`, `.tod`, `.dv`),
+RealMedia, Ogg video, MPEG transport and elementary streams, MXF, 3GPP, Flash
+video, and common DivX/Xvid extensions — all through the same validation
+pipeline.
 
-Legacy coverage includes QuickTime (`.mov`, `.qt`), Windows Media (`.asf`,
-`.wmv`, `.dvr-ms`, `.wtv`), DVD and camcorder formats (`.vob`, `.vro`, `.mod`,
-`.tod`, `.dv`), RealMedia, Ogg video, MPEG transport and elementary streams,
-MXF, 3GPP/3GPP2, Flash video, and common DivX/Xvid extensions. Every format
-goes through the same ffprobe preflight and validation pipeline.
+> **Photos converted before v0.15.0 were not actually lossless.** A stray
+> `-preset photo` after `cwebp`'s `-lossless` flag reset the parameter set and
+> produced an ordinary lossy file; validation did not notice, so those
+> originals were disposed of. Those `.webp` files cannot be recovered, but
+> anything still in the Trash or a graveyard is the untouched original.
+> Conversions are now checked for a genuine lossless stream and fail closed
+> otherwise.
 
 ## Options
 
@@ -92,113 +83,71 @@ goes through the same ffprobe preflight and validation pipeline.
 - `--dry-run` — traverse and print what would happen; nothing is written or deleted.
 - `--keep-originals` — convert but never touch inputs. A non-standard `foo.mp4`
   becomes `foo.standardized.mp4`, since the original keeps its name.
-- `--only-if-smaller` — discard the conversion and keep the original unless the
-  output is actually smaller. **Recommended**: lossless WebP is frequently
-  *bigger* than a camera JPEG or HEIC, because it must reproduce the source's
-  compression noise exactly.
-- `--workers N` — concurrent conversions: an integer, or `auto` (the default)
-  to use the CPU count, capped at 8 for video-heavy runs.
+- `--only-if-smaller` — keep the original unless the output is actually
+  smaller. **Recommended**: lossless WebP is frequently *bigger* than a camera
+  JPEG or HEIC, because it must reproduce the source's compression noise
+  exactly.
+- `--workers N` — concurrent conversions: an integer, or `auto` (the default).
 - `--log-file PATH` — default is `conversion.log` in the target directory. The
   console shows one line per file; the log adds timestamps and full converter
   stderr on failures.
-- `--verbose` — show debug output on the console.
-- `--no-config` — ignore the config file for this run.
-- `--version` — print the version and exit.
+- `--verbose` · `--no-config` · `--version`
 
 ### Convert more
 
-- `--convert-heic` — convert HEIC/HEIF, which is skipped by default because it
-  is already space-efficient. Pair with `--only-if-smaller`.
+- `--convert-heic` — convert HEIC/HEIF, skipped by default because it is
+  already space-efficient. Pair with `--only-if-smaller`.
 - `--reencode-hevc` — convert HEVC MP4s to h264 for non-Apple compatibility,
   accepting the size increase.
 - `--convert-live-photos` — convert Live Photo pairs anyway.
 - `--output-format {webp,avif}` — photo output format. Both are lossless; AVIF
   is often *larger* than WebP for photos.
-- `--validate-existing` — fully decode already-standardized MP4s and repair
-  any corruption found. This library-health pass is potentially expensive and
-  off by default; newly converted outputs are always validated regardless.
+- `--validate-existing` — fully decode already-standardized MP4s and repair any
+  corruption found. Expensive, so off by default; newly converted outputs are
+  always validated regardless.
 
-### Encoding speed
+### Speed
 
-Video encoding dominates a run, and the encoder preset is the only lever that
-matters much. Benchmarked on an Apple M2 against 1080p30 sources, measuring
-SSIM against the original rather than eyeballing:
+- `--encode-preset PRESET` — libx264 preset, default `medium`. On grainy
+  footage `slow` measures both slower *and larger* — its psy settings spend
+  bits preserving grain. `veryfast` is where quality starts to fall off.
+- `--photo-effort {fast,default,max}` — photos are always lossless, so effort
+  trades time against size, never quality. For WebP the default is the sweet
+  spot; for AVIF `max` is a real option if size matters more than time.
+- `--hardware` — use VideoToolbox. Roughly 5–7x faster, but measurably lower
+  quality per byte, which is why it is opt-in. Outputs go through the same
+  strict validation either way.
 
-| preset | grainy 30s clip | size | SSIM | clean clip | SSIM |
-|---|---|---|---|---|---|
-| `slow` | 207s | 532 MB | 0.9471 | 13.1s | 0.997767 |
-| `medium` *(default)* | 76s | 524 MB | 0.9448 | 7.5s | 0.997762 |
-| `fast` | 66s | 522 MB | 0.9447 | 6.9s | 0.997744 |
-| `veryfast` | 22s | 421 MB | 0.9215 | 3.6s | — |
-
-- `--encode-preset PRESET` — libx264 preset, default `medium`. Note that on
-  grainy footage `slow` measured both slower *and larger*: its psy settings
-  spend bits preserving grain at this quality level. `veryfast` is where
-  quality genuinely starts to fall off.
-- `--hardware` — encode with the platform hardware encoder (VideoToolbox on
-  macOS). Roughly 5–7x faster than `medium`, but quality per byte is
-  measurably lower: at a matched file size its SSIM was 0.925 against
-  libx264's 0.933, and reaching libx264's quality grew a 977 MB source to
-  1.2 GB. That is why it is opt-in and not the default. Outputs go through
-  the same strict validation either way.
-
-Two things that are *not* worth tuning for video: `--workers` barely affects it
-(x264 already saturates every core — 8 workers measured 133s against 1 worker's
-150s for the same eight files), and the post-encode validation decode costs
-about 5% of an encode.
-
-Photos are a different shape. They are always encoded losslessly, so effort
-trades time against file size and never against quality. Measured on
-3024x4032 stills:
-
-| level | cwebp | avifenc |
-|---|---|---|
-| `fast` | 3.4s, 4.09 MB | 0.6s, 5.99 MB |
-| `default` | 4.7s, 3.97 MB | 2.0s, 5.24 MB |
-| `max` | 20.4s, 3.93 MB | 60.8s, 4.71 MB |
-
-- `--photo-effort LEVEL` — `fast`, `default` or `max`. The levels are named
-  rather than numbered because the two encoders' own scales run in opposite
-  directions. For WebP the default is the sweet spot: `max` costs 4x the time
-  for 1% (and on grainy images it came out *larger*). For AVIF the range is
-  much wider, so `max` is a real option if size matters more than time.
-
-Unlike video, `--workers` *does* matter for photos: `cwebp -mt` made no
-measurable difference to a lossless encode, so the worker pool is the only
-parallelism there is — which is why mediate leaves it uncapped for photo-only
-runs and caps it at 8 when video is involved.
+`--workers` barely affects video (x264 already saturates every core) but is the
+only parallelism photos have. The numbers behind all of this are in
+[AGENTS.md](AGENTS.md#measured-numbers).
 
 ### Accept a loss (explicit opt-ins)
 
-- `--allow-stream-removal` — let MP4 conversion discard incompatible
-  subtitles, artwork, extra video tracks, and data/attachment streams.
-  Compatible text subtitles and JPEG/PNG cover streams are always preserved.
+- `--allow-stream-removal` — let MP4 conversion discard incompatible subtitles,
+  artwork, extra video tracks, and data/attachment streams. Compatible text
+  subtitles and JPEG/PNG cover streams are always preserved.
 - `--allow-video-downgrade` — permit 8-bit h264 conversion of
   HDR/high-bit-depth, alpha, interlaced, or variable-frame-rate video.
 
 ### Where originals go
 
-Trash by default.
+Trash by default — the file's own volume's `.Trashes`, so a video on an
+external drive is a rename rather than a full copy.
 
 - `--graveyard DIR` — move originals to DIR, mirroring the folder structure.
-- `--hard-delete` — permanently delete them (the pre-Trash behavior).
-
-### Renaming
-
-`--rename`, `--rename-only`, `--rename-folders`, `--date-prefix`,
-`--undo-renames`, `--plan-file PATH`, `--apply-plan PATH`. See
-[Name standardization](#name-standardization).
+- `--hard-delete` — permanently delete them.
 
 ### Exit codes
 
 `0` nothing failed · `1` a file failed validation · `2` usage error (bad
 directory, missing tools).
 
-## Name standardization
+## Renaming
 
 Besides formats, mediate can settle *naming* disputes. `--rename` runs after
-conversion, so fresh `.webp`/`.mp4` outputs are covered too; `--rename-only`
-skips conversion entirely. Both respect `--dry-run`.
+conversion, so fresh outputs are covered too; `--rename-only` skips conversion
+entirely. Both respect `--dry-run`.
 
 ```sh
 mediate ~/Pictures/Library --rename-only --dry-run   # preview
@@ -209,56 +158,43 @@ mediate ~/Pictures/Library --rename-only --plan-file plan.json
 mediate ~/Pictures/Library --apply-plan plan.json
 ```
 
-**Cleanup** — underscores, dots and dashes become spaces (digit-dash-digit
-survives, so `2023-01-05` keeps its shape); whitespace collapses; lowercase
-words are title-cased, with small words like "of" staying lower unless
-leading; existing capitalization such as `USA` or `McDonald` is respected;
-extensions are lowercased; Unicode is NFC-normalized.
+**Cleanup** — underscores, dots and dashes become spaces; whitespace
+collapses; lowercase words are title-cased, with small words like "of" staying
+lower unless leading; existing capitalization such as `USA` or `McDonald` is
+respected; extensions are lowercased; Unicode is NFC-normalized. Meaningful
+punctuation is protected: initialisms keep their dots and are uppercased
+(`e.e. cummings` → `E.E. Cummings`) while a longer abbreviation is still a
+separator (`Mr. Smith` → `Mr Smith`), and a name beginning `YYYY-MM-DD` keeps
+the clock in its dots.
 
-Punctuation that carries meaning is protected: initialisms keep their dots
-and are uppercased (`R.E.M. concert` → `R.E.M. Concert`, `e.e. cummings` →
-`E.E. Cummings`), while a longer abbreviation is still a separator
-(`Mr. Smith` → `Mr Smith`). A name beginning `YYYY-MM-DD` keeps the clock in
-its dots (`2023-01-05 12.30.45.jpg` is left alone) while its words are still
-tidied (`2023-01-05 party` → `2023-01-05 Party`).
-
-**Numbering** — `photo (1)` → `Photo [1]`, `Wren Tally - 2` →
-`Wren Tally [1]`, `Tilly-Marsh-001` → `Tilly Marsh [1]`. `Copy of X`,
-`X - copy` and `X copy 2` markers join the numbering. Every series compacts to
-start at 1 with gaps closed (`1,2,4` → `1,2,3`), and once a series reaches
-double digits, single digits are zero-padded (`[01]`…`[10]`, widening again
-past 99) so lexical order matches numeric order. Series are per directory + base name + site +
-extension, so different file types count independently. A bare space-number
-(`Terminator 2`) is *not* numbering; only `(N)`, `[N]` and dash-`N` forms are.
-Neither is a parenthesised year: `The Matrix (1999).mp4` keeps its year, while
-`photo (1).jpg` still folds into the series.
+**Numbering** — `photo (1)` → `Photo [1]`, `Wren Tally - 2` → `Wren Tally [1]`,
+`Tilly-Marsh-001` → `Tilly Marsh [1]`. `Copy of X` markers join the numbering.
+Every series compacts to start at 1 with gaps closed, and zero-pads once it
+reaches double digits so lexical order matches numeric order. Series are per
+directory + base name + site + extension. A bare space-number (`Terminator 2`)
+is not numbering, and neither is a parenthesised year — `The Matrix (1999).mp4`
+keeps it.
 
 **Websites** move into the tag: `Nova-Quinn-Example.com-4` →
-`Nova Quinn [Example.com 1]`, each site its own series.
+`Nova Quinn [Example.com 1]`.
 
-**Meaningless names** take their folder's name — GUIDs and random
-letter/digit tokens alike: `Nova/ue73up.jpg` → `Nova [ue73up].jpg`,
-`Vacation 2019/550e8400-….jpg` → `Vacation 2019 [550e8400-…].jpg`.
+**Meaningless names** take their folder's name — GUIDs and random tokens alike:
+`Nova/ue73up.jpg` → `Nova [ue73up].jpg`.
 
 **Left verbatim** — camera counters (`IMG_1234`, `DSC_0001`, `PXL_…`) and
-screenshot/WhatsApp names, where there is nothing human to fix and the dots
-and digits are data. Names already carrying an unrecognized `[…]` tag are
-also left alone, which is what makes re-runs idempotent.
+screenshot/WhatsApp names, where the dots and digits are data. Names already
+carrying an unrecognized `[…]` tag are left alone too, which is what makes
+re-runs idempotent.
 
 **Options** — `--rename-folders` cleans directory names with the same rules;
-`--date-prefix` prepends the capture date (`2019-06-01 Misty Vale [01].webp`)
-from EXIF via exiftool, video `creation_time`, or file mtime.
+`--date-prefix` prepends the capture date (`2019-06-01 Misty Vale [01].webp`).
 
-**Safety** — a rename never overwrites. Symlinks are skipped, matching the
-converter. Names are trimmed to the filesystem's 255-byte limit with the
-numbering tag and any date prefix kept intact, and invisible formatting
-(zero-width spaces, direction marks) is stripped while emoji joiners survive. Live Photo `.mov` halves mirror their
-still's rename and `.aae`/`.xmp` sidecars follow their media file, so pairings
-survive. Files that clean to the same name (`misty_vale.jpg` and
-`misty.vale.jpg` both becoming `Misty Vale`) join one numbered series rather
-than colliding; whichever already has the final name keeps it. Every applied
-batch is recorded in `.mediate-renames.json` at the library root, and
-`--undo-renames` reverses the most recent batch, repeatable batch by batch.
+**Safety** — a rename never overwrites, symlinks are skipped, names are
+trimmed to the filesystem's 255-byte limit with the numbering tag kept intact,
+and Live Photo halves and `.aae`/`.xmp` sidecars follow their media file so
+pairings survive. Every applied batch is recorded in `.mediate-renames.json`
+at the library root, and `--undo-renames` reverses the most recent batch,
+repeatable batch by batch.
 
 ## Config file
 
@@ -278,188 +214,99 @@ run.
 ## What it skips
 
 **Already standardized** — static `.webp`, static `.avif`, static GIFs, hidden
-files and directories, and MP4s that are already h264/8-bit 4:2:0/AAC
-(including FFmpeg's full-range `yuvj420p` alias).
+files and directories, and MP4s that are already h264/8-bit 4:2:0/AAC.
 
-**Would get bigger** — HEVC MP4s are smaller than h264 and play natively on
-Apple devices, so re-encoding only grows the file (`--reencode-hevc` to
+**Would get bigger** — HEVC MP4s play natively on Apple devices and are
+smaller than h264, so re-encoding only grows the file (`--reencode-hevc` to
 force). HEIC/HEIF likewise (`--convert-heic`).
 
 **Would break a pairing** — a `.mov` and same-named still whose Apple
-`ContentIdentifier` metadata matches are a Live Photo. Both halves are left
-alone, since converting either breaks the pairing in Apple Photos
-(`--convert-live-photos`).
+`ContentIdentifier` matches are a Live Photo. Converting either half breaks the
+pairing in Apple Photos, so both are left alone (`--convert-live-photos`).
 
 **Would lose content** — videos whose MP4 conversion would discard
-styled/bitmap subtitles, incompatible attachments, extra video angles,
-arbitrary data streams, or stream groups such as an LCEVC enhancement layer.
-Simple text subtitles become `mov_text` and JPEG/PNG cover streams are kept
-automatically; `--allow-stream-removal` opts into dropping the rest.
+styled/bitmap subtitles, incompatible attachments, extra video angles, data
+streams, or stream groups such as an LCEVC enhancement layer. Simple text
+subtitles and JPEG/PNG covers are kept automatically; `--allow-stream-removal`
+opts into dropping the rest.
 
-**Would lose picture semantics** — video that would silently lose HDR
-(including SMPTE 2094-50 metadata), high bit depth, alpha, interlacing, or
-variable/unusual frame rate in an 8-bit encode. Animated WebPs with alpha or
-ICC/EXIF/XMP metadata are covered by the same rule.
+**Would lose picture semantics** — video that would silently lose HDR, high bit
+depth, alpha, interlacing, or variable frame rate in an 8-bit encode.
 `--allow-video-downgrade` is the explicit opt-in.
 
-**Application bundles** — `*.photoslibrary`, `*.app`, `*.fcpbundle` and
-friends are never traversed. Converting files inside an Apple Photos library
-would corrupt it, so **this cannot be overridden**.
+**Application bundles** — `*.photoslibrary`, `*.app`, `*.fcpbundle` and friends
+are never traversed. Converting files inside an Apple Photos library would
+corrupt it, so **this cannot be overridden**.
 
-## Safety protocol
+## Is it safe?
 
-### The checklist
+That is the whole point of the tool, so: an original is disposed of **only**
+after its replacement passes every one of these.
 
-An original is disposed of **only** after all of these pass:
-
-1. Converter exit code is `0`.
-2. The output file exists.
-3. The output file is larger than 0 bytes.
-4. **(Videos)** `ffmpeg -v error -i out.mp4 -f null -` exits `0` **and** prints
-   nothing to stderr — a full-decode integrity check. FFmpeg reports many
-   corruptions on stderr while still exiting 0, so silence is required.
-5. **(macOS videos)** AVFoundation — the playback stack behind Quick Look —
-   reports the finished MP4 as playable. An FFmpeg-readable file that Apple
-   rejects is discarded and the original left untouched.
-6. **(Videos)** The MP4 is faststart — its `moov` index precedes the media,
-   so a player streaming it can start before downloading the whole file —
-   and declares the `mp42` brand. Both are requested by every mp4-producing
-   command; this confirms they reached the file.
-7. **(Photos) The output really is lossless.** A WebP must contain a `VP8L`
-   stream; an AVIF must declare an identity colour matrix in full range.
-   This is what catches an encoder that stops honouring `-lossless` — which
-   happened, silently, before v0.15.0.
-8. **Metadata survived.** A photo whose source has an EXIF capture date must
-   carry the same date in the output, and any ICC colour profile the source
-   carried must still be there. The first catches cwebp silently dropping
-   TIFF metadata; the second catches a wide-gamut photo losing its Display
-   P3 profile, which shifts every colour and breaks nothing visibly.
-9. **Streams survived.** Duration matches within 1s/2%, and the full inventory
-   is checked: every audio track keeps its duration, language,
-   title/commentary, dispositions, channel count and layout, sample rate,
-   profile, and A/V start offset; chapters, rotation, colour, aspect ratio,
-   field order, frame rate, compatible subtitles, artwork, and HDR side data
-   are verified too.
+1. The converter exited `0` and wrote a file larger than 0 bytes.
+2. **(Videos)** A full decode — `ffmpeg -v error -i out.mp4 -f null -` — exits
+   `0` *and* prints nothing. FFmpeg reports many corruptions on stderr while
+   still exiting 0, so silence is required.
+3. **(Videos)** AVFoundation, the playback stack behind Quick Look, reports the
+   MP4 as playable. An FFmpeg-readable file that Apple rejects is discarded.
+4. **(Videos)** The MP4 is faststart and declares the `mp42` brand — both
+   requested by the command, and here confirmed to have reached the file.
+5. **(Photos) The output really is lossless** — a WebP must contain a `VP8L`
+   stream, an AVIF an identity colour matrix. This is what catches an encoder
+   that stops honouring `-lossless`, which happened silently before v0.15.0.
+6. **Metadata survived** — the EXIF capture date, and any ICC colour profile
+   the source carried. A dropped Display P3 profile shifts every colour and
+   breaks nothing visibly.
+7. **Streams survived** — duration within 1s/2%, plus every audio track's
+   language, title, dispositions, channel layout, sample rate and A/V offset,
+   and chapters, rotation, colour, aspect ratio, field order, frame rate,
+   subtitles, artwork and HDR side data.
 
 On any failure the partial output is removed, the original is untouched, and
 the reason is logged.
 
-### Damaged sources
+Around that checklist:
 
-**Truncated JPEGs** are first run through `jpegtran -copy all`, rebuilding the
-JPEG structure while copying compressed coefficients and metadata without
-another lossy encode, then retried. The repair happens on a temporary file;
-the source is untouched until the validated replacement commits.
-
-**Truncated videos** are different — mediate cannot reconstruct packets that
-are absent from the file, but it can salvage the readable prefix. It compares
-every source video and audio packet timeline against the repaired output,
-keeps the damaged source automatically, and records the salvage so later runs
-do not retry it. The result reports both the recoverable duration and the
-longer duration the damaged header claimed.
-
-**Containers that understate themselves** are handled too. Concatenated MPEG
-program streams — how a ripped DVD's `VTS_01_N.VOB` parts are usually joined —
-restart their timestamps at each join, so the container reports only the final
-segment. When the output is *longer* than the source claims, mediate measures
-the source by decoding it before rejecting a conversion that is probably
-correct. A *short* output is still genuine truncation and still fails.
-
-### Existing MP4s
-
-By default these are classified by stream format and skipped without a full
-decode. `--validate-existing` turns on the library-health pass: mediate fully
-decodes every stream, asks AVFoundation to open each MP4 on macOS, caches the
-result by filesystem identity plus sampled content, and repairs damage or
-Apple playback rejection. Repair is lossless-first — container, index and
-timestamp rebuild — then tolerant re-encoding. Every repaired file still
-passes the complete checklist. Damaged HEVC remains opt-in via
-`--reencode-hevc`.
-
-An existing MP4 is not automatically a *compatible* MP4, and mediate explains
-whether video, pixel format, audio, or codec tags require standardization.
-Compatible H.264 or HEVC video is copied bit-for-bit when only its audio needs
-conversion, and `hev1` HEVC is losslessly retagged to `hvc1` for Apple
-playback instead of spending hours on an unnecessary re-encode. New MP4s write
-explicit `avc1`/`hvc1` and `mp4a` tracks, an `mp42` brand, and a fast-start
-index.
-
-### Beyond the checklist
-
-- **Originals go to the Trash by default** — the file's own volume's
-  `.Trashes`, so a video on an external drive is a rename rather than a full
-  copy to `~/.Trash`. Video re-encoding is lossy: once an original is
-  hard-deleted that quality is gone forever, so recoverability is the default.
 - **Nothing is written under its final name until it is proven.** Conversions
-  go to a hidden temp name (`.name.<rand>.part.ext`) and enter a durable
-  two-phase replacement transaction only after validation. The original is
-  staged, the output installed atomically, and the Trash/graveyard/delete
-  policy runs last. On startup, interrupted transactions either restore the
-  original or finish a proven installation.
-- **FFmpeg's implicit "best stream" selection is never trusted.** Video
-  commands explicitly map the primary video plus *all* audio tracks and
-  chapters. A rotated video gets a short lossless remux after encoding to
-  restore its display matrix before validation.
-- **The filesystem is checked before work starts.** The source must be a
-  readable regular file with no symlink or hard-link ambiguity, its output
-  directory must be writable, and conservative temporary free space must
-  exist. Concurrent workers reserve that budget per filesystem so they cannot
-  all spend the same free bytes. Device, inode, size and mtime are rechecked
-  before disposal, so a moving source is never replaced.
-- **The toolchain is checked before media work begins** — FFmpeg, ffprobe,
-  libx264, AAC, MP4 muxing, JSON probing, progress and rotation support.
-  Unsupported rotation tooling warns and fails affected files safely; core
-  failures stop the run with upgrade instructions.
+  go to a hidden temp file and enter a durable two-phase replacement only after
+  validation. On startup, an interrupted transaction either restores the
+  original or finishes a proven installation.
 - **Ctrl-C is safe.** It terminates active FFmpeg children, removes partial
-  outputs, records queued and running work in `.mediate-run.json`, and
-  prioritizes unfinished files on the next run.
-- **Output names never collide.** Two inputs mapping to one output (`a.jpg`
-  and `a.png` both becoming `a.webp`) are given distinct names before any
-  worker starts, so concurrent conversions cannot overwrite each other.
-- **Dates are preserved.** The output inherits the original's modification
-  time and, on macOS, its creation date via `setattrlist`, so both EXIF-based
-  and Finder-based sorting keep working.
+  outputs, records queued work in `.mediate-run.json`, and prioritizes
+  unfinished files next run.
+- **The filesystem is checked first** — readable regular file, no symlink or
+  hard-link ambiguity, writable output directory, and enough free space
+  (reserved per filesystem so concurrent workers cannot all spend the same
+  bytes). Device, inode, size and mtime are rechecked before disposal, so a
+  moving source is never replaced.
+- **Output names never collide.** Two inputs mapping to one output (`a.jpg` and
+  `a.png` both becoming `a.webp`) are given distinct names before any worker
+  starts.
+- **Dates are preserved** — modification time and Finder's creation date, so
+  both EXIF-based and Finder-based sorting keep working.
+- **Damaged sources are handled, not guessed at.** Truncated JPEGs are rebuilt
+  with `jpegtran -copy all` and retried; truncated videos keep the damaged
+  original and report the salvageable duration; containers that understate
+  their own length — concatenated DVD VOBs — are measured by decoding before a
+  correct conversion is rejected.
 
-## How it works
+The reasoning behind each of these, and the bugs that produced them, is in
+[AGENTS.md](AGENTS.md).
 
-**Caching.** ffprobe results are cached in `~/Library/Caches/mediate`,
-keyed by path, nanosecond mtime/ctime, size, device and
-inode. Expensive full-decode health entries also carry a sampled BLAKE2
-fingerprint. Completed MP4s are reported as one aggregate "already
-standardized" count. With `--keep-originals`, each validated source/output
-pair is recorded so later runs skip the unchanged source while that exact
-output is intact — preventing repeat conversions and duplicate files.
+## Good to know
 
-**Progress.** Interactive terminals show one live bar per concurrent encode,
-remux and integrity check, with media time, percent, speed and ETA.
-Redirected logs get 10% updates and a heartbeat at least once a minute. Files
-over 100 MB announce themselves up front.
-
-**exiftool** queries — metadata validation, `--date-prefix`, Live Photo
-verification — go through a small pool of persistent `-stay_open` daemons
-rather than one process per file.
-
-**Sidecars.** `.aae`/`.xmp` files describe their original, so when an original
-is disposed of after conversion, its sidecars travel with it.
-
-**Live Photo detection** finds candidates by same-directory stem naming, then
-requires matching Apple `ContentIdentifier` metadata when ExifTool is
-available. Without ExifTool the naming-only fallback stays conservative.
-
-**The HEIC PNG intermediate is deliberate.** Both sips and FFmpeg carry EXIF
-into PNG and cwebp extracts EXIF from PNG, whereas cwebp silently drops
-metadata from TIFF input. Because FFmpeg reads HEIC through the mov/mp4
-demuxer, every auxiliary image (thumbnail, depth map) appears as a stream, so
-the largest is selected explicitly and the decoded dimensions are checked —
-otherwise a thumbnail could quietly replace the photo.
-
-**Failures are isolated.** An unexpected exception in one worker is recorded
-as that file's failure and no longer stops collection of the rest of the scan.
-
-**Known limits.** `.tif` inputs whose EXIF matters will fail the metadata
-check (cwebp cannot carry TIFF metadata) and stay untouched, by design. On
-Windows the Recycle Bin is unsupported, so `--graveyard DIR` or
-`--hard-delete` is required.
+- **Progress.** Interactive terminals show one live bar per concurrent encode,
+  with media time, percent, speed and ETA. Redirected logs get 10% updates and
+  a heartbeat at least once a minute.
+- **Caching.** ffprobe results are cached in `~/Library/Caches/mediate`, keyed
+  by filesystem identity, so a re-run over a large library does not re-probe
+  everything. Expensive decode results carry a content fingerprint too.
+- **Sidecars.** `.aae`/`.xmp` files describe their original, so they travel
+  with it when it is disposed of.
+- **Failures are isolated** — one file's unexpected error is recorded as that
+  file's failure and does not stop the rest of the run.
+- **Known limit.** `.tif` inputs whose EXIF matters will fail the metadata
+  check and stay untouched, by design: cwebp cannot carry TIFF metadata.
 
 ## Tests
 
@@ -470,5 +317,5 @@ python3 -m unittest discover tests
 Alongside the pure-Python tests, the suite generates real media to cover
 ASF/VOB, surround and multi-track audio, chapters, subtitle and artwork
 preservation, rotation, high-bit-depth blocking, corrupt packets, and missing
-MP4 indexes. Those run automatically when `ffmpeg`, `ffprobe` and `libx264`
-are available and skip cleanly otherwise.
+MP4 indexes. Those run automatically when `ffmpeg`, `ffprobe` and `libx264` are
+available and skip cleanly otherwise.
