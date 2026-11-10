@@ -1,3 +1,6 @@
+import os
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -1129,6 +1132,122 @@ class ApplePlaybackTests(unittest.TestCase):
             ok, reason = verify_apple_playback(Path("output.mp4"))
         self.assertFalse(ok)
         self.assertIn("timed out", reason)
+
+
+class CompiledCheckerTests(unittest.TestCase):
+    """The checker is compiled once and cached; a bad cache is never a verdict."""
+
+    def setUp(self):
+        from mediate import validators
+
+        self.validators = validators
+        self.home = Path(tempfile.mkdtemp(prefix="mediate-checker-"))
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        environment = patch.dict(os.environ, {"HOME": str(self.home)})
+        environment.start()
+        self.addCleanup(environment.stop)
+        self._reset()
+        self.addCleanup(self._reset)
+
+    def _reset(self):
+        self.validators._checker = None
+        self.validators._checker_unavailable = False
+
+    def _plant(self, script: str) -> Path:
+        """Stand a shell script in for the cached binary."""
+        target = self.validators._checker_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(script)
+        target.chmod(0o755)
+        return target
+
+    def test_the_cached_checker_lives_under_the_users_own_cache(self):
+        # It is executed, so it must not sit in a shared temp directory.
+        target = self.validators._checker_path()
+        self.assertEqual(target.parent, self.home / "Library" / "Caches" / "mediate")
+
+    def test_a_cached_checker_is_used_without_compiling_or_interpreting(self):
+        self._plant("#!/bin/sh\nexit 0\n")
+        with patch("mediate.validators._compile_checker") as compiler, patch(
+            "mediate.validators._apple_check_lock"
+        ) as interpreter_lock:
+            self.assertEqual(verify_apple_playback(Path("output.mp4")), (True, "ok"))
+        compiler.assert_not_called()
+        interpreter_lock.__enter__.assert_not_called()
+
+    def test_a_not_playable_verdict_fails_without_a_second_opinion(self):
+        self._plant("#!/bin/sh\necho 'playable=false' >&2\nexit 1\n")
+        with patch("mediate.validators._apple_check_lock") as interpreter_lock:
+            ok, reason = verify_apple_playback(Path("output.mp4"))
+        self.assertFalse(ok)
+        self.assertEqual(reason, "playable=false")
+        interpreter_lock.__enter__.assert_not_called()
+
+    def test_a_checker_that_dies_without_a_verdict_is_discarded(self):
+        # Exit 3 is not one of the script's verdicts: the binary itself is
+        # broken (a dyld abort after an OS upgrade looks like this), which
+        # says nothing about the video. It must neither pass nor fail it.
+        target = self._plant("#!/bin/sh\nexit 3\n")
+        interpreted = subprocess.CompletedProcess([], 0, "", "")
+        real_run = subprocess.run
+
+        def run(argv, **kwargs):
+            if argv[0] == str(target):
+                return real_run(argv, **kwargs)
+            return interpreted
+
+        with patch("mediate.validators.subprocess.run", side_effect=run) as runner:
+            self.assertEqual(verify_apple_playback(Path("output.mp4")), (True, "ok"))
+        self.assertFalse(target.exists())
+        self.assertIn("-e", runner.call_args_list[-1].args[0])
+
+    def test_a_checker_that_cannot_start_falls_back_to_the_interpreter(self):
+        target = self._plant("not an executable format")
+        target.chmod(0o644)
+        interpreted = subprocess.CompletedProcess([], 0, "", "")
+        real_run = subprocess.run
+
+        def run(argv, **kwargs):
+            if argv[0] == str(target):
+                return real_run(argv, **kwargs)
+            return interpreted
+
+        with patch("mediate.validators.subprocess.run", side_effect=run):
+            self.assertEqual(verify_apple_playback(Path("output.mp4")), (True, "ok"))
+        self.assertFalse(target.exists())
+
+    def test_a_failed_compile_is_not_retried_for_every_video(self):
+        with patch(
+            "mediate.validators._compile_checker", return_value=False
+        ) as compiler, patch(
+            "mediate.validators.subprocess.run",
+            return_value=subprocess.CompletedProcess([], 0, "", ""),
+        ):
+            verify_apple_playback(Path("a.mp4"))
+            verify_apple_playback(Path("b.mp4"))
+        self.assertEqual(compiler.call_count, 1)
+
+    @unittest.skipUnless(
+        shutil.which("swiftc") and shutil.which("ffmpeg"), "needs swiftc and ffmpeg"
+    )
+    def test_a_real_compile_judges_real_media(self):
+        clip = self.home / "clip.mp4"
+        subprocess.run(
+            [
+                "ffmpeg", "-nostdin", "-y", "-v", "error",
+                "-f", "lavfi", "-i", "testsrc=size=160x120:rate=10:duration=1",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", str(clip),
+            ],
+            check=True,
+        )
+        garbage = self.home / "garbage.mp4"
+        garbage.write_bytes(b"this is not a movie" * 64)
+
+        self.assertEqual(verify_apple_playback(clip), (True, "ok"))
+        self.assertTrue(self.validators._checker_path().exists())
+        self.assertFalse(verify_apple_playback(garbage)[0])
+        # The verdict on garbage was the script's own, so the binary stays.
+        self.assertTrue(self.validators._checker_path().exists())
 
 
 if __name__ == "__main__":

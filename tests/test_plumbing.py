@@ -437,6 +437,32 @@ class ScanCompletionTests(unittest.TestCase):
             output.write_bytes(b"changed-output")
             self.assertIsNone(probe.completed_conversion_output(source))
 
+    def test_existing_mp4s_are_classified_concurrently_and_in_order(self):
+        import threading
+        from mediate.cli import _filter_standardized_mp4
+        from mediate.scanner import MediaJob
+
+        # Two classifications must be in flight at once to get past the
+        # barrier; run one at a time, it times out and raises.
+        barrier = threading.Barrier(2, timeout=10)
+
+        def status(path):
+            barrier.wait()
+            return "standard" if path.stem.startswith("done") else "needs-conversion"
+
+        jobs = [
+            MediaJob(Path("done-1.mp4"), "mp4"),
+            MediaJob(Path("todo-1.mp4"), "mp4"),
+            MediaJob(Path("clip.mov"), "video"),
+            MediaJob(Path("done-2.mp4"), "mp4"),
+            MediaJob(Path("todo-2.mp4"), "mp4"),
+        ]
+        candidates, count = _filter_standardized_mp4(jobs, status, "standard", workers=2)
+        self.assertEqual(
+            [job.path.name for job in candidates], ["todo-1.mp4", "clip.mov", "todo-2.mp4"]
+        )
+        self.assertEqual(count, 2)
+
     def test_completed_mp4s_do_not_return_as_candidates(self):
         from mediate.cli import _filter_standardized_mp4
         from mediate.scanner import MediaJob

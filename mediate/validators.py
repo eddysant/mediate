@@ -10,9 +10,11 @@ lives in `videoverify.py`.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -90,6 +92,108 @@ Task {
 dispatchMain()
 '''
 _apple_check_lock = threading.Lock()
+_checker_lock = threading.Lock()
+_checker: "Path | None" = None
+_checker_unavailable = False
+# The script's own verdicts. Any other exit status means the checker itself
+# did not run (a signal, a dyld abort after an OS upgrade), not that the
+# video is unplayable.
+_CHECKER_VERDICTS = (0, 1, 2)
+
+
+def _checker_path() -> Path:
+    """Where the compiled checker lives: keyed by its source and the OS.
+
+    Under the user's own cache directory rather than the shared temp dir,
+    because this file is executed.
+    """
+    key = hashlib.blake2b(
+        (_AVFOUNDATION_CHECK + platform.mac_ver()[0]).encode(), digest_size=8
+    ).hexdigest()
+    return Path.home() / "Library" / "Caches" / "mediate" / f"avfoundation-check-{key}"
+
+
+def _compile_checker(swiftc: str, target: Path) -> bool:
+    """Build the checker and install it atomically. False if that fails."""
+    try:
+        with tempfile.TemporaryDirectory(prefix="mediate-swiftc-") as temp:
+            source = Path(temp) / "check.swift"
+            built = Path(temp) / "check"
+            source.write_text(_AVFOUNDATION_CHECK, encoding="utf-8")
+            proc = subprocess.run(
+                [swiftc, "-O", str(source), "-o", str(built)],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if proc.returncode != 0 or not built.exists():
+                log.debug("could not compile the AVFoundation checker: %s", _tail(proc.stderr))
+                return False
+            target.parent.mkdir(parents=True, exist_ok=True)
+            staged = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+            try:
+                shutil.copy2(built, staged)
+                os.replace(staged, target)
+            except OSError:
+                staged.unlink(missing_ok=True)
+                raise
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.debug("could not compile the AVFoundation checker: %s", exc)
+        return False
+    return True
+
+
+def _compiled_checker() -> "Path | None":
+    """The compiled checker, built on first use, or None to interpret instead."""
+    global _checker, _checker_unavailable
+    with _checker_lock:
+        if _checker is not None or _checker_unavailable:
+            return _checker
+        target = _checker_path()
+        swiftc = shutil.which("swiftc")
+        if target.exists() or (swiftc and _compile_checker(swiftc, target)):
+            _checker = target
+        else:
+            _checker_unavailable = True
+        return _checker
+
+
+def _discard_checker(path: Path) -> None:
+    global _checker, _checker_unavailable
+    with _checker_lock:
+        _checker = None
+        _checker_unavailable = True
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _run_compiled_checker(path: Path) -> "subprocess.CompletedProcess | None":
+    """Run the compiled checker, or None when it cannot give a verdict.
+
+    Interpreting the script costs ~0.29s per video and has to be serialized;
+    the compiled form measured 0.03s and runs concurrently. A checker that
+    will not start, or dies without reaching a verdict, is thrown away and
+    the caller falls back to the interpreter — a broken cache must never be
+    what fails a conversion, and must never pass one either.
+    """
+    checker = _compiled_checker()
+    if checker is None:
+        return None
+    try:
+        proc = subprocess.run(
+            [str(checker), str(path)], capture_output=True, text=True, timeout=30
+        )
+    except OSError as exc:
+        log.debug("compiled AVFoundation checker could not start: %s", exc)
+        _discard_checker(checker)
+        return None
+    if proc.returncode not in _CHECKER_VERDICTS:
+        log.debug("compiled AVFoundation checker exited %s; discarding it", proc.returncode)
+        _discard_checker(checker)
+        return None
+    return proc
 
 
 def verify_apple_playback(path: Path) -> Tuple[bool, str]:
@@ -104,18 +208,20 @@ def verify_apple_playback(path: Path) -> Tuple[bool, str]:
         return _verify_quicklook_playback(path)
     cache = Path(tempfile.gettempdir()) / f"mediate-swift-cache-{os.getuid()}"
     try:
-        with _apple_check_lock:
-            proc = subprocess.run(
-                [
-                    swift,
-                    "-module-cache-path", str(cache),
-                    "-e", _AVFOUNDATION_CHECK,
-                    str(path),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
+        proc = _run_compiled_checker(path)
+        if proc is None:
+            with _apple_check_lock:
+                proc = subprocess.run(
+                    [
+                        swift,
+                        "-module-cache-path", str(cache),
+                        "-e", _AVFOUNDATION_CHECK,
+                        str(path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
     except subprocess.TimeoutExpired:
         return False, "AVFoundation timed out while opening the converted MP4"
     except OSError as exc:

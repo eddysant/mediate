@@ -382,6 +382,25 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   declares. Hardcoding it there meant that raising `requires-python` left
   the test silently asserting the old floor — the one thing it exists to
   catch.
+- **Existing MP4s are classified through a pool, not a comprehension**
+  (`_classify_concurrently` in `cli.py`): an uncached classification is one
+  ffprobe, and the filter that runs before the worker pool used to make them
+  one at a time — 78s for 3,000 MP4s on a cold cache against 16s on 8
+  threads. Only uncached files pay it (a first run, a moved library, a lost
+  cache); a warm pass over 12,000 files is 0.5s. The probe cache locks its
+  own reads and writes, which is what makes the status function shareable.
+- **The AVFoundation checker is compiled once, and a broken cache is never
+  a verdict** (`_run_compiled_checker` in `validators.py`): `swift -e`
+  re-interprets the script per video (0.29s) and had to be serialized behind
+  a lock, which made `--validate-existing` single-file — 40 checks took
+  11.6s; compiled, 0.24s on 8 threads. The binary lives under
+  `~/Library/Caches/mediate`, **not** the temp dir, because it is executed,
+  and is keyed by the script plus the macOS version. Only exit codes 0/1/2
+  are the script's own verdicts: anything else (a dyld abort after an OS
+  upgrade, a file that will not exec) means the checker did not run, so it
+  is deleted and that video is re-checked by the interpreter. Without that
+  rule a stale binary would fail every conversion. A failed compile is
+  remembered for the run, not retried per video.
 - **Probe results are cached** (`probecache.py`: path+mtime_ns+ctime_ns+size+device+
   inode keyed JSON; health adds a sampled BLAKE2 fingerprint) in the user cache
   dir, loaded/saved by cli — a 50k-file re-run would otherwise
