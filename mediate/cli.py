@@ -154,6 +154,18 @@ def _filter_completed_conversions(jobs, completed_fn):
     return [job for job in jobs if job.path not in completed], completed
 
 
+def _filter_known_not_smaller(jobs, opts):
+    """Drop files a previous run already converted and found no smaller."""
+    from .converters import size_guard_settings
+    from .probe import known_not_smaller
+
+    remaining = [
+        job for job in jobs
+        if not known_not_smaller(job.path, size_guard_settings(job.kind, opts))
+    ]
+    return remaining, len(jobs) - len(remaining)
+
+
 def _existing_mp4_health(path: Path) -> dict:
     """Optional deep health check, including Apple's own playback stack."""
     from .probe import video_health
@@ -232,7 +244,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="convert HEIC/HEIF photos to lossless WebP (macOS sips, or an "
         "FFmpeg build that reads HEIC stills elsewhere) "
         "(default: skip them; the lossless re-encode of an efficient lossy "
-        "format usually grows the file — combine with --only-if-smaller)",
+        "format usually grows the file, in which case the original is kept)",
     )
     selection.add_argument(
         "--convert-live-photos",
@@ -318,11 +330,14 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="convert but never touch the original files",
     )
     originals.add_argument(
-        "--only-if-smaller",
+        "--allow-larger",
         action="store_true",
-        help="keep the original (and discard the conversion) unless the output is "
-        "smaller — lossless WebP can be bigger than a camera JPEG",
+        help="keep a conversion even when it is larger than the original "
+        "(default: discard it and keep the original — lossless WebP is usually "
+        "bigger than a camera JPEG)",
     )
+    # The default since 0.19; still accepted so existing config files parse.
+    originals.add_argument("--only-if-smaller", action="store_true", help=argparse.SUPPRESS)
     disposal = originals.add_mutually_exclusive_group()
     disposal.add_argument(
         "--graveyard",
@@ -529,7 +544,7 @@ def build_options(root: Path, args: argparse.Namespace):
     return Options(
         dry_run=args.dry_run,
         keep_originals=args.keep_originals,
-        only_if_smaller=args.only_if_smaller,
+        only_if_smaller=not args.allow_larger,
         reencode_hevc=args.reencode_hevc,
         convert_heic=args.convert_heic,
         allow_stream_removal=args.allow_stream_removal,
@@ -723,6 +738,11 @@ def main(argv=None) -> int:
     recognized, previously_converted = _filter_completed_conversions(
         recognized, completed_conversion_output
     )
+    # Like completed conversions, these are settled, not pending: counting
+    # them as candidates would re-encode each one only to discard it again.
+    not_smaller_count = 0
+    if opts.only_if_smaller:
+        recognized, not_smaller_count = _filter_known_not_smaller(recognized, opts)
     has_video = any(job.kind in {"video", "mp4", "gif", "webp"} for job in recognized)
     has_photos = any(
         job.kind == "photo" or (job.kind == "heic" and args.convert_heic)
@@ -774,6 +794,12 @@ def main(argv=None) -> int:
         log.info(
             "already converted with originals retained: %d unchanged source file(s)",
             len(previously_converted),
+        )
+    if not_smaller_count:
+        log.info(
+            "kept as they are: %d file(s) whose conversion was not smaller "
+            "(--allow-larger to convert them anyway)",
+            not_smaller_count,
         )
     if not args.keep_originals and not args.dry_run:
         log.info("originals: %s after validation", dispose_label)

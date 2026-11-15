@@ -463,6 +463,24 @@ class ScanCompletionTests(unittest.TestCase):
         )
         self.assertEqual(count, 2)
 
+    def test_a_not_smaller_verdict_holds_only_for_that_file_and_those_settings(self):
+        from unittest.mock import patch
+        from mediate import probe
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(probecache._cache, {}, clear=True):
+            photo = Path(tmp) / "photo.jpg"
+            photo.write_bytes(b"original")
+            self.assertFalse(probe.known_not_smaller(photo, "webp/default"))
+
+            probe.mark_not_smaller(photo, "webp/default")
+            self.assertTrue(probe.known_not_smaller(photo, "webp/default"))
+            # A different format or effort is a different question.
+            self.assertFalse(probe.known_not_smaller(photo, "avif/default"))
+            self.assertFalse(probe.known_not_smaller(photo, "webp/max"))
+
+            photo.write_bytes(b"edited since, and a different size")
+            self.assertFalse(probe.known_not_smaller(photo, "webp/default"))
+
     def test_completed_mp4s_do_not_return_as_candidates(self):
         from mediate.cli import _filter_standardized_mp4
         from mediate.scanner import MediaJob

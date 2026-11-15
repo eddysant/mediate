@@ -32,12 +32,13 @@ mediate ~/Pictures/Library --dry-run   # see what would happen
 mediate ~/Pictures/Library             # convert; originals -> Trash
 ```
 
-Always start with `--dry-run`. A good full-strength invocation for a real
-library:
+Always start with `--dry-run`.
 
-```sh
-mediate ~/Pictures/Library --only-if-smaller --convert-heic
-```
+**A conversion that comes out larger is thrown away and the original kept.**
+That is most camera JPEGs: a lossless WebP has to reproduce the JPEG's
+compression noise exactly, and measured on a 4032×4032 photo that turned
+2.2 MB into 6.4 MB. mediate remembers which files did not shrink, so later
+runs do not encode them again. `--allow-larger` converts them anyway.
 
 ### Requirements
 
@@ -83,10 +84,10 @@ pipeline.
 - `--dry-run` — traverse and print what would happen; nothing is written or deleted.
 - `--keep-originals` — convert but never touch inputs. A non-standard `foo.mp4`
   becomes `foo.standardized.mp4`, since the original keeps its name.
-- `--only-if-smaller` — keep the original unless the output is actually
-  smaller. **Recommended**: lossless WebP is frequently *bigger* than a camera
-  JPEG or HEIC, because it must reproduce the source's compression noise
-  exactly.
+- `--allow-larger` — keep a conversion even when it is larger than the
+  original, for a uniform format at the cost of space. By default the larger
+  output is discarded. Remuxes and repairs are never size-checked: they do not
+  re-encode the picture.
 - `--workers N` — concurrent conversions: an integer, or `auto` (the default).
 - `--log-file PATH` — default is `conversion.log` in the target directory. The
   console shows one line per file; the log adds timestamps and full converter
@@ -96,7 +97,7 @@ pipeline.
 ### Convert more
 
 - `--convert-heic` — convert HEIC/HEIF, skipped by default because it is
-  already space-efficient. Pair with `--only-if-smaller`.
+  already space-efficient, so most conversions will be discarded as larger.
 - `--reencode-hevc` — convert HEVC MP4s to h264 for non-Apple compatibility,
   accepting the size increase.
 - `--convert-live-photos` — convert Live Photo pairs anyway.
@@ -203,7 +204,6 @@ flag per line, `#` comments:
 
 ```
 # my defaults
---only-if-smaller
 --convert-heic
 --workers 4
 ```

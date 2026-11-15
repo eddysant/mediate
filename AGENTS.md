@@ -66,7 +66,8 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
    chapters and timings, rotation, compatible subtitle/art streams, and advanced
    picture metadata. This is what stops cwebp's silent TIFF metadata drop and FFmpeg's
    default “best stream” selection from quietly losing an alternate track.
-5. `--only-if-smaller` check (after validation, before disposal).
+5. Size guard (after validation, before disposal): a re-encode that is not
+   smaller is discarded and the original kept, unless `--allow-larger`.
 6. Write a durable local transaction manifest, atomically stage the original,
    atomically install the validated output, and restore timestamps. A crash
    before installation rolls back on startup; a crash after a proven install
@@ -382,6 +383,21 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   declares. Hardcoding it there meant that raising `requires-python` left
   the test silently asserting the old floor — the one thing it exists to
   catch.
+- **Not growing the file is the default, and the verdict is remembered**
+  (`process_job`, `mark_not_smaller`): the size guard used to be the opt-in
+  `--only-if-smaller`, so an ordinary run kept every larger output — and a
+  lossless WebP of a JPEG is larger almost by definition (measured: a
+  4032x4032 quality-90 JPEG, 2.19 MB → 6.44 MB). It is now on unless
+  `--allow-larger`; `--only-if-smaller` is still parsed, hidden, because
+  config files carry it. Two things the flip needed. The guard judges
+  **re-encodes only**: a remux, an audio-only conversion or a repair moves
+  the size by container overhead in either direction, so guarding them
+  would skip iPhone `.mov` remuxes at random. And the verdict is cached per
+  file identity *and* encoder settings (`size_guard_settings`), with those
+  files filtered before the candidate count — otherwise every run would
+  re-encode every JPEG (4.7s each at 12 MP) just to discard it again. The
+  end-to-end fixtures are a second of test pattern and grow when converted,
+  so `run_cli` passes `--allow-larger`; the default has its own tests.
 - **Existing MP4s are classified through a pool, not a comprehension**
   (`_classify_concurrently` in `cli.py`): an uncached classification is one
   ffprobe, and the filter that runs before the worker pool used to make them

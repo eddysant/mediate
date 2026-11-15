@@ -205,6 +205,24 @@ def completed_conversion_output(source: Path) -> Path | None:
     return output
 
 
+def mark_not_smaller(source: Path, settings: str) -> None:
+    """Remember that converting this file, with these settings, grew it.
+
+    Finding that out costs a full encode, and the answer cannot change while
+    the file and the encoder settings do not. Without the memo every run
+    re-encodes every such file just to discard the result again.
+    """
+    identity = file_identity(source)
+    if identity is not None:
+        remember(f"notsmaller:{settings}:{source.resolve()}", identity)
+
+
+def known_not_smaller(source: Path, settings: str) -> bool:
+    """Whether an unchanged file is already known not to shrink."""
+    record = recall(f"notsmaller:{settings}:{source.resolve()}")
+    return bool(record) and file_identity(source) == record
+
+
 # Stream metadata that must survive a video conversion. Values omitted by
 # ffprobe are intentionally distinct from explicit "unknown" values.
 

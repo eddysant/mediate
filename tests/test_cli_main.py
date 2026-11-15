@@ -551,6 +551,25 @@ class ExtractedSeamTests(MainTestCase):
         self.assertEqual(len(runnable), 2)
         self.assertEqual(skips, [])
 
+    def test_a_larger_output_is_refused_unless_asked_for(self):
+        from mediate.cli import build_options
+
+        default, _ = build_options(self.root, cli.parse_args([str(self.root)]))
+        self.assertTrue(default.only_if_smaller)
+
+        allowed, _ = build_options(
+            self.root, cli.parse_args([str(self.root), "--allow-larger"])
+        )
+        self.assertFalse(allowed.only_if_smaller)
+
+        # A config file written before the default changed still carries the
+        # old flag; the command line must be able to override it.
+        both, _ = build_options(
+            self.root,
+            cli.parse_args([str(self.root), "--only-if-smaller", "--allow-larger"]),
+        )
+        self.assertFalse(both.only_if_smaller)
+
     def test_build_options_carries_the_flags_through(self):
         from mediate.cli import build_options
 

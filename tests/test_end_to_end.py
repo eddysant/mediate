@@ -127,6 +127,12 @@ class EndToEndRunTests(unittest.TestCase):
         )
 
     def run_cli(self, *extra: str) -> int:
+        # --allow-larger: these fixtures are a second of test pattern, which
+        # a lossless encode grows. The tests here are about the pipeline; the
+        # size guard that is now the default has its own tests below.
+        return self.run_cli_with_defaults("--allow-larger", *extra)
+
+    def run_cli_with_defaults(self, *extra: str) -> int:
         return cli.main([str(self.root), "--log-file", str(self.log), *extra])
 
     def assertNothingHalfFinished(self):
@@ -344,6 +350,39 @@ class EndToEndRunTests(unittest.TestCase):
         self.assertEqual(self.standard.read_bytes(), before)
         self.assertEqual(self.standard.stat().st_mtime_ns, before_mtime)
         self.assertFalse((self.graveyard / "standard.mp4").exists())
+
+    def test_by_default_a_conversion_that_grows_the_file_is_not_kept(self):
+        # A lossless WebP of a JPEG is larger than the JPEG. Keeping it would
+        # trade a smaller original for a bigger copy, so the default is to
+        # keep the original; the remux is not a re-encode and still happens.
+        before = self.photo.read_bytes()
+
+        self.assertEqual(self.run_cli_with_defaults("--graveyard", str(self.graveyard)), 0)
+
+        self.assertEqual(self.photo.read_bytes(), before)
+        self.assertFalse(self.photo.with_suffix(".webp").exists())
+        self.assertFalse((self.graveyard / "snapshot.jpg").exists())
+        self.assertTrue(self.ready.with_suffix(".mp4").exists(), "the remux was size-guarded")
+        self.assertNothingHalfFinished()
+        self.assertNotIn("kept as they are", self.log.read_text())
+
+    def test_a_file_known_not_to_shrink_is_not_encoded_again(self):
+        # Learning that a file grows costs a full encode. The second run must
+        # know the answer already rather than pay for it on every pass.
+        from mediate import photo
+
+        self.assertEqual(self.run_cli_with_defaults("--graveyard", str(self.graveyard)), 0)
+        with patch("mediate.photo._run", wraps=photo._run) as encoder:
+            self.assertEqual(
+                self.run_cli_with_defaults("--graveyard", str(self.graveyard)), 0
+            )
+        encoder.assert_not_called()
+        self.assertRegex(self.log.read_text(), r"kept as they are: \d+ file")
+
+        # The verdict belongs to the size guard, so opting out ignores it.
+        self.assertEqual(self.run_cli("--graveyard", str(self.graveyard)), 0)
+        self.assertTrue(self.photo.with_suffix(".webp").exists())
+        self.assertTrue((self.graveyard / "snapshot.jpg").exists())
 
     def test_a_second_run_finds_no_work_and_touches_nothing(self):
         # The repeat-run gotcha: a converted library must look finished, not

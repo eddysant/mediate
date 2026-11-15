@@ -22,6 +22,7 @@ from .probe import (
     STREAM_STANDARD,
     gif_is_animated,
     mark_conversion_complete,
+    mark_not_smaller,
     mark_video_healthy,
     media_duration,
     mp4_conversion_reason,
@@ -92,6 +93,13 @@ class Options:
     dispose: Optional[Disposer] = None
     dispose_label: str = "delete original"
     transaction_root: Optional[Path] = None
+
+
+def size_guard_settings(kind: str, opts: Options) -> str:
+    """What a "did not get smaller" verdict depended on, besides the file."""
+    if kind in ("photo", "heic"):
+        return f"{opts.output_format}/{opts.photo_effort}"
+    return "mp4/" + ("hardware" if opts.hardware else opts.encode_preset)
 
 
 @dataclass
@@ -617,12 +625,18 @@ def process_job(job: MediaJob, opts: Options) -> Outcome:
     src_birthtime = get_birthtime(src)
     new_size = tmp.stat().st_size
 
-    if opts.only_if_smaller and new_size >= src_stat.st_size:
+    # The size guard judges re-encodes only. A stream copy or an audio-only
+    # conversion changes the container, not the picture, so its size moves by
+    # overhead in either direction and guarding it would skip remuxes at
+    # random; a repair exists to fix a broken file, whatever it weighs.
+    reencoded = not (remux or copy_video or repair or salvaged_source)
+    if opts.only_if_smaller and reencoded and new_size >= src_stat.st_size:
         tmp.unlink(missing_ok=True)
+        mark_not_smaller(src, size_guard_settings(kind, opts))
         return Outcome(
             SKIPPED, src,
             f"output not smaller ({_fmt_size(src_stat.st_size)} -> {_fmt_size(new_size)}), original kept",
-            reason="output not smaller than the original (--only-if-smaller)",
+            reason="output not smaller than the original (--allow-larger to convert anyway)",
         )
 
     disposed = ""
