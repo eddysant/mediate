@@ -485,6 +485,17 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   `--version` disagrees with the tag. The release job still runs on
   `ubuntu-latest`: building a stdlib zipapp is platform-neutral, and
   `--version` answers there because `require_macos` runs after `parse_args`.
+- **Dependencies are kept current three different ways**, because they
+  are three different kinds. The only pinned versions are the GitHub
+  Actions, and Dependabot (`.github/dependabot.yml`) opens one grouped PR a
+  week when they move — they were two majors stale before it existed. The
+  media tools are deliberately *unpinned*: CI brews the latest on every run,
+  and users get new releases via `brew upgrade` with no mediate release in
+  between, so CI also runs on a **weekly schedule** and logs each tool's
+  version; a red scheduled run on an unchanged repo means a tool changed
+  under us. CPython's top end is `"3.x"` in the matrix rather than a number,
+  so it cannot go stale; the floor stays an explicit number because
+  `requires-python` is a promise to users and moves only on purpose.
 - **Homebrew tap** (`eddysant/homebrew-tap`, sibling checkout at
   `~/Code/homebrew-tap`): `Formula/mediate.rb` wraps the release source
   tarball (libexec + PYTHONPATH bin shim on brewed python; ffmpeg/webp as

@@ -1,0 +1,16 @@
+# mediate has no Python dependencies (stdlib only), so the only pinned
+# versions in the repository are the GitHub Actions the workflows use.
+# Everything else is deliberately unpinned and tracked differently:
+# Homebrew installs the latest ffmpeg/webp/libavif/exiftool on every CI run,
+# and the scheduled run in ci.yml tests mediate against those weekly.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "CI"

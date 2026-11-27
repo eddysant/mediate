@@ -5,6 +5,13 @@ on:
     branches: [main]
     tags: ["v*"]
   pull_request:
+  # Weekly, against whatever Homebrew ships that day. Users get new ffmpeg,
+  # cwebp, libavif and exiftool releases through `brew upgrade` without any
+  # mediate release, so a push-only CI would learn that one broke a check
+  # from a user. Monday 07:37 UTC, clear of the tap's 06:27-07:07 crons.
+  schedule:
+    - cron: "37 7 * * 1"
+  workflow_dispatch:
 
 jobs:
   test:
@@ -16,16 +23,17 @@ jobs:
         # make deleting an original safe.
         os: [macos-latest]
         # 3.10 is the floor declared in pyproject.toml; test it so the floor
-        # stays honest, and the current stable release alongside it. Watch the
+        # stays honest. "3.x" is whatever CPython is newest and stable, so the
+        # top of the range moves on its own instead of going stale. Watch the
         # floor's end-of-life: setup-python stops publishing a version's
         # builds some releases after it goes EOL, and the failure lands
         # *inside* setup-python, leaving the matrix green with the test step
         # merely skipped. 3.9 failed exactly that way on Linux.
-        python-version: ["3.10", "3.12"]
+        python-version: ["3.10", "3.x"]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install media tools
@@ -44,6 +52,14 @@ jobs:
           # tests skip themselves without libavif, and a skip reads as a pass.
           command -v avifenc >/dev/null && command -v avifdec >/dev/null
           command -v exiftool >/dev/null
+          # Record what this run actually tested against: on a scheduled run
+          # that changed nothing in the repository, a new tool version is the
+          # first suspect.
+          python --version
+          ffmpeg -hide_banner -version | head -1
+          cwebp -version
+          avifenc --version | head -1
+          exiftool -ver
       - name: Run unit tests
         env:
           MEDIATE_CONFIG: /nonexistent
@@ -56,8 +72,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Resolve version
