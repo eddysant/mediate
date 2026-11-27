@@ -4,7 +4,7 @@ User-facing documentation is in [README.md](README.md); this file is the
 implementation record — why each decision is the way it is, and which bug
 taught it.
 
-macOS-only, stdlib-only Python (≥3.10) CLI by Misty Vale, built with AI assistance. Recursively
+macOS-only, stdlib-only Python (≥3.11) CLI by Misty Vale, built with AI assistance. Recursively
 standardizes a media library: photos → lossless WebP (`cwebp`), videos and
 GIF/WebP animations → h264/yuv420p/AAC MP4 (`ffmpeg`). Originals are disposed
 of (Trash by
@@ -459,7 +459,10 @@ everything is subprocess calls to `cwebp`/`ffmpeg`/`ffprobe` (+ `sips` on macOS)
   one per line, prepended to argv in `parse_args` unless `--no-config`.
   Tests must set `MEDIATE_CONFIG=/nonexistent` to stay hermetic.
 - **CI** (`.github/workflows/ci.yml`): unit tests on macos x Python
-  3.10 (the `requires-python` floor) and 3.12 for every push/PR. Ubuntu was
+  3.11 (the `requires-python` floor) and the newest stable `3.x` for every
+  push/PR, plus weekly. The floor follows CPython's own support window: it
+  moved 3.10 → 3.11 when 3.10 went EOL in October 2026, and 3.11's own EOL
+  is October 2027 — raise it then, before the runners drop it. Ubuntu was
   dropped when mediate became macOS-only — it had been the only thing
   exercising eleven non-macOS branches, and once those branches went there
   was nothing left for it to test. The floor was 3.9 until it went EOL in

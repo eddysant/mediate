@@ -5,7 +5,7 @@ standardizes photos and videos into compatible, space-efficient formats — and
 only parts with an original after the converted file passes a strict
 validation checklist. Even then it goes to the Trash, not oblivion.
 
-**macOS only.** Stdlib-only Python (≥ 3.10); everything else is `ffmpeg`,
+**macOS only.** Stdlib-only Python (≥ 3.11); everything else is `ffmpeg`,
 `cwebp`, and friends. The checks that make deleting an original safe are
 Apple's — AVFoundation playback validation, `sips` for HEIC stills,
 `setattrlist` for Finder's creation date, the per-volume `.Trashes` layout —
